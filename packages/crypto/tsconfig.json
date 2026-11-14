@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "lib": ["ES2022", "DOM"],
+    "paths": {
+      "@e2ee-chat/shared": ["../shared/dist/index.d.ts"]
+    }
+  },
+  "include": ["src"]
+}

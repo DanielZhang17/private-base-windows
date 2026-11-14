@@ -1,0 +1,76 @@
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { Device, User } from "@e2ee-chat/shared";
+import UnlockedAppEffects from "./UnlockedAppEffects.js";
+import { useAuthStore } from "../../stores/authStore.js";
+import { createNotificationWebSocket } from "../../services/notifications.js";
+import { resetMessageSyncState, runUnlockSync } from "../../lib/message-sync.js";
+
+vi.mock("../../stores/authStore.js", async () => {
+  const { create } = await import("zustand");
+  return { useAuthStore: create(() => ({ user: null, device: null, accessToken: null })) };
+});
+vi.mock("../../services/notifications.js", () => ({ createNotificationWebSocket: vi.fn() }));
+vi.mock("../../services/api.js", () => ({ api: { get: vi.fn() } }));
+vi.mock("../../db/index.js", () => ({ cleanupExpiredFileCache: vi.fn(), cleanupExpiredPendingCalls: vi.fn(), deletePendingCall: vi.fn(), getPendingCall: vi.fn() }));
+vi.mock("../../lib/message-sync.js", () => ({ pruneExpiredPlaintext: vi.fn(), resetMessageSyncState: vi.fn(), syncMessages: vi.fn(), runUnlockSync: vi.fn() }));
+vi.mock("../../lib/conversation-cache.js", () => ({ refreshConversationList: vi.fn() }));
+vi.mock("../../lib/browser-notifications.js", () => ({ requestNotificationPermission: vi.fn() }));
+
+let root: Root;
+let container: HTMLDivElement;
+const dispose = vi.fn();
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.useFakeTimers();
+  useAuthStore.setState({ user: { id: "bob" } as User, device: { id: "device-1" } as Device, accessToken: "old" });
+  vi.mocked(createNotificationWebSocket).mockReturnValue({ ws: null, dispose });
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+});
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+  vi.clearAllTimers();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
+it("keeps sync, sockets and timers alive across token and profile updates", async () => {
+  await act(async () => root.render(<UnlockedAppEffects />));
+  expect(createNotificationWebSocket).toHaveBeenCalledTimes(1);
+  expect(runUnlockSync).toHaveBeenCalledTimes(1);
+  const timerCount = vi.getTimerCount();
+  await act(async () => {
+    useAuthStore.setState({ accessToken: "refreshed", user: { id: "bob", displayName: "Updated" } as User });
+  });
+  expect(dispose).not.toHaveBeenCalled();
+  expect(resetMessageSyncState).not.toHaveBeenCalled();
+  expect(createNotificationWebSocket).toHaveBeenCalledTimes(1);
+  expect(runUnlockSync).toHaveBeenCalledTimes(1);
+  expect(vi.getTimerCount()).toBe(timerCount);
+});
+
+it("tears down only for a device/user change, logout or unmount", async () => {
+  await act(async () => root.render(<UnlockedAppEffects />));
+  await act(async () => { useAuthStore.setState({ device: { id: "device-2" } as Device }); });
+  expect(dispose).toHaveBeenCalledTimes(1);
+  expect(resetMessageSyncState).toHaveBeenCalledTimes(1);
+  expect(createNotificationWebSocket).toHaveBeenCalledTimes(2);
+  await act(async () => { useAuthStore.setState({ user: { id: "alice" } as User }); });
+  expect(dispose).toHaveBeenCalledTimes(2);
+  expect(createNotificationWebSocket).toHaveBeenCalledTimes(3);
+  await act(async () => { useAuthStore.setState({ user: null, accessToken: null }); });
+  expect(dispose).toHaveBeenCalledTimes(3);
+  expect(resetMessageSyncState).toHaveBeenCalledTimes(3);
+  expect(vi.getTimerCount()).toBe(0);
+  await act(async () => { useAuthStore.setState({ user: { id: "bob" } as User, accessToken: "new" }); });
+  expect(createNotificationWebSocket).toHaveBeenCalledTimes(4);
+  await act(async () => root.unmount());
+  expect(dispose).toHaveBeenCalledTimes(4);
+  expect(resetMessageSyncState).toHaveBeenCalledTimes(4);
+});

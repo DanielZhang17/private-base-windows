@@ -1,0 +1,61 @@
+name: Native Windows (debug, unsigned)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - native/windows
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/native/src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build unsigned debug executable and NSIS installer
+        run: pnpm native:build --debug
+
+      - name: Upload NSIS installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: private-base-windows-x64-debug-nsis
+          path: apps/native/src-tauri/target/debug/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload raw executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: private-base-windows-x64-debug-exe
+          path: apps/native/src-tauri/target/debug/e2ee-chat-native.exe
+          if-no-files-found: error
+          retention-days: 14

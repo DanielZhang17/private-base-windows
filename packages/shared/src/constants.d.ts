@@ -1,0 +1,24 @@
+export declare const MAX_MESSAGE_SIZE: number;
+export declare const MAX_FILE_SIZE: number;
+export declare const MAX_CUSTOM_EMOJI_SIZE: number;
+export declare const MAX_CUSTOM_EMOJIS_PER_USER = 64;
+export declare const CHUNK_SIZE: number;
+export declare const OTP_KEY_POOL_SIZE = 100;
+export declare const OTP_KEY_REPLENISH_THRESHOLD = 25;
+export declare const SIGNED_PRE_KEY_ROTATION_DAYS = 7;
+export declare const ACCESS_TOKEN_TTL: number;
+export declare const REFRESH_TOKEN_TTL: number;
+export declare const PBKDF2_ITERATIONS = 600000;
+export declare const PRESIGNED_URL_EXPIRY = 3600;
+export declare const DEVICE_LINK_REQUEST_TTL_SECONDS: number;
+export declare const UNBOUND_FILE_TTL_MS: number;
+export declare const MIN_TIMED_MESSAGE_TTL_SECONDS = 10;
+export declare const MAX_TIMED_MESSAGE_TTL_SECONDS: number;
+export declare const MESSAGE_RETENTION_MS: number;
+export declare const FILE_RETENTION_MS: number;
+export declare const HEARTBEAT_INTERVAL = 30000;
+export declare const IDLE_TIMEOUT = 60000;
+export declare const MAX_SKIPPED_KEYS = 1000;
+export declare const PROTOCOL_VERSION = 1;
+export declare const CALL_RING_TIMEOUT_MS = 30000;
+//# sourceMappingURL=constants.d.ts.map

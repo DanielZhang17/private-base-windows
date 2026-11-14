@@ -1,0 +1,25 @@
+[package]
+name = "e2ee-chat-native"
+version = "0.0.1"
+description = "Shared native shell for Private Base"
+edition = "2021"
+rust-version = "1.90"
+
+[lib]
+name = "e2ee_chat_native_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.4", features = [] }
+
+[dependencies]
+serde_json = "=1.0.154"
+tauri = { version = "=2.12.5", features = [] }
+tauri-plugin-clipboard-manager = "=2.5.0"
+tauri-plugin-dialog = "=2.8.4"
+tauri-plugin-fs = "=2.7.1"
+tauri-plugin-notification = "=2.8.1"
+tauri-plugin-opener = "=2.7.3"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

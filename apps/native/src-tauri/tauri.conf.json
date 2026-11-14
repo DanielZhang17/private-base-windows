@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Private Base",
+  "version": "0.0.1",
+  "identifier": "xyz.chat718788.e2eechat",
+  "build": {
+    "frontendDist": "../../web/dist-native",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "node scripts/dev-web.mjs",
+    "beforeBuildCommand": "node scripts/build-web.mjs"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "dragDropEnabled": false,
+        "title": "Private Base",
+        "backgroundColor": "#0f3f52",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 360,
+        "minHeight": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self' 'wasm-unsafe-eval'",
+        "worker-src": "'self' blob:",
+        "connect-src": "'self' ipc: http://ipc.localhost https://chat.718788.xyz wss://chat.718788.xyz https://chat-api.718788.xyz wss://chat-api.718788.xyz http://localhost:8787 ws://localhost:8787",
+        "img-src": "'self' blob: data: https://chat.718788.xyz https://chat-api.718788.xyz https://genshin.jmp.blue https://api.dicebear.com",
+        "media-src": "'self' blob: mediastream:",
+        "style-src": "'self' 'unsafe-inline'"
+      }
+    }
+  },
+  "plugins": {
+    "fs": {
+      "scopeDroppedPaths": false
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

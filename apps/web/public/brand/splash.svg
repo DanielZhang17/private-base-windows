@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="2048" height="2048" role="img" aria-label="E2EE Chat">
+  <defs>
+    <clipPath id="back"><rect x="196" y="192" width="456" height="392" rx="128"/></clipPath>
+  </defs>
+  <rect width="1024" height="1024" fill="#0f3f52"/>
+  <g transform="translate(512 512) scale(0.3) translate(-512 -520)">
+    <!-- back bubble -->
+    <path d="M252 480v160l148-64z" fill="#f3fafb" stroke="#f3fafb" stroke-width="20" stroke-linejoin="round"/>
+    <rect x="196" y="192" width="456" height="392" rx="128" fill="#f3fafb"/>
+    <!-- front bubble -->
+    <path d="M772 688v160l-148-64z" fill="#5fbbd3" stroke="#5fbbd3" stroke-width="20" stroke-linejoin="round"/>
+    <rect x="372" y="400" width="456" height="392" rx="128" fill="#5fbbd3"/>
+    <!-- the part only the two of them share -->
+    <rect x="372" y="400" width="456" height="392" rx="128" fill="#f6c667" clip-path="url(#back)"/>
+  </g>
+</svg>

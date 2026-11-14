@@ -1,0 +1,45 @@
+/* Dark theme tokens scoped to a full-window layer. */
+[data-theme="dark"].ui-dark-surface {
+    color-scheme: dark;
+    --canvas: #0e171c;
+    --surface: #152127;
+    --surface-raised: #1c2b33;
+    --surface-sunken: #0a1216;
+    --line: #2a3b44;
+    --border-strong: #627984;
+    --scrim: rgb(2 8 11 / 0.64);
+    --text: #e8eef0;
+    --text-muted: #a7b6bd;
+    --text-subtle: #8fa1a9;
+    --primary: #6cc3db;
+    --primary-hover: #8bd1e5;
+    --on-primary: #06222b;
+    --primary-soft: #173a47;
+    --on-primary-soft: #bfe6f0;
+    --secondary: #a7b6bd;
+    --on-secondary: #0e171c;
+    --accent: #f6c667;
+    --on-accent: #2b2000;
+    --neutral: #2a3b44;
+    --on-neutral: #e8eef0;
+    --success: #6fcfa4;
+    --on-success: #062216;
+    --success-soft: #133527;
+    --warning: #edb65a;
+    --on-warning: #2b1c00;
+    --warning-soft: #3a2b0c;
+    --danger: #f28b82;
+    --danger-hover: #f6a59e;
+    --on-danger: #3b0b07;
+    --danger-soft: #44201d;
+    --focus-ring: #6cc3db;
+    --message-own-bg: #1c6b84;
+    --message-own-fg: #f9fafb;
+    --message-incoming-bg: #22323b;
+    --message-incoming-fg: #f9fafb;
+    --send-button-bg: #1c6b84;
+    --send-button-fg: #f9fafb;
+    --elevation-1: 0 1px 2px rgb(0 0 0 / 0.4);
+    --elevation-2: 0 8px 24px rgb(0 0 0 / 0.45), 0 0 0 1px rgb(255 255 255 / 0.04);
+    --elevation-3: 0 24px 56px rgb(0 0 0 / 0.6), 0 0 0 1px rgb(255 255 255 / 0.06);
+  }

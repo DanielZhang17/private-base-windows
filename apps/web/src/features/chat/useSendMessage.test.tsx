@@ -1,0 +1,41 @@
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import type { ConversationWithMembers } from "@e2ee-chat/shared";
+import { afterEach, expect, it, vi } from "vitest";
+import { useSendMessage } from "./useSendMessage.js";
+import { useChatStore } from "../../stores/chatStore.js";
+import { getAllOutgoing } from "../../db/index.js";
+import { api } from "../../services/api.js";
+vi.mock("./useOutgoingQueue.js", () => ({ useOutgoingQueue: () => ({ outgoing: [], retry: vi.fn(), discard: vi.fn() }) }));
+vi.mock("../../stores/authStore.js", () => ({ useAuthStore: { getState: () => ({ user: { id: "alice" }, device: { id: "device" }, accessToken: "token" }) } }));
+vi.mock("../../lib/key-manager.js", () => ({ keysLoaded: () => true }));
+vi.mock("../../services/api.js", () => ({ api: { get: async () => ({}), post: vi.fn() } }));
+vi.mock("../../lib/direct-messages.js", () => ({ prepareDirectPayloadFanout: async () => ({ messages: [{ ciphertext: "opaque", iv: "iv", header: "header" }] }) }));
+vi.mock("../../lib/group-session.js", () => ({ prepareSenderKeyDistribution: vi.fn(), finishSenderKeyDistribution: vi.fn() }));
+vi.mock("../../lib/message-processor.js", () => ({ encryptGroupText: vi.fn() }));
+vi.mock("../../lib/conversation-cache.js", () => ({ touchConversationInCache: vi.fn() }));
+afterEach(() => vi.unstubAllGlobals());
+it("shows an outgoing message immediately while its ciphertext POST is pending", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  let state!: ReturnType<typeof useSendMessage>;
+  const conversation = { id: "chat", type: "direct" } as ConversationWithMembers;
+  function Probe() { state = useSendMessage(conversation); return null; }
+  let resolve!: (value: unknown) => void;
+  vi.mocked(api.post).mockReturnValue(new Promise((r) => { resolve = r; }));
+  const root = createRoot(document.createElement("div"));
+  await act(async () => root.render(<Probe />));
+  let sent!: Promise<void>;
+  act(() => { sent = state.handleSend("hello", { ttlSeconds: null }); });
+  expect(useChatStore.getState().messages.get("chat")).toMatchObject([{ content: "hello", status: "sending" }]);
+  await vi.waitFor(() => expect(api.post).toHaveBeenCalled());
+  const rows = await getAllOutgoing();
+  expect(rows).toHaveLength(1);
+  expect(JSON.stringify(rows)).not.toContain("hello");
+  await act(async () => {
+    resolve({ serverTimestamp: Date.now(), expiresAt: Date.now() + 60000, expiryKind: "retention" });
+    await sent;
+  });
+  expect(useChatStore.getState().messages.get("chat")).toMatchObject([{ content: "hello", status: "sent" }]);
+  expect(await getAllOutgoing()).toEqual([]);
+  await act(async () => root.unmount());
+});

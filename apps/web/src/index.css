@@ -1,0 +1,463 @@
+@import "tailwindcss";
+@plugin "daisyui";
+
+/*
+ * E2EE Chat design tokens. The full specification is docs/design/ui-spec.md.
+ *
+ * Layers:
+ *   1. Raw tokens (--canvas, --text, --primary, ...) on :root, swapped for dark.
+ *   2. DaisyUI "light"/"dark" themes that point at those tokens, so existing
+ *      DaisyUI classes (btn, bg-base-200, alert, ...) take the new look.
+ *   3. Tailwind utilities generated from the tokens (bg-surface, text-ink, ...)
+ *      for the primitives in src/ui.
+ */
+
+/* ── 2. DaisyUI themes ───────────────────────────────────────────────────── */
+
+@plugin "daisyui/theme" {
+  name: "light";
+  default: true;
+  prefersdark: false;
+  color-scheme: light;
+  --color-base-100: var(--surface);
+  --color-base-200: var(--canvas);
+  --color-base-300: var(--line);
+  --color-base-content: var(--text);
+  --color-primary: var(--primary);
+  --color-primary-content: var(--on-primary);
+  --color-secondary: var(--secondary);
+  --color-secondary-content: var(--on-secondary);
+  --color-accent: var(--accent);
+  --color-accent-content: var(--on-accent);
+  --color-neutral: var(--neutral);
+  --color-neutral-content: var(--on-neutral);
+  --color-info: var(--primary);
+  --color-info-content: var(--on-primary);
+  --color-success: var(--success);
+  --color-success-content: var(--on-success);
+  --color-warning: var(--warning);
+  --color-warning-content: var(--on-warning);
+  --color-error: var(--danger);
+  --color-error-content: var(--on-danger);
+  --radius-selector: 0.5rem;
+  --radius-field: 0.625rem;
+  --radius-box: 0.875rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.275rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+@plugin "daisyui/theme" {
+  name: "dark";
+  default: false;
+  prefersdark: true;
+  color-scheme: dark;
+  --color-base-100: var(--surface);
+  --color-base-200: var(--canvas);
+  --color-base-300: var(--line);
+  --color-base-content: var(--text);
+  --color-primary: var(--primary);
+  --color-primary-content: var(--on-primary);
+  --color-secondary: var(--secondary);
+  --color-secondary-content: var(--on-secondary);
+  --color-accent: var(--accent);
+  --color-accent-content: var(--on-accent);
+  --color-neutral: var(--neutral);
+  --color-neutral-content: var(--on-neutral);
+  --color-info: var(--primary);
+  --color-info-content: var(--on-primary);
+  --color-success: var(--success);
+  --color-success-content: var(--on-success);
+  --color-warning: var(--warning);
+  --color-warning-content: var(--on-warning);
+  --color-error: var(--danger);
+  --color-error-content: var(--on-danger);
+  --radius-selector: 0.5rem;
+  --radius-field: 0.625rem;
+  --radius-box: 0.875rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.275rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+/* ── 3. Tailwind utilities from tokens ───────────────────────────────────── */
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-raised: var(--surface-raised);
+  --color-sunken: var(--surface-sunken);
+  --color-line: var(--line);
+  --color-line-strong: var(--border-strong);
+  --color-ink: var(--text);
+  --color-ink-muted: var(--text-muted);
+  --color-ink-subtle: var(--text-subtle);
+  --color-brand: var(--primary);
+  --color-brand-hover: var(--primary-hover);
+  --color-on-brand: var(--on-primary);
+  --color-brand-soft: var(--primary-soft);
+  --color-on-brand-soft: var(--on-primary-soft);
+  --color-ok: var(--success);
+  --color-on-ok: var(--on-success);
+  --color-ok-soft: var(--success-soft);
+  --color-warn: var(--warning);
+  --color-on-warn: var(--on-warning);
+  --color-warn-soft: var(--warning-soft);
+  --color-danger: var(--danger);
+  --color-danger-hover: var(--danger-hover);
+  --color-on-danger: var(--on-danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-scrim: var(--scrim);
+
+  --font-sans: var(--font-ui);
+  --font-mono: var(--font-code);
+
+  --shadow-raised: var(--elevation-1);
+  --shadow-overlay: var(--elevation-2);
+  --shadow-modal: var(--elevation-3);
+
+  --animate-ui-fade: ui-fade var(--duration-base) var(--ease-enter) both;
+  --animate-ui-pop: ui-pop var(--duration-base) var(--ease-enter) both;
+  --animate-ui-sheet: ui-sheet var(--duration-slow) var(--ease-enter) both;
+  --animate-ui-toast: ui-toast var(--duration-base) var(--ease-enter) both;
+  --animate-ui-spin: ui-spin 0.8s linear infinite;
+  --animate-ui-pulse: ui-pulse 1.6s var(--ease-standard) infinite;
+}
+
+/* Shape and easing tokens. "static" keeps them defined even when no utility uses them. */
+@theme static {
+  --radius-control: 0.625rem;
+  --radius-card: 0.875rem;
+  --radius-bubble: 1.125rem;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-enter: cubic-bezier(0.05, 0.7, 0.1, 1);
+}
+
+@keyframes ui-fade { from { opacity: 0; } }
+@keyframes ui-pop { from { opacity: 0; transform: translateY(8px) scale(0.98); } }
+@keyframes ui-sheet { from { transform: translateY(100%); } }
+@keyframes ui-toast { from { opacity: 0; transform: translateY(-8px); } }
+@keyframes ui-spin { to { transform: rotate(360deg); } }
+@keyframes ui-pulse { 50% { opacity: 0.45; } }
+
+/* Safe-area helpers. Each resolves to 0 where there is no inset. */
+@utility pt-safe { padding-top: var(--safe-top); }
+@utility pb-safe { padding-bottom: var(--safe-bottom); }
+@utility pl-safe { padding-left: var(--safe-left); }
+@utility pr-safe { padding-right: var(--safe-right); }
+@utility px-safe { padding-left: var(--safe-left); padding-right: var(--safe-right); }
+@utility mb-safe { margin-bottom: var(--safe-bottom); }
+/* Minimum touch target (44px). */
+@utility tap-target { min-width: var(--tap-target); min-height: var(--tap-target); }
+/* Native window dragging (Tauri). No effect in a browser tab. */
+@utility drag-region { -webkit-app-region: drag; app-region: drag; }
+@utility no-drag { -webkit-app-region: no-drag; app-region: no-drag; }
+
+/* ── 1. Raw tokens ───────────────────────────────────────────────────────── */
+
+@layer base {
+  :root {
+    color-scheme: light;
+
+    /* Surfaces */
+    --canvas: #eef2f3;
+    --surface: #ffffff;
+    --surface-raised: #ffffff;
+    --surface-sunken: #e3e9eb;
+    --line: #d5dde0;
+    --border-strong: #7b8d96;
+    --scrim: rgb(9 22 28 / 0.48);
+
+    /* Text */
+    --text: #12222b;
+    --text-muted: #4d5f69;
+    --text-subtle: #5e707a;
+
+    /* Brand */
+    --primary: #14586e;
+    --primary-hover: #0f4759;
+    --on-primary: #ffffff;
+    --primary-soft: #d9edf2;
+    --on-primary-soft: #0f4759;
+    --secondary: #3e5560;
+    --on-secondary: #ffffff;
+    --accent: #f6c667;
+    --on-accent: #2b2000;
+    --neutral: #22343d;
+    --on-neutral: #e8eef0;
+
+    /* Status */
+    --success: #1d6f4f;
+    --on-success: #ffffff;
+    --success-soft: #ddf1e7;
+    --warning: #8a5200;
+    --on-warning: #ffffff;
+    --warning-soft: #fbebcf;
+    --danger: #b3322b;
+    --danger-hover: #962721;
+    --on-danger: #ffffff;
+    --danger-soft: #fbe3e1;
+
+    /* Focus */
+    --focus-ring: #14586e;
+
+    /* Message bubbles. UiPreferencesEffects overwrites these six on <html>
+       with the user's colours; the values here are the pre-mount defaults. */
+    --message-own-bg: #14586e;
+    --message-own-fg: #f9fafb;
+    --message-incoming-bg: #e3e9eb;
+    --message-incoming-fg: #111827;
+    --send-button-bg: #14586e;
+    --send-button-fg: #f9fafb;
+
+    /* Type */
+    --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+    --font-code: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+    --text-caption: 0.75rem;
+    --text-small: 0.8125rem;
+    --text-body: 0.9375rem;
+    --text-body-lg: 1rem;
+    --text-title: 1.125rem;
+    --text-heading: 1.375rem;
+    --text-display: 1.75rem;
+
+    /* Space (4px grid) */
+    --space-1: 0.25rem;
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-5: 1.25rem;
+    --space-6: 1.5rem;
+    --space-8: 2rem;
+    --space-10: 2.5rem;
+    --space-12: 3rem;
+
+    /* Shape */
+    --radius-bubble-tail: 0.375rem;
+
+    /* Elevation */
+    --elevation-1: 0 1px 2px rgb(9 22 28 / 0.06), 0 1px 1px rgb(9 22 28 / 0.04);
+    --elevation-2: 0 6px 20px rgb(9 22 28 / 0.1), 0 2px 6px rgb(9 22 28 / 0.06);
+    --elevation-3: 0 20px 48px rgb(9 22 28 / 0.2), 0 6px 16px rgb(9 22 28 / 0.1);
+
+    /* Motion */
+    --duration-fast: 120ms;
+    --duration-base: 180ms;
+    --duration-slow: 260ms;
+
+    /* Layout */
+    --tap-target: 2.75rem;
+    --bar-height: 3.5rem;
+    --pane-list-width: 20rem;
+    --content-width: 42rem;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-right: env(safe-area-inset-right, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-left: env(safe-area-inset-left, 0px);
+    /* Height of the native desktop title-bar strip. The native shell sets
+       data-titlebar="overlay" on <html> when the window has no system bar. */
+    --titlebar-height: 0px;
+    --titlebar-inset-start: 0px;
+    --titlebar-inset-end: 0px;
+  }
+
+  :root[data-titlebar="overlay"] {
+    --titlebar-height: 2rem;
+  }
+  :root[data-titlebar="overlay"][data-platform="macos"] {
+    --titlebar-inset-start: 4.75rem; /* traffic lights */
+  }
+  :root[data-titlebar="overlay"][data-platform="windows"] {
+    --titlebar-inset-end: 8.75rem; /* caption buttons */
+  }
+
+  /* Dark palette: system preference unless the app has chosen light … */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --canvas: #0e171c;
+      --surface: #152127;
+      --surface-raised: #1c2b33;
+      --surface-sunken: #0a1216;
+      --line: #2a3b44;
+      --border-strong: #627984;
+      --scrim: rgb(2 8 11 / 0.64);
+      --text: #e8eef0;
+      --text-muted: #a7b6bd;
+      --text-subtle: #8fa1a9;
+      --primary: #6cc3db;
+      --primary-hover: #8bd1e5;
+      --on-primary: #06222b;
+      --primary-soft: #173a47;
+      --on-primary-soft: #bfe6f0;
+      --secondary: #a7b6bd;
+      --on-secondary: #0e171c;
+      --accent: #f6c667;
+      --on-accent: #2b2000;
+      --neutral: #2a3b44;
+      --on-neutral: #e8eef0;
+      --success: #6fcfa4;
+      --on-success: #062216;
+      --success-soft: #133527;
+      --warning: #edb65a;
+      --on-warning: #2b1c00;
+      --warning-soft: #3a2b0c;
+      --danger: #f28b82;
+      --danger-hover: #f6a59e;
+      --on-danger: #3b0b07;
+      --danger-soft: #44201d;
+      --focus-ring: #6cc3db;
+      --message-own-bg: #1c6b84;
+      --message-own-fg: #f9fafb;
+      --message-incoming-bg: #22323b;
+      --message-incoming-fg: #f9fafb;
+      --send-button-bg: #1c6b84;
+      --send-button-fg: #f9fafb;
+      --elevation-1: 0 1px 2px rgb(0 0 0 / 0.4);
+      --elevation-2: 0 8px 24px rgb(0 0 0 / 0.45), 0 0 0 1px rgb(255 255 255 / 0.04);
+      --elevation-3: 0 24px 56px rgb(0 0 0 / 0.6), 0 0 0 1px rgb(255 255 255 / 0.06);
+    }
+  }
+
+  /* … and whenever the app has chosen dark. Keep in sync with the block above. */
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --canvas: #0e171c;
+    --surface: #152127;
+    --surface-raised: #1c2b33;
+    --surface-sunken: #0a1216;
+    --line: #2a3b44;
+    --border-strong: #627984;
+    --scrim: rgb(2 8 11 / 0.64);
+    --text: #e8eef0;
+    --text-muted: #a7b6bd;
+    --text-subtle: #8fa1a9;
+    --primary: #6cc3db;
+    --primary-hover: #8bd1e5;
+    --on-primary: #06222b;
+    --primary-soft: #173a47;
+    --on-primary-soft: #bfe6f0;
+    --secondary: #a7b6bd;
+    --on-secondary: #0e171c;
+    --accent: #f6c667;
+    --on-accent: #2b2000;
+    --neutral: #2a3b44;
+    --on-neutral: #e8eef0;
+    --success: #6fcfa4;
+    --on-success: #062216;
+    --success-soft: #133527;
+    --warning: #edb65a;
+    --on-warning: #2b1c00;
+    --warning-soft: #3a2b0c;
+    --danger: #f28b82;
+    --danger-hover: #f6a59e;
+    --on-danger: #3b0b07;
+    --danger-soft: #44201d;
+    --focus-ring: #6cc3db;
+    --message-own-bg: #1c6b84;
+    --message-own-fg: #f9fafb;
+    --message-incoming-bg: #22323b;
+    --message-incoming-fg: #f9fafb;
+    --send-button-bg: #1c6b84;
+    --send-button-fg: #f9fafb;
+    --elevation-1: 0 1px 2px rgb(0 0 0 / 0.4);
+    --elevation-2: 0 8px 24px rgb(0 0 0 / 0.45), 0 0 0 1px rgb(255 255 255 / 0.04);
+    --elevation-3: 0 24px 56px rgb(0 0 0 / 0.6), 0 0 0 1px rgb(255 255 255 / 0.06);
+  }
+
+  html {
+    font-family: var(--font-ui);
+    -webkit-tap-highlight-color: transparent;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    touch-action: manipulation;
+    overscroll-behavior: contain;
+    background-color: var(--canvas);
+    color: var(--text);
+  }
+
+  body {
+    overscroll-behavior: contain;
+    font-size: var(--text-body);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* 16px keeps iOS Safari from zooming the page when a field takes focus. */
+  input, textarea, select {
+    font-size: 16px;
+  }
+
+  /* Visible focus ring for keyboard navigation */
+  :focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--primary-soft);
+    color: var(--on-primary-soft);
+  }
+
+  /* Respect reduced motion preference */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  .send-button-themed {
+    background-color: var(--send-button-bg);
+    border-color: var(--send-button-bg);
+    color: var(--send-button-fg);
+  }
+
+  .send-button-themed:hover:not(:disabled),
+  .send-button-themed:focus-visible:not(:disabled) {
+    filter: brightness(0.95);
+  }
+
+  /* Message bubbles. Colours always come from the user-preference variables. */
+  .bubble {
+    max-width: min(34rem, 82%);
+    padding: 0.5rem 0.75rem;
+    border-radius: var(--radius-bubble);
+    font-size: var(--text-body);
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+  .bubble-own {
+    background-color: var(--message-own-bg);
+    color: var(--message-own-fg);
+    border-end-end-radius: var(--radius-bubble-tail);
+  }
+  .bubble-incoming {
+    background-color: var(--message-incoming-bg);
+    color: var(--message-incoming-fg);
+    border-end-start-radius: var(--radius-bubble-tail);
+  }
+  .bubble-failed {
+    outline: 1.5px dashed var(--danger);
+    outline-offset: 2px;
+    opacity: 0.85;
+  }
+
+  /* Long secrets and codes: recovery key, safety number, link code. */
+  .secret-text {
+    font-family: var(--font-code);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.04em;
+    overflow-wrap: anywhere;
+    user-select: all;
+  }
+}

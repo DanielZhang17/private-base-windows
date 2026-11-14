@@ -1,0 +1,22 @@
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import Layout from "./Layout.js";
+vi.mock("../../features/chat/useOutgoingQueue.js", () => ({ useOutgoingQueue: vi.fn() }));
+vi.mock("../../features/chat/useShell.js", () => ({ useShell: () => ({ user: null, isOnline: false, unread: 2 }) }));
+vi.mock("../../pages/ChatListPage.js", () => ({ default: () => <h1>Chats</h1> }));
+vi.mock("../calls/IncomingCallModal.js", () => ({ default: () => null }));
+let root: Root; let container: HTMLDivElement;
+beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); container = document.createElement("div"); root = createRoot(container); });
+afterEach(async () => { await act(async () => root.unmount()); vi.unstubAllGlobals(); });
+it("mounts one list and one route surface in the responsive shell", async () => {
+  await act(async () => root.render(<MemoryRouter initialEntries={["/chat/mara"]}><Routes><Route element={<Layout />}><Route path="chat/:conversationId" element={<div data-testid="conversation">Conversation</div>} /></Route></Routes></MemoryRouter>));
+  expect(container.querySelectorAll("h1")).toHaveLength(1);
+  expect(container.querySelectorAll('[data-testid="conversation"]')).toHaveLength(1);
+  expect(container.querySelectorAll("aside")).toHaveLength(1);
+  expect(container.querySelectorAll("main")).toHaveLength(1);
+  expect(container.textContent).toContain("You are offline. Messages will send when you reconnect.");
+  expect(container.querySelectorAll('[data-tauri-drag-region]')).toHaveLength(1);
+  expect(document.documentElement.hasAttribute("data-titlebar")).toBe(false);
+});

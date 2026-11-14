@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.turbo/
+.wrangler/
+.dev.vars
+*.local
+.env
+.env.*
+!.env.example
+apps/web/dist-native/
+apps/native/src-tauri/target/
+apps/native/src-tauri/gen/
+/backups/

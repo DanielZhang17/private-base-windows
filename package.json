@@ -1,0 +1,29 @@
+{
+  "name": "e2ee-chat",
+  "private": true,
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "native:dev": "pnpm --filter @e2ee-chat/native dev:native",
+    "native:build": "pnpm --filter @e2ee-chat/native build",
+    "native:android": "node apps/native/scripts/platform-placeholder.mjs android",
+    "native:ios": "node apps/native/scripts/platform-placeholder.mjs ios",
+    "lint": "turbo lint",
+    "smoke:preview": "node scripts/smoke-preview.mjs",
+    "typecheck": "turbo typecheck",
+    "clean": "turbo clean",
+    "postinstall": "node scripts/fix-libsodium-wrappers-sumo.cjs"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.0",
+    "typescript": "^5.8.0"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd",
+      "sharp"
+    ]
+  }
+}
