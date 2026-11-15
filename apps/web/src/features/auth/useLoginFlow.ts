@@ -28,6 +28,7 @@ import {
 } from "../../lib/key-manager.js";
 import { api } from "../../services/api.js";
 import { buildDefaultDeviceName, signDeviceLinkCompletion } from "../../lib/device-link.js";
+import { signInWithNativePasskey } from "../../lib/native-passkeys.js";
 import { getPasskeyAssertion, PasskeyUnsupportedError } from "../../lib/webauthn.js";
 import { capabilities } from "../../platform/capabilities.js";
 
@@ -431,7 +432,7 @@ export function useLoginFlow() {
   };
 
   const handlePasskeyLogin = async () => {
-    if (!capabilities.passkeys) {
+    if (!capabilities.passkeys && !capabilities.nativePasskeys) {
       setError(toErrorMessage(new PasskeyUnsupportedError()));
       return;
     }
@@ -444,6 +445,13 @@ export function useLoginFlow() {
     try {
       if (!deviceId || !await hasLocalKeyMaterial()) {
         setError(localized("passkeyLoginRequiresAPreviouslyLinkedDeviceOn"));
+        return;
+      }
+      if (capabilities.nativePasskeys) {
+        const auth = await signInWithNativePasskey(deviceId);
+        lockLocalCryptoState();
+        applyAuthResponse(auth);
+        navigate("/");
         return;
       }
       if (!normalizedUsername) {
@@ -550,7 +558,7 @@ export function useLoginFlow() {
     retryLink: () => retryPendingLink.current?.(),
     recoveryRetry,
     capabilities,
-    passkeysSupported: capabilities.passkeys,
+    passkeysSupported: capabilities.passkeys || capabilities.nativePasskeys,
     signInAsOwner,
     cancelLink,
     forgetLocalKeys,

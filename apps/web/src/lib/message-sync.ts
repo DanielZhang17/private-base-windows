@@ -37,6 +37,7 @@ import { decryptGroupText, decryptMessage, type IncomingMessage } from "./messag
 import { classifyReceiveError, ConversationMetadataError, MissingSenderKeyError, withSessionLock, type ReceiveContext, type ReceiveState } from "./receive.js";
 import { parseCallOffer, validateFilePayload } from "./receive-validation.js";
 import { consumeOneTimePreKey } from "./key-manager.js";
+import { capabilities } from "../platform/capabilities.js";
 
 const conversationCache = new Map<string, ConversationWithMembers>();
 const inFlightDecryptIds = new Map<string, Promise<void>>();
@@ -372,6 +373,8 @@ async function ingestFrame(frame: WSMessageFrame, session: MessageSession, lockK
   const { activeConversationId, incrementUnread, conversations } = useChatStore.getState();
   if (activeConversationId !== frame.conversationId) {
     incrementUnread(frame.conversationId);
+  }
+  if (activeConversationId !== frame.conversationId || capabilities.nativeCallNotifications) {
     if (Date.now() - frame.timestamp < 30_000 && document.visibilityState !== "visible") {
       const conv = conversations.find((c) => c.id === frame.conversationId);
       const sender = conv?.members.find((m) => m.userId === frame.senderId);

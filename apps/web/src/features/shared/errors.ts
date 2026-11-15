@@ -97,6 +97,7 @@ const rawErrorKeys: TranslationKey[] = [
   "usernameTaken",
 ];
 const rawErrors = new Map<string, TranslationKey>(rawErrorKeys.map((key) => [en[key], key]));
+rawErrors.set("One or more users are unavailable", "personCannotBeAdded");
 
 export function toErrorMessage(error: unknown, fallback: TranslationKey = "genericError"): LocalizedMessage {
   if (error instanceof LocalizedError) return error.localizedMessage;

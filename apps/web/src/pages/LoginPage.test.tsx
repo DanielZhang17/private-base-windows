@@ -32,6 +32,7 @@ vi.mock("../lib/device-link.js", () => ({
   buildDefaultDeviceName: () => "Test browser",
   signDeviceLinkCompletion: vi.fn(async () => "signature"),
 }));
+vi.mock("../lib/native-passkeys.js", () => ({ signInWithNativePasskey: vi.fn() }));
 vi.mock("../lib/webauthn.js", () => ({ isWebAuthnSupported: () => false, getPasskeyAssertion: vi.fn() }));
 
 let root: Root;
@@ -414,4 +415,24 @@ it("shows the passkey action only when the platform supports it", async () => {
     await act(async () => root.render(<MemoryRouter><LoginPage /></MemoryRouter>));
     expect(container.textContent).toContain("Sign in with a passkey");
   } finally { passkeys.mockRestore(); }
+});
+
+it("shows native passkey login and preserves the local-key password unlock step", async () => {
+  const { capabilities } = await import("../platform/capabilities.js");
+  const { signInWithNativePasskey } = await import("../lib/native-passkeys.js");
+  const native = vi.spyOn(capabilities, "nativePasskeys", "get").mockReturnValue(true);
+  const web = vi.spyOn(capabilities, "passkeys", "get").mockReturnValue(false);
+  vi.mocked(signInWithNativePasskey).mockResolvedValue(auth as never);
+  useAuthStore.setState({ device: { id: "existing-device" } } as never);
+  vi.mocked(keyManager.hasLocalKeyMaterial).mockResolvedValue(true);
+  try {
+    await act(async () => root.render(<MemoryRouter><LoginPage /></MemoryRouter>));
+    expect(container.textContent).toContain("Sign in with a passkey");
+    await click("Sign in with a passkey");
+    expect(signInWithNativePasskey).toHaveBeenCalledWith("existing-device");
+    expect(keyManager.lockLocalCryptoState).toHaveBeenCalled();
+    expect(applyAuthResponse).toHaveBeenCalledWith(auth);
+    expect(keyManager.loadKeys).not.toHaveBeenCalled();
+    expect(api.post).not.toHaveBeenCalled();
+  } finally { native.mockRestore(); web.mockRestore(); }
 });

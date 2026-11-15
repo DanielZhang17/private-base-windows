@@ -1,15 +1,16 @@
 import { localized, renderMessage, LocalizedError, type LocalizedMessage } from "../../i18n/messages.js";
 import { toErrorMessage } from "../shared/errors.js";
 import { t, useLocale } from "../../i18n/index.js";
-import { useOutgoingQueue } from "../chat/useOutgoingQueue.js";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useMatch } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
+import { useToast } from "../../ui/index.js";
 import type { ConversationWithMembers, GetCallResponse, WSSignalFrame } from "@e2ee-chat/shared";
 import { WSFrameType } from "@e2ee-chat/shared";
 import { fromBase64Url } from "@e2ee-chat/crypto";
 import { useCallStore } from "../../stores/callStore.js";
 import { useAuthStore } from "../../stores/authStore.js";
 
+import { cleanupCallBestEffort } from "../../services/call-cleanup.js";
 import { api, resolveWsBaseUrl } from "../../services/api.js";
 import {
   addSenderTransform,
@@ -17,6 +18,7 @@ import {
   createPeerConnection,
   acceptCallOffer,
   deriveCallKey,
+  disposeCallTransforms,
   supportsE2EECalling,
   sendSignal,
   type CallFrameKey,
@@ -25,6 +27,8 @@ import { deletePendingCall, getPendingCall } from "../../db/index.js";
 import { syncMessages } from "../../lib/message-sync.js";
 import { captureUserMedia, captureDisplayMedia } from "../../platform/media.js";
 import { E2EECallUnsupportedError } from "../../platform/calls.js";
+import type { PendingLocalAcceptance } from "./useCallInvitationOwner.js";
+import { isSameSession } from "../../services/session-identity.js";
 
 type Stage = "loading" | "ringing" | "connecting" | "connected" | "ended";
 
@@ -37,37 +41,50 @@ function conversationDisplayName(conversation: ConversationWithMembers | null, l
     .join(", ");
 }
 
-export function useCall() {
+export function useCallSession(callId: string | undefined, pendingAcceptance: PendingLocalAcceptance | null = null,
+  finishNativeCaptureWait?: (callId: string, epoch: number) => void) {
+  const nativeAcceptanceRef = useRef(pendingAcceptance);
+  nativeAcceptanceRef.current = pendingAcceptance;
+  const finishCaptureWaitRef = useRef(finishNativeCaptureWait);
+  finishCaptureWaitRef.current = finishNativeCaptureWait;
   useLocale();
-  useOutgoingQueue();
-  const match = useMatch("/call/:callId");
-  const storeCallId = useCallStore((state) => state.activeCallId);
-  const callId = storeCallId || match?.params?.callId;
-
   const navigate = useNavigate();
+  const location = useLocation();
+  const pathnameRef = useRef(location.pathname);
+  pathnameRef.current = location.pathname;
+  const toast = useToast();
   const user = useAuthStore((state) => state.user);
   const userId = user?.id;
+  const deviceId = useAuthStore((state) => state.device?.id);
+  const sessionId = useAuthStore((state) => state.sessionId);
+  const legacyEpoch = useAuthStore((state) => !state.sessionId && !state.device?.id ? state.authEpoch : undefined);
+  const sessionEpochRef = useRef(0);
+  const callAuthRef = useRef(useAuthStore.getState());
+  const localCallEpochRef = useRef(useCallStore.getState().localCallEpoch);
+  const currentCallIdRef = useRef(callId);
+  currentCallIdRef.current = callId;
   const mountedRef = useRef(true);
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
   const {
     callType,
     callStatus,
+    localCallOwnership,
+    releaseCallOwnership,
+    conversationName: storedConversationName,
     localStream,
     remoteStreams,
     isMuted,
     isVideoOff,
-    isMinimized,
     setMinimized,
     setLocalStream,
     addRemoteStream,
     hydrateCall,
     clearCall,
+    clearAllCalls,
     toggleMute,
     toggleVideo,
   } = useCallStore();
-  const callerAvatarUrl = useCallStore((state) => state.callerAvatarUrl);
 
-  const localVideoRef = useRef<HTMLVideoElement>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const videoSenderRef = useRef<RTCRtpSender | null>(null);
@@ -89,9 +106,11 @@ export function useCall() {
   const screenTrackRef = useRef<MediaStreamTrack | null>(null);
   const setupStartedRef = useRef(false);
   const endingRef = useRef(false);
+  const endHandledRef = useRef(false);
   const connectingTimeoutCleanupRef = useRef<(() => void) | null>(null);
   const [stage, setStage] = useState<Stage>("loading");
   const [isSharingScreen, setIsSharingScreen] = useState(false);
+  const [stateCallId, setStateCallId] = useState<string>();
   const [callInfo, setCallInfo] = useState<GetCallResponse | null>(null);
   const [conversation, setConversation] = useState<ConversationWithMembers | null>(null);
   const [error, setError] = useState<LocalizedMessage | null>(null);
@@ -100,10 +119,28 @@ export function useCall() {
   const durationTimerRef = useRef<number | null>(null);
   const canShareScreen = typeof navigator !== "undefined" && typeof navigator.mediaDevices?.getDisplayMedia === "function";
 
-  const conversationName = useMemo(
-    () => conversationDisplayName(conversation, user?.id),
-    [conversation, user?.id],
-  );
+  const conversationName = conversation
+    ? conversationDisplayName(conversation, userId)
+    : storedConversationName ?? t("callScreenTitle");
+  // Presentation identity is independent of who initiated the call.
+  const isGroupCall = conversation?.type === "group";
+  const peer = conversation?.members.find((member) => member.userId !== userId)?.user;
+  const peerName = isGroupCall ? conversationName : peer?.displayName ?? conversationName;
+  const peerAvatarUrl = isGroupCall ? conversation?.avatarUrl ?? null : peer?.avatarUrl ?? null;
+
+  const isCurrentEpoch = (epoch: number) => {
+    const auth = useAuthStore.getState();
+    return mountedRef.current && sessionEpochRef.current === epoch && currentCallIdRef.current === callId &&
+      auth.user?.id === callAuthRef.current.user?.id && auth.device?.id === callAuthRef.current.device?.id &&
+      isSameSession(callAuthRef.current, auth);
+  };
+  const isRunningSession = (epoch: number) => {
+    const current = useCallStore.getState();
+    return isCurrentEpoch(epoch) && current.localCallEpoch === localCallEpochRef.current && !endingRef.current && !!callId &&
+      current.activeCallId === callId && current.localCallOwnership?.callId === callId &&
+      (current.callStatus === "ringing" || current.callStatus === "active") &&
+      useAuthStore.getState().user?.id === userId;
+  };
 
   function formatDuration(seconds: number): string {
     const m = Math.floor(seconds / 60).toString().padStart(2, "0");
@@ -112,9 +149,10 @@ export function useCall() {
   }
 
   useEffect(() => {
+    const epoch = sessionEpochRef.current;
     if (stage === "connected") {
       durationTimerRef.current = window.setInterval(() => {
-        setCallDuration((d) => d + 1);
+        if (isRunningSession(epoch)) setCallDuration((d) => isRunningSession(epoch) ? d + 1 : d);
       }, 1000);
     } else if (stage !== "ended") {
       setCallDuration(0);
@@ -125,13 +163,38 @@ export function useCall() {
         durationTimerRef.current = null;
       }
     };
-  }, [stage]);
+  }, [stage, callId]);
+
+  // The provider stays mounted across routes and calls. Reset per-call UI/refs here.
+  useEffect(() => {
+    callAuthRef.current = useAuthStore.getState();
+    localCallEpochRef.current = useCallStore.getState().localCallEpoch;
+    endingRef.current = false;
+    endHandledRef.current = false;
+    setupStartedRef.current = false;
+    callKeyRef.current = null;
+    setStateCallId(callId);
+    setCallInfo(null);
+    setConversation(null);
+    setError(null);
+    setCallUnsupported(false);
+    setCallDuration(0);
+    setIsSharingScreen(false);
+    setStage("loading");
+    return () => {
+      sessionEpochRef.current += 1;
+      wsRef.current?.close();
+      pcRef.current?.close();
+      stopAcquiredTracks();
+      useCallStore.getState().remoteStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
+      disposeCallTransforms();
+    };
+  }, [callId]);
 
   useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
-    }
-  }, [localStream]);
+    const previous = callAuthRef.current;
+    if (previous.user?.id !== userId || previous.device?.id !== deviceId || !isSameSession(previous, useAuthStore.getState())) clearAllCalls();
+  }, [userId, deviceId, sessionId, legacyEpoch, clearAllCalls]);
 
   useEffect(() => {
     if (!callId || !user) return;
@@ -139,27 +202,36 @@ export function useCall() {
     const currentCallId = callId;
     const currentUser = user;
     let cancelled = false;
+    const epoch = sessionEpochRef.current;
+    const isCurrent = () => !cancelled && isRunningSession(epoch);
 
     async function loadCall() {
       try {
+        if (!isCurrent()) return;
         const info = await api.get<GetCallResponse>(`/api/calls/${currentCallId}`);
+        if (!isCurrent()) return;
         const conversationDetails = await api.get<ConversationWithMembers>(`/api/conversations/${info.conversationId}`);
+        if (!isCurrent()) return;
 
         let pendingCall = await getPendingCall(currentCallId);
+        if (!isCurrent()) return;
         if (!pendingCall) {
           await syncMessages({ force: true });
+          if (!isCurrent()) return;
           pendingCall = await getPendingCall(currentCallId);
+          if (!isCurrent()) return;
         }
         if (!pendingCall || pendingCall.expiresAt <= Date.now()) {
           throw new LocalizedError("secureCallKeyNotFoundOnThisDevice");
         }
 
-        if (cancelled) return;
+        if (!isCurrent()) return;
 
         const key = await deriveCallKey(fromBase64Url(pendingCall.callKey), currentCallId);
-        if (cancelled) return;
+        if (!isCurrent()) return;
         callKeyRef.current = key;
 
+        setStateCallId(currentCallId);
         setCallInfo(info);
         setConversation(conversationDetails);
         hydrateCall({
@@ -177,7 +249,8 @@ export function useCall() {
         });
         setStage(info.status === "active" ? "connecting" : info.status === "ringing" ? "ringing" : "ended");
       } catch (err: any) {
-        if (!cancelled) {
+        if (isCurrent()) {
+          setStateCallId(currentCallId);
           setError(toErrorMessage(err, "failedToLoadCall"));
           setStage("ended");
         }
@@ -192,8 +265,8 @@ export function useCall() {
   }, [callId, hydrateCall, userId]);
 
   useEffect(() => {
-    if (!callId || !callInfo || !callKeyRef.current || !user) return;
-    if (callStatus !== "active") return;
+    if (!callId || callInfo?.id !== callId || !callKeyRef.current || !user) return;
+    if (callStatus !== "active" || localCallOwnership?.callId !== callId) return;
     if (setupStartedRef.current) return;
 
     const currentCallId = callId;
@@ -201,24 +274,61 @@ export function useCall() {
     const currentCallKey = callKeyRef.current;
     const currentUser = user;
     let cancelled = false;
+    const epoch = sessionEpochRef.current;
+    const isCurrent = () => !cancelled && isRunningSession(epoch);
+    let sessionPc: RTCPeerConnection | null = null;
+    let sessionWs: WebSocket | null = null;
+    let sessionStream: MediaStream | null = null;
+    let clearConnectingTimeout = () => {};
+    const visibilityWait = new AbortController();
+    const waitForNativeVisibility = async () => {
+      while (isCurrent() && nativeAcceptanceRef.current?.callId === currentCallId && document.hidden) {
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            document.removeEventListener("visibilitychange", changed);
+            visibilityWait.signal.removeEventListener("abort", done);
+            resolve();
+          };
+          const changed = () => { if (!document.hidden) done(); };
+          document.addEventListener("visibilitychange", changed);
+          visibilityWait.signal.addEventListener("abort", done, { once: true });
+          if (!document.hidden || visibilityWait.signal.aborted) done();
+        });
+      }
+      return isCurrent();
+    };
     setupStartedRef.current = true;
 
     async function startCall() {
       try {
+        if (!isCurrent()) return;
         if (!supportsE2EECalling()) {
           throw new E2EECallUnsupportedError();
         }
+        if (nativeAcceptanceRef.current?.callId === currentCallId && !await waitForNativeVisibility()) return;
 
         // Validate the encrypted peer before asking for camera/microphone access.
         const pc = await createPeerConnection(currentCallId, currentCallKey, (remoteStream) => {
+          if (!isCurrent()) { remoteStream.getTracks().forEach((track) => track.stop()); return; }
           addRemoteStream("remote", remoteStream);
           setStage("connected");
-        });
-        if (cancelled) {
+        }, isCurrent);
+        if (!isCurrent()) {
           pc.close();
           return;
         }
+        sessionPc = pc;
         pcRef.current = pc;
+
+        // Native consent survives backgrounding; initial capture still requires visibility.
+        while (nativeAcceptanceRef.current?.callId === currentCallId && document.hidden) {
+          if (!await waitForNativeVisibility()) return;
+        }
+        if (!isCurrent()) return;
+        const acceptance = nativeAcceptanceRef.current;
+        if (acceptance?.callId === currentCallId) {
+          finishCaptureWaitRef.current?.(acceptance.callId, acceptance.epoch);
+        }
 
         const mediaStream = await captureUserMedia({
           audio: true,
@@ -226,11 +336,13 @@ export function useCall() {
             ? { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }
             : false,
         });
-        if (cancelled) {
+        if (!isCurrent()) {
           mediaStream.getTracks().forEach((track) => track.stop());
+          pc.close();
           return;
         }
 
+        sessionStream = mediaStream;
         rememberStream(mediaStream);
         setLocalStream(mediaStream);
         cameraTrackRef.current = mediaStream.getVideoTracks()[0] ?? null;
@@ -240,19 +352,23 @@ export function useCall() {
 
         // --- Connection state monitoring with ICE restart ---
         pc.onconnectionstatechange = () => {
-          if (cancelled) return;
+          if (!isCurrent()) return;
           const state = pc.connectionState;
           if (state === "connected") {
             setStage("connected");
           } else if (state === "failed") {
             // Attempt ICE restart before giving up
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
+            const restartSocket = sessionWs;
+            if (restartSocket?.readyState === WebSocket.OPEN) {
               void (async () => {
                 try {
                   const restartOffer = await pc.createOffer({ iceRestart: true });
+                  if (!isCurrent()) return;
                   await pc.setLocalDescription(restartOffer);
-                  sendSignal(wsRef.current!, { kind: "offer", sdp: restartOffer.sdp, fromUserId: currentUser.id });
+                  if (!isCurrent()) return;
+                  sendSignal(restartSocket, { kind: "offer", sdp: restartOffer.sdp, fromUserId: currentUser.id });
                 } catch {
+                  if (!isCurrent()) return;
                   setError(localized("connectionFailed"));
                   setStage("ended");
                 }
@@ -270,7 +386,7 @@ export function useCall() {
         let wsOpen = false;
 
         const flushOutgoingCandidates = () => {
-          while (outgoingCandidateQueue.length > 0) {
+          while (isCurrent() && outgoingCandidateQueue.length > 0) {
             const c = outgoingCandidateQueue.shift()!;
             sendSignal(ws, {
               kind: "ice-candidate",
@@ -283,18 +399,20 @@ export function useCall() {
         };
 
         const flushIncomingCandidates = async () => {
-          while (incomingCandidateQueue.length > 0) {
+          while (isCurrent() && incomingCandidateQueue.length > 0) {
             const c = incomingCandidateQueue.shift()!;
-            await pcRef.current?.addIceCandidate(new RTCIceCandidate(c));
+            await pc.addIceCandidate(new RTCIceCandidate(c));
+            if (!isCurrent()) return;
           }
         };
 
         const ws = new WebSocket(`${resolveWsBaseUrl()}/ws/call/${currentCallId}`, [`token.${useAuthStore.getState().accessToken}`]);
+        sessionWs = ws;
         wsRef.current = ws;
 
         // Buffer outgoing ICE candidates until WS is open
         pc.onicecandidate = (event) => {
-          if (!event.candidate) return;
+          if (!isCurrent() || !event.candidate) return;
           const candidate: RTCIceCandidateInit = {
             candidate: event.candidate.candidate,
             sdpMid: event.candidate.sdpMid,
@@ -315,79 +433,86 @@ export function useCall() {
 
         // Queue incoming ICE candidates until remote description is set
         ws.onmessage = async (event) => {
-          if (cancelled) return;
+          if (!isCurrent()) return;
           try {
             const frame = JSON.parse(event.data);
             if (frame.type !== WSFrameType.Signal) return;
             const signal = (frame as WSSignalFrame).payload;
 
-            if (signal.kind === "offer" && pcRef.current) {
-              await acceptCallOffer(pcRef.current, ws, signal.sdp!);
+            if (signal.kind === "offer") {
+              await acceptCallOffer(pc, ws, signal.sdp!, isCurrent);
+              if (!isCurrent()) return;
               // Remote description is now set — flush queued incoming candidates
               await flushIncomingCandidates();
-            } else if (signal.kind === "answer" && pcRef.current) {
-              await pcRef.current.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp! }));
+              if (!isCurrent()) return;
+            } else if (signal.kind === "answer") {
+              await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp! }));
+              if (!isCurrent()) return;
               // Remote description is now set — flush queued incoming candidates
               await flushIncomingCandidates();
-            } else if (signal.kind === "ice-candidate" && signal.candidate && pcRef.current) {
+              if (!isCurrent()) return;
+            } else if (signal.kind === "ice-candidate" && signal.candidate) {
               const candidate: RTCIceCandidateInit = {
                 candidate: signal.candidate,
                 sdpMid: signal.sdpMid,
                 sdpMLineIndex: signal.sdpMLineIndex ?? undefined,
               };
-              if (pcRef.current.remoteDescription) {
-                await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+              if (pc.remoteDescription) {
+                await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                if (!isCurrent()) return;
               } else {
                 incomingCandidateQueue.push(candidate);
               }
             }
           } catch (error: any) {
-            if (!cancelled) { setCallUnsupported(error instanceof E2EECallUnsupportedError); setError(toErrorMessage(error, "callSignalingFailed")); setStage("ended"); }
+            if (isCurrent()) { setCallUnsupported(error instanceof E2EECallUnsupportedError); setError(toErrorMessage(error, "callSignalingFailed")); setStage("ended"); }
           }
         };
 
         ws.onopen = async () => {
-          if (cancelled) return;
+          if (!isCurrent()) return;
           try {
             wsOpen = true;
             // Flush any ICE candidates that were generated before WS connected
             flushOutgoingCandidates();
 
-            if (currentCallInfo.initiatorId !== currentUser.id || !pcRef.current) return;
-            const offer = await pcRef.current.createOffer();
-            await pcRef.current.setLocalDescription(offer);
+            if (currentCallInfo.initiatorId !== currentUser.id) return;
+            const offer = await pc.createOffer();
+            if (!isCurrent()) return;
+            await pc.setLocalDescription(offer);
+            if (!isCurrent()) return;
             sendSignal(ws, { kind: "offer", sdp: offer.sdp, fromUserId: currentUser.id });
           } catch (error: any) {
-            if (!cancelled) { setCallUnsupported(error instanceof E2EECallUnsupportedError); setError(toErrorMessage(error, "callSignalingFailed")); setStage("ended"); }
+            if (isCurrent()) { setCallUnsupported(error instanceof E2EECallUnsupportedError); setError(toErrorMessage(error, "callSignalingFailed")); setStage("ended"); }
           }
         };
 
         ws.onerror = () => {
-          if (cancelled) return;
+          if (!isCurrent()) return;
           console.error("Call signaling WebSocket error");
         };
 
         ws.onclose = () => {
-          if (cancelled) return;
+          if (!isCurrent()) return;
           wsOpen = false;
         };
 
         // --- Connecting timeout: give up after 30s if still not connected ---
         const connectingTimeout = window.setTimeout(() => {
-          if (pcRef.current?.connectionState !== "connected" && !cancelled) {
+          if (isCurrent() && pc.connectionState !== "connected") {
             setError(localized("couldNotEstablishConnection"));
             setStage("ended");
           }
         }, 30_000);
-        const origCleanup = () => {
+        clearConnectingTimeout = () => {
           window.clearTimeout(connectingTimeout);
         };
         // Store cleanup for the effect return
-        connectingTimeoutCleanupRef.current = origCleanup;
+        connectingTimeoutCleanupRef.current = clearConnectingTimeout;
 
         setStage("connecting");
       } catch (err: any) {
-        if (cancelled) return;
+        if (!isCurrent()) return;
         console.error("Call setup failed:", err);
         setCallUnsupported(err instanceof E2EECallUnsupportedError);
         setError(toErrorMessage(err, "callSetupFailed"));
@@ -399,20 +524,20 @@ export function useCall() {
 
     return () => {
       cancelled = true;
+      visibilityWait.abort();
       setupStartedRef.current = false;
-      connectingTimeoutCleanupRef.current?.();
-      wsRef.current?.close();
-      pcRef.current?.close();
-      screenTrackRef.current?.stop();
-      cameraTrackRef.current?.stop();
-      useCallStore.getState().localStream?.getTracks().forEach((track) => track.stop());
-      setLocalStream(null);
-      videoSenderRef.current = null;
+      clearConnectingTimeout();
+      sessionWs?.close();
+      sessionPc?.close();
+      sessionStream?.getTracks().forEach((track) => track.stop());
+      if (useCallStore.getState().localStream === sessionStream) setLocalStream(null);
+      if (wsRef.current === sessionWs) wsRef.current = null;
+      if (pcRef.current === sessionPc) { pcRef.current = null; videoSenderRef.current = null; }
     };
-  }, [addRemoteStream, callId, callInfo, callStatus, setLocalStream, userId]);
+  }, [addRemoteStream, callId, callInfo, callStatus, localCallOwnership, setLocalStream, userId]);
 
   useEffect(() => {
-    if (!callStatus || (stage === "ended" && (callStatus === "active" || callStatus === "ringing"))) return;
+    if (!callId || !callStatus || (stage === "ended" && (callStatus === "active" || callStatus === "ringing"))) return;
     if (callStatus === "ringing") {
       setStage((current) => current === "ended" ? current : "ringing");
       return;
@@ -436,7 +561,13 @@ export function useCall() {
   }, [callId, callStatus, localStream, setLocalStream, stage]);
 
   useEffect(() => {
-    if (stage !== "ended") return;
+    if (!callId || stateCallId !== callId || stage !== "ended") return;
+    endingRef.current = true;
+    sessionEpochRef.current += 1;
+    const epoch = sessionEpochRef.current;
+    releaseCallOwnership(callId);
+    stopAcquiredTracks();
+    useCallStore.getState().remoteStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
     connectingTimeoutCleanupRef.current?.();
     wsRef.current?.close();
     pcRef.current?.close();
@@ -444,13 +575,20 @@ export function useCall() {
     cameraTrackRef.current?.stop();
     useCallStore.getState().localStream?.getTracks().forEach((track) => track.stop());
     setLocalStream(null);
+    disposeCallTransforms();
     const targetConversationId = callInfo?.conversationId;
+    const onCallScreen = pathnameRef.current === `/call/${callId}`;
+    if (!onCallScreen) toast.show({ message: error ? renderMessage(error) : t("callEnded"), tone: error ? "danger" : "info" });
     const timer = window.setTimeout(() => {
-      clearCall();
-      navigate(targetConversationId ? `/chat/${targetConversationId}` : "/");
+      if (!isCurrentEpoch(epoch)) return;
+      const current = useCallStore.getState();
+      if (current.activeCallId && current.activeCallId !== callId) return;
+      if (current.pendingCallStart && current.pendingCallStart.callId !== callId) return;
+      clearCall(callId);
+      if (pathnameRef.current === `/call/${callId}`) navigate(targetConversationId ? `/chat/${targetConversationId}` : "/");
     }, 3000);
     return () => window.clearTimeout(timer);
-  }, [stage, callInfo?.conversationId, clearCall, navigate]);
+  }, [callId, stateCallId, stage, callInfo?.conversationId, clearCall, releaseCallOwnership, navigate, toast.show]);
 
   useEffect(() => {
     return () => {
@@ -464,19 +602,24 @@ export function useCall() {
   }, []);
 
   const replaceOutgoingVideoTrack = async (nextTrack: MediaStreamTrack | null) => {
+    const epoch = sessionEpochRef.current;
     const videoSender = videoSenderRef.current;
-    if (!videoSender) return;
+    if (!isRunningSession(epoch)) return false;
+    if (!videoSender) return true;
     await videoSender.replaceTrack(nextTrack);
+    if (!isRunningSession(epoch)) return false;
     if (nextTrack && callKeyRef.current) {
       addSenderTransform(videoSender, callKeyRef.current);
     }
+    return true;
   };
 
   const toggleScreenShare = async () => {
-    if (callType !== "video" || !localStream || !canShareScreen) return;
+    const epoch = sessionEpochRef.current;
+    if (!isRunningSession(epoch) || callType !== "video" || !localStream || !canShareScreen) return;
 
     if (isSharingScreen) {
-      await replaceOutgoingVideoTrack(cameraTrackRef.current);
+      if (!await replaceOutgoingVideoTrack(cameraTrackRef.current) || !isRunningSession(epoch)) return;
       if (cameraTrackRef.current) {
         setLocalStream(new MediaStream([...localStream.getAudioTracks(), cameraTrackRef.current]));
       }
@@ -488,46 +631,48 @@ export function useCall() {
 
     try {
       const displayStream = await captureDisplayMedia({ video: true, audio: false });
-      if (!mountedRef.current || endingRef.current) { displayStream.getTracks().forEach((track) => track.stop()); return; }
+      if (!isRunningSession(epoch)) { displayStream.getTracks().forEach((track) => track.stop()); return; }
       rememberStream(displayStream);
       const displayTrack = displayStream.getVideoTracks()[0];
       if (!displayTrack) return;
 
       displayTrack.onended = () => {
+        if (!isRunningSession(epoch)) return;
         void (async () => {
           const videoDisabled = useCallStore.getState().isVideoOff;
           if (videoDisabled || !cameraTrackRef.current) {
-            await replaceOutgoingVideoTrack(null);
+            if (!await replaceOutgoingVideoTrack(null) || !isRunningSession(epoch)) return;
             if (localStream) {
               setLocalStream(new MediaStream(localStream.getAudioTracks()));
             }
           } else {
-            await replaceOutgoingVideoTrack(cameraTrackRef.current);
+            if (!await replaceOutgoingVideoTrack(cameraTrackRef.current) || !isRunningSession(epoch)) return;
             if (localStream) {
               setLocalStream(new MediaStream([...localStream.getAudioTracks(), cameraTrackRef.current]));
             }
           }
           screenTrackRef.current = null;
           setIsSharingScreen(false);
-        })();
+        })().catch((err) => { if (isRunningSession(epoch)) console.error("Screen share restore failed:", err); });
       };
 
       screenTrackRef.current = displayTrack;
-      await replaceOutgoingVideoTrack(displayTrack);
+      if (!await replaceOutgoingVideoTrack(displayTrack) || !isRunningSession(epoch)) return;
       setLocalStream(new MediaStream([...localStream.getAudioTracks(), displayTrack]));
       setIsSharingScreen(true);
     } catch (err) {
-      console.error("Screen share failed:", err);
+      if (isRunningSession(epoch)) console.error("Screen share failed:", err);
     }
   };
 
   const handleToggleVideo = async () => {
-    if (callType !== "video" || !localStream) return;
+    const epoch = sessionEpochRef.current;
+    if (!isRunningSession(epoch) || callType !== "video" || !localStream) return;
 
     if (isVideoOff) {
       try {
         const cameraStream = await captureUserMedia({ video: true, audio: false });
-        if (!mountedRef.current || endingRef.current) { cameraStream.getTracks().forEach((track) => track.stop()); return; }
+        if (!isRunningSession(epoch)) { cameraStream.getTracks().forEach((track) => track.stop()); return; }
         rememberStream(cameraStream);
         const nextCameraTrack = cameraStream.getVideoTracks()[0];
         if (!nextCameraTrack) return;
@@ -536,19 +681,19 @@ export function useCall() {
         cameraTrackRef.current = nextCameraTrack;
 
         if (!isSharingScreen) {
-          await replaceOutgoingVideoTrack(nextCameraTrack);
+          if (!await replaceOutgoingVideoTrack(nextCameraTrack) || !isRunningSession(epoch)) return;
           setLocalStream(new MediaStream([...localStream.getAudioTracks(), nextCameraTrack]));
         }
 
         toggleVideo();
       } catch (err) {
-        console.error("Failed to turn camera back on:", err);
+        if (isRunningSession(epoch)) console.error("Failed to turn camera back on:", err);
       }
       return;
     }
 
     if (!isSharingScreen) {
-      await replaceOutgoingVideoTrack(null);
+      if (!await replaceOutgoingVideoTrack(null) || !isRunningSession(epoch)) return;
     }
 
     cameraTrackRef.current?.stop();
@@ -564,20 +709,28 @@ export function useCall() {
   };
 
   const handleEnd = () => {
-    if (endingRef.current) return;
+    if (!callId) { navigate("/", { replace: true }); return; }
+    if (currentCallIdRef.current !== callId || endHandledRef.current) return;
+    const activeId = useCallStore.getState().activeCallId;
+    if (activeId && activeId !== callId) return;
+    endHandledRef.current = true;
     endingRef.current = true;
+    sessionEpochRef.current += 1;
     const target = callInfo ? `/chat/${callInfo.conversationId}` : "/";
     screenTrackRef.current?.stop();
     cameraTrackRef.current?.stop();
+    stopAcquiredTracks();
+    useCallStore.getState().remoteStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
     wsRef.current?.close();
     pcRef.current?.close();
+    disposeCallTransforms();
     videoSenderRef.current = null;
-    clearCall();
-    navigate(target);
+    clearCall(callId);
+    if (pathnameRef.current === `/call/${callId}`) navigate(target);
+    else toast.show({ message: t("callEnded") });
     // Capture must stop immediately, even while the best-effort server request is offline.
     if (callId) {
-      void api.post(`/api/calls/${callId}/end`).catch(() => undefined);
-      void deletePendingCall(callId).catch(() => undefined);
+      void cleanupCallBestEffort(callId, callAuthRef.current);
     }
   };
 
@@ -585,20 +738,27 @@ export function useCall() {
 
   const restoreCall = () => {
     setMinimized(false);
-    navigate(callInfo?.conversationId ? `/chat/${callInfo.conversationId}` : "/");
+    if (callId) navigate(`/call/${callId}`);
+  };
+
+  const minimizeCall = () => {
+    setMinimized(true);
+    const conversationId = callInfo?.conversationId ?? useCallStore.getState().conversationId;
+    navigate(conversationId ? `/chat/${conversationId}` : "/");
   };
 
   return {
+    minimizeCall,
     restoreCall,
     callType,
     localStream,
     isMuted,
     isVideoOff,
-    isMinimized,
     toggleMute,
-    callerAvatarUrl,
-    localVideoRef,
-    stage,
+    peerAvatarUrl,
+    peerName,
+    isGroupCall,
+    stage: callId ? stage : "ended" as Stage,
     isSharingScreen,
     error: error ? renderMessage(error) : error,
     callUnsupported,
@@ -612,3 +772,5 @@ export function useCall() {
     remoteEntries
   };
 }
+
+export { useCall } from "./CallContext.js";

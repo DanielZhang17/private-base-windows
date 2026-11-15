@@ -1,6 +1,8 @@
 export const SETTINGS_SECTIONS = [
   ["profile", "settingsProfileSection", "user"], ["appearance", "settingsAppearanceSection", "palette"],
   ["attachments", "attachmentSettings", "attach"],
+  ["notifications", "androidBackground.notificationsSection", "settings"],
+  ["privacy", "settingsPrivacySection", "lock"],
   ["security", "settingsSecuritySection", "key"], ["devices", "linkedDevices", "devices"],
   ["emoji", "customEmoji", "emoji"], ["account", "settingsAccountSection", "user"],
 ] as const;

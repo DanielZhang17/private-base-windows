@@ -88,6 +88,12 @@ function ensureCallTransformWorker(): Worker {
   return callTransformWorker;
 }
 
+/** The app-level call owner releases the worker only after media has stopped. */
+export function disposeCallTransforms(): void {
+  callTransformWorker?.terminate();
+  callTransformWorker = null;
+}
+
 function pipeEncodedFrames(
   streams: EncodedStreams,
   transform: Transformer<EncodedFrame, EncodedFrame>,
@@ -248,9 +254,12 @@ export async function createPeerConnection(
   _callId: string,
   callKey: CallFrameKey,
   onRemoteStream: (stream: MediaStream) => void,
+  isCurrent: () => boolean = () => true,
 ): Promise<RTCPeerConnection> {
+  if (!isCurrent()) throw new DOMException("Call setup cancelled", "AbortError");
   requireE2EECalling();
   const turnCreds = await fetchTurnCredentials();
+  if (!isCurrent()) throw new DOMException("Call setup cancelled", "AbortError");
   requireE2EECalling();
   const baseConfig: RTCConfiguration = {
     iceServers: turnCreds.iceServers,
@@ -264,6 +273,7 @@ export async function createPeerConnection(
   encryptedConnections.add(pc);
 
   pc.ontrack = (event) => {
+    if (!isCurrent()) { event.track.stop(); return; }
     try {
       addReceiverTransform(event.receiver, callKey);
       if (event.streams[0]) onRemoteStream(event.streams[0]);
@@ -398,7 +408,9 @@ export async function acceptCallOffer(
   pc: RTCPeerConnection,
   callWs: WebSocket,
   offerSdp: string,
+  isCurrent: () => boolean = () => true,
 ): Promise<void> {
+  if (!isCurrent()) return;
   requireEncryptedConnection(pc);
   if (pc.getSenders().some((sender) => sender.track && !senderTransforms.has(sender))) {
     pc.close();
@@ -406,7 +418,10 @@ export async function acceptCallOffer(
   }
   const { user } = useAuthStore.getState();
   await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: offerSdp }));
+  if (!isCurrent()) return;
   const answer = await pc.createAnswer();
+  if (!isCurrent()) return;
   await pc.setLocalDescription(answer);
+  if (!isCurrent()) return;
   sendSignal(callWs, { kind: "answer", sdp: answer.sdp, fromUserId: user?.id ?? "" });
 }

@@ -244,6 +244,10 @@
     --elevation-2: 0 6px 20px rgb(9 22 28 / 0.1), 0 2px 6px rgb(9 22 28 / 0.06);
     --elevation-3: 0 20px 48px rgb(9 22 28 / 0.2), 0 6px 16px rgb(9 22 28 / 0.1);
 
+    --z-call-bubble: 30;
+    --z-media-viewer: 80;
+    --media-viewer-background: #000000;
+
     /* Motion */
     --duration-fast: 120ms;
     --duration-base: 180ms;
@@ -460,4 +464,27 @@
     overflow-wrap: anywhere;
     user-select: all;
   }
+}
+
+/* The hit area is the card; the surrounding safe rectangle never blocks the app. */
+.call-bubble-bounds {
+  z-index: var(--z-call-bubble);
+  inset: calc(var(--call-viewport-top, 0px) + var(--safe-top) + var(--titlebar-height) + 1rem) calc(var(--call-viewport-right, 0px) + var(--safe-right) + 1rem) calc(var(--call-viewport-bottom, 0px) + var(--safe-bottom) + 1rem) calc(var(--call-viewport-left, 0px) + var(--safe-left) + 1rem);
+}
+.call-bubble {
+  width: 11rem;
+  height: 13rem;
+  max-width: 100%;
+  max-height: 100%;
+  right: 0;
+  top: 0;
+}
+.call-bubble-snapping {
+  transition: left var(--duration-base) var(--ease-standard), top var(--duration-base) var(--ease-standard);
+}
+@media (max-width: 639px) {
+  .call-bubble { top: auto; bottom: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .call-bubble { transition: none; }
 }

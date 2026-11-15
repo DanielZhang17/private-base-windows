@@ -76,7 +76,7 @@ export default function LoginPage() {
                 </Field>
                 <Button type="submit" loading={loading}>{recoveryRetry ? t("finishRecovery") : t("signInAction")}</Button>
               </form>
-              {capabilities.passkeys && !recoveryRetry && <>
+              {(capabilities.passkeys || capabilities.nativePasskeys) && !recoveryRetry && <>
                 <div className="flex items-center gap-3 text-xs text-ink-subtle"><span className="h-px flex-1 bg-line" />{t("or")}<span className="h-px flex-1 bg-line" /></div>
                 <Button variant="secondary" leadingIcon="passkey" disabled={loading} onClick={() => void handlePasskeyLogin()}>{t("signInWithAPasskey")}</Button>
               </>}

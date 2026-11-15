@@ -9,7 +9,7 @@ let container: HTMLDivElement;
 const end = vi.fn();
 const mute = vi.fn();
 const video = vi.fn();
-const state = () => ({ stage: "connected", callType: "audio", conversationName: "Mara Lindqvist", callDuration: 252, formatDuration: () => "04:12", remoteEntries: [], localStream: null, isMuted: false, isVideoOff: false, handleEnd: end, toggleMute: mute, handleToggleVideo: video });
+const state = () => ({ stage: "connected", callType: "audio", conversationName: "Chat alias", peerName: "Mara Lindqvist", peerAvatarUrl: "/mara.png", isGroupCall: false, callDuration: 252, formatDuration: () => "04:12", remoteEntries: [], localStream: null, isMuted: false, isVideoOff: false, handleEnd: end, toggleMute: mute, handleToggleVideo: video });
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); vi.clearAllMocks();
   container = document.createElement("div"); root = createRoot(container);

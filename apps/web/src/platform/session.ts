@@ -3,7 +3,7 @@ import { useCallStore } from "../stores/callStore.js";
 import { useChatStore } from "../stores/chatStore.js";
 import { usePresenceStore } from "../stores/presenceStore.js";
 import { stopAllCapturedTracks } from "./media.js";
-import { registerAccountScopedCleanup } from "./session-cleanup.js";
+import { clearUnlockedSessionState, registerAccountScopedCleanup } from "./session-cleanup.js";
 
 /**
  * Drop everything in memory that belongs to the signed-in account. Leaving a session through
@@ -13,8 +13,9 @@ import { registerAccountScopedCleanup } from "./session-cleanup.js";
  */
 export function clearAccountScopedState(): void {
   const steps = [
+    clearUnlockedSessionState,
     // Stops the tracks in the local stream and clears the active call.
-    () => useCallStore.getState().clearCall(),
+    () => useCallStore.getState().clearAllCalls(),
     // Tracks held outside the local stream, such as the camera during a screen share.
     stopAllCapturedTracks,
     () => queryClient.clear(),

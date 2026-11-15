@@ -69,8 +69,8 @@ the capability flag and typed failures from the adapter.
 `handleSave` delegates to the platform adapter. Unsupported saves become
 `saveError`/`saveUnsupported` state; other save failures reject for the caller's
 existing error handling. Desktop dialog cancellation resolves without writing.
-FilePreview uses this hook, disables its attachment save action and image save
-clicks when unsupported, and keeps decrypted image/video object-URL previews
+FilePreview uses this hook, disables its attachment save action when unsupported,
+and keeps decrypted image/video object-URL previews
 visible. Saving support does not gate loading or decrypting inline previews.
 The platform adapter rejects mobile saves before importing dialog/fs plugins.
 
@@ -94,17 +94,67 @@ Uploads use the API client's binary PUT path, including token refresh and sessio
 
 ## `calls/useCall.ts` — `useCall()`
 
-Uses the active call store ID, falling back to `/call/:callId`. State: `callType`, `localStream`, `remoteEntries` (`[userId, MediaStream][]`), `callerAvatarUrl`, `conversationName`, `stage` (`loading`, `ringing`, `connecting`, `connected`, `ended`), `error`, `callUnsupported` (boolean, true for `E2EECallUnsupportedError`; `error` contains its explanation), `callDuration`, `isMuted`, `isVideoOff`, `isMinimized`, `isSharingScreen`, `canShareScreen`. Bind `localVideoRef` to local video.
+`CallProvider` is mounted above Routes in App and enabled only while unlocked. It owns one
+`useCallSession(callId)` lifecycle for a call explicitly started or accepted in this tab. `localCallOwnership` is an in-memory
+per-tab consent record, granted only by local Start/Accept and cleared on end/teardown.
+Server notifications and hydration cannot grant ownership: acceptance elsewhere dismisses
+the incoming modal without peer creation, capture, or signaling here. A stale call URL after reload shows the ended state
+and never restarts capture.
+`clearCall(callId)` only clears that call; cleanup for an old ID cannot alter a newer
+pending or owned call. Lock/sign-out use `clearAllCalls()` to cancel all local work.
+Outgoing Start reserves its own token before the initiate request, binds the server call
+ID when available, and completes only if that token remains current. It does not depend
+on the shared call epoch, so a retired call's delayed cleanup cannot cancel a redial.
+If Start is cancelled after creating a server call, its cancellation watcher deletes that
+call's pending key and sends `/api/calls/:id/end` immediately, even while fanout is still
+pending. Cleanup is ID-scoped and does not touch a newer call. It is also run on failed
+fanout; joining an existing call (`created: false`) never ends that pre-existing call.
+Cancelled key writes are deleted again after they commit, so they cannot recreate the key.
+`cleanupCallBestEffort` is shared with hangup: local key deletion runs independently of
+network progress; transient end failures retry after 500ms and 1500ms (three attempts total),
+rechecking user/device/session identity and authentication before every attempt.
+If sign-out has removed the session, the client cannot authenticate an end request and
+only deletes the local key. The server's existing 30-second ring timeout is the fallback
+for an unaccepted call; that alarm does not cover a call that was already accepted.
 
-Actions: `toggleMute()`, `handleToggleVideo()`, `toggleScreenShare()`, `handleEnd()`, `restoreCall()`. `formatDuration(seconds)` is a display helper. `handleEnd` releases capture immediately and coalesces duplicate end actions; the server notification is best effort. `restoreCall` expands a minimized call and navigates to its conversation.
 
-The hook recovers pending call keys from IndexedDB/sync, rejects missing/expired keys or unsupported E2EE, and owns signaling, peers, capture and timers. E2EE capability and peer creation are checked before any camera/microphone capture. Cleanup stops media even when capture finishes late. Every acquired track goes through the platform media helpers and is recorded independently of the displayed stream, including a parked camera during screen share and extra display tracks; both session cleanup and unmount stop the full set. Malformed/failed signaling becomes terminal instead of an unhandled rejection, and terminal errors cannot be overwritten by the still-active store status. Duration remains available after ending. No unencrypted fallback is provided.
+`useCall()` now reads that provider's context; CallPage and CallBubble never acquire or dispose media.
+Incoming ringing invitations retain the existing modal/accept flow. A reference-counted outgoing
+queue consumer remains mounted throughout the unlocked app, including the full call screen.
 
-Every captured audio track takes the current mute state before any track is attached or replaced, including when capture resolves after muting during ringing. Audio tracks retain that state across camera/screen replacements. Keep the local preview mounted while screen sharing, even with the camera off, so turning the camera back on with the same stream keeps its `srcObject` binding.
+State: `callType`, `localStream`, `remoteEntries`, `peerAvatarUrl`, `peerName`, `isGroupCall`, `conversationName`,
+`stage`, `error`, `callUnsupported`, `callDuration`, `isMuted`, `isVideoOff`, `isSharingScreen`,
+`canShareScreen`. Views bind streams through `useMediaElement`; the provider renders persistent
+remote audio for both voice and video. Presentation identity uses the other member for direct
+calls, or the conversation name/avatar (group initials when absent) for groups; caller metadata
+stays separate for the incoming-call modal. Every remote video is muted to avoid duplicate audio.
 
-## `calls/useMediaElement.ts` — `useMediaElement<T extends HTMLMediaElement>(stream)`
+Actions: `toggleMute()`, `handleToggleVideo()`, `toggleScreenShare()`, `handleEnd()`,
+`minimizeCall()` (conversation route, falling back to store metadata during setup), `restoreCall()` (call route), `formatDuration(seconds)`.
+Any route away from the call displays the bubble until the call ends. End from the bubble and
+remote hangup keep the current route/draft and show a toast. The full route keeps its usual end state.
 
-Returns an element ref. Bind it to remote `<audio>` or `<video>`; it assigns `srcObject` and clears it on cleanup. Playback attributes and styling remain the view's responsibility. It does not own/stop the supplied stream.
+The lifecycle retains pending-key recovery, fail-closed E2EE capability/setup/signaling checks,
+all acquired-track tracking, parked-camera/screen cleanup and late-capture cancellation.
+Minimising changes no peer, sender, receiver, worker or timer. Hangup, terminal failure, session
+teardown and provider unmount close signaling/peers, stop tracks and release the transform worker.
+Call guards use a tab-local call epoch and the login identity (user/device/session), never
+the persisted cross-tab auth epoch. Local key lock, sign-out and end invalidate the epoch
+and stop media; locking/unlocking another tab of the same login leaves this call running.
+Every async continuation and timer checks the call epoch and local ownership; stale work
+uses only its captured peer/socket and cannot signal for, overwrite or tear down the next call.
+Offer answering and TURN setup also check cancellation inside their awaited helpers.
+No running call is persisted across reloads. `useCallBubblePosition` owns pointer capture, drag
+threshold, clamping and edge snapping; geometry helpers are pure. It measures the visible
+`data-call-message-area` and excludes `data-call-avoid="top|bottom|left|right"` controls.
+TopBar, BottomBar, NavRail and MessageInput register these zones declaratively. ResizeObserver
+reclamps when a composer grows; route mutations refresh registrations, and visualViewport
+resize/scroll handles keyboards. Defaults are top-right on desktop/tablet and above the composer
+on phones, within safe-area gutters.
+
+## `calls/useMediaElement.ts` — `useMediaElement<T extends HTMLMediaElement>(stream, play?)`
+
+Returns an element ref. Bind it to remote `<audio>` or `<video>`; it assigns `srcObject` and clears it on cleanup. The bubble opts into explicit `play()` on mount, stream changes, metadata and added tracks (including a video track arriving after audio). Playback attributes and styling remain the view's responsibility. It does not own/stop the supplied stream.
 
 ## `settings/useSettings.ts` — `useSettings()`
 
@@ -156,9 +206,14 @@ route paths and guard decisions stay in App. `chat/useShell` exposes the current
 unread total for current conversations and online state, and subscribes to browser online/offline events. Layout
 keeps `useOutgoingQueue` mounted once and renders one route surface in `AppShell`.
 
-`chat/useFilePreview(options)` owns the existing cached/fetched attachment decryption,
+`chat/useFilePreview(options)` owns fetched attachment decryption in memory,
 retry, expiry, object-URL and platform-save states. It exposes `loading`, `expired`,
 `error`, `objectUrl`, `isImage`, `isVideo`, `saveUnsupported`, `load` and `handleDownload`.
+Decrypted bytes are never written to the attachment cache. Blob URLs are revoked
+on replacement/unmount; stale asynchronous loads cannot create URLs. The inline
+preview and viewer share one URL.
+`chat/useMediaGestures` owns pointer tracking, zoom/pan, tap timing and phone swipe
+dismissal; `chat/media-gestures` contains pure geometry and tap classification.
 File keys remain in the encrypted channel; the API never receives a file key.
 `chat/useEmojiText`, `chat/avatar` and `chat/presentation` expose resolved emoji/avatar
 URLs, text segments and date/expiry/preview labels for presentational components.
@@ -186,6 +241,10 @@ clipboard copying without data-layer imports in the bubble. Failed-bubble Retry 
 include the message text or attachment filename, keeping failed messages distinguishable
 to screen readers without exposing file keys.
 
+`CallProvider` also owns `useCallInvitationOwner`: its Accept/Decline requests, completion,
+loading state and errors survive modal remounts and route changes. The modal only triggers
+the action and reads that state. Only a real end, local lock/sign-out or changed login cancels
+a pending response; successful Accept grants this tab ownership and opens the call route.
 `calls/useIncomingCall()` exposes the current invitation, `visible`, `loadingAction`,
 `error`, `callUnsupported` and `respond('accept' | 'decline')`. Accept requires the existing
 secure invitation key and encrypted-media capability. Failed responses remain visible.
@@ -204,3 +263,28 @@ to the release corner on drag, with Move camera preview as the keyboard alternat
 No media routing, key setup or call lifecycle logic lives in that adapter.
 
 Known limitation (accepted): orphan retirement doesn't see file preparation in *another* new-version tab. If a legacy v5 tab expires a queued file's display row while a second new tab is still encrypting that file, a third new tab may retire the entry. The user must re-attach the file. Nothing leaks, and other sends aren't blocked. This only happens while legacy tabs from before the deploy are still open.
+
+## Android background calls and notifications
+
+`settings/useBackgroundSettings` exposes the per-device, account-scoped background
+opt-in, pending/error state, system status and settings actions. The Notifications
+menu and view require `capabilities.backgroundConnection`; all eight copy keys use
+`androidBackground.*` in the normal 12 locale bundles.
+
+`calls/useNativeCallNotifications` runs once in CallProvider when enabled and
+`capabilities.nativeCallNotifications` is available. It posts hidden incoming calls,
+cancels exact IDs on replacement/end/acceptance elsewhere, and drains native action
+batches at startup, visibility, focus and the payload-free window wake event.
+Deferred Accept waits for the secure invite and visible session, checks server
+ringing status/expiry, then calls the same invitation owner's local Accept path.
+A deferred Accept blocks later navigation in FIFO order; a later Decline of the
+same call replaces it at that queue position. Native Accept records pending local
+consent with the call ID and tab-local epoch before its POST, and completes
+ownership even if the accepted event or backgrounding arrives first. Initial media
+capture waits for visibility; a hidden wait past the server ring deadline ends the
+call through shared cleanup. Legacy sessions use the API identity fallback (device
+ID, then authEpoch) when sessionId is null. The
+provider keeps shared incoming controls on the native call route while accepting
+or displaying a response failure. UnlockedAppEffects owns the service session and
+retains the shared presence socket; key lock/account cleanup invalidate both
+native lifecycles before asynchronous continuations can act.

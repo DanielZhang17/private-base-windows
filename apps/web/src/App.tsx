@@ -7,6 +7,7 @@ import RegisterPage from "./pages/RegisterPage.js";
 import UnlockPage from "./pages/UnlockPage.js";
 import ChatPage from "./pages/ChatPage.js";
 import SettingsPage from "./pages/SettingsPage.js";
+import { CallProvider } from "./features/calls/CallProvider.js";
 import CallPage from "./pages/CallPage.js";
 import VerifyPage from "./pages/VerifyPage.js";
 import DeviceLinkPage from "./pages/DeviceLinkPage.js";
@@ -90,6 +91,7 @@ export default function App() {
       <UiPreferencesEffects />
       {phase === "unlocked" && <UnlockedAppEffects />}
 
+      <CallProvider enabled={phase === "unlocked"}>
       <Routes>
         <Route
           path="/login"
@@ -139,6 +141,7 @@ export default function App() {
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+      </CallProvider>
     </ToastProvider>
   );
 }

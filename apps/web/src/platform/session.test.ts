@@ -8,6 +8,7 @@ import { useChatStore } from "../stores/chatStore.js";
 import { usePresenceStore } from "../stores/presenceStore.js";
 import { registerNavigate } from "./navigation.js";
 import { clearAccountScopedState } from "./session.js";
+import { registerUnlockedSessionCleanup } from "./session-cleanup.js";
 import { captureDisplayMedia, captureUserMedia } from "../services/webrtc.js";
 import { ensureConversationInCache, fetchConversationList } from "../lib/conversation-cache.js";
 
@@ -78,6 +79,13 @@ afterEach(() => {
 });
 
 describe("clearAccountScopedState", () => {
+  it("invalidates unlocked native work during account teardown", () => {
+    const stop = vi.fn();
+    const unregister = registerUnlockedSessionCleanup(stop);
+    clearAccountScopedState();
+    expect(stop).toHaveBeenCalledTimes(1);
+    unregister();
+  });
   it("clears cached account data and stops local call media", () => {
     const tracks = seedAccountState();
     clearAccountScopedState();

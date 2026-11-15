@@ -92,7 +92,7 @@ export function TopBar({ title, subtitle, onBack, backLabel = t("back"), backOnP
     </>
   );
   return (
-    <header className={cx("shrink-0 border-b border-line bg-inherit pt-safe", className)}>
+    <header data-call-avoid="top" className={cx("shrink-0 border-b border-line bg-inherit pt-safe", className)}>
       <div className="flex h-14 items-center gap-1 px-2">
         {onBack && (
           <IconButton icon="chevron-left" label={backLabel} onClick={onBack} className={backOnPhoneOnly ? "sm:hidden" : undefined} />
@@ -157,7 +157,7 @@ export interface BottomBarProps {
 export function BottomBar({ label = t("mainNavigation"), children, className }: BottomBarProps) {
   useLocale();
   return (
-    <nav aria-label={label} className={cx("shrink-0 border-t border-line bg-canvas pb-safe", className)}>
+    <nav data-call-avoid="bottom" aria-label={label} className={cx("shrink-0 border-t border-line bg-canvas pb-safe", className)}>
       <div className="flex items-stretch gap-1 px-2 py-1">{children}</div>
     </nav>
   );
@@ -175,7 +175,7 @@ export interface NavRailProps {
 export function NavRail({ label = t("mainNavigation"), children, footer, className }: NavRailProps) {
   useLocale();
   return (
-    <nav aria-label={label} className={cx("flex w-[4.5rem] shrink-0 flex-col items-center gap-1 border-e border-line bg-canvas px-1 py-2", className)}>
+    <nav data-call-avoid="left" aria-label={label} className={cx("flex w-[4.5rem] shrink-0 flex-col items-center gap-1 border-e border-line bg-canvas px-1 py-2", className)}>
       <div className="flex grow flex-col gap-1 [&>*]:grow-0">{children}</div>
       {footer}
     </nav>

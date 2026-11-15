@@ -1,12 +1,15 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { WSFrameType, type WSMessageFrame } from "@e2ee-chat/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { WSFrameType, type WSMessageFrame, type ConversationWithMembers } from "@e2ee-chat/shared";
 import { commitReceivedMessage, getAppDB, getMessageById, getSyncState, saveMessage, saveSyncState } from "../db/index.js";
 import { api } from "../services/api.js";
 import { useChatStore } from "../stores/chatStore.js";
 import { decryptMessage } from "./message-processor.js";
 import { ingestMessageFrame, loadPersistedConversationMessages, resetMessageSyncState, syncMessages } from "./message-sync.js";
+import { capabilities } from "../platform/capabilities.js";
+import { showMessageNotification } from "./browser-notifications.js";
 
 vi.mock("../services/api.js", () => ({ api: { get: vi.fn() } }));
+vi.mock("./browser-notifications.js", () => ({ showMessageNotification: vi.fn() }));
 vi.mock("../stores/authStore.js", () => ({
   useAuthStore: { getState: () => ({ user: { id: "bob" }, device: { id: "bob-device" } }) },
 }));
@@ -41,6 +44,21 @@ beforeEach(async () => {
   useChatStore.setState({ messages: new Map(), unreadCounts: new Map(), activeConversationId: "conv" });
   vi.resetAllMocks();
   vi.mocked(decryptMessage).mockImplementation((...args) => completeDecrypt("decrypted", args[2]));
+});
+afterEach(() => vi.restoreAllMocks());
+
+it.each([false, true])("notifies a hidden active conversation only on the native notification path (capability=%s)", async (native) => {
+  vi.spyOn(capabilities, "nativeCallNotifications", "get").mockReturnValue(native);
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+  useChatStore.setState({ conversations: [{ id: "conv", members: [{ userId: "alice", user: { displayName: "Alice" } }] }] as ConversationWithMembers[] });
+  await ingestMessageFrame(frame("new-message", Date.now()));
+  expect(vi.mocked(showMessageNotification).mock.calls).toEqual(native ? [["Alice", "conv"]] : []);
+});
+it("never notifies the visible active conversation even with native notifications", async () => {
+  vi.spyOn(capabilities, "nativeCallNotifications", "get").mockReturnValue(true);
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  await ingestMessageFrame(frame("visible-message", Date.now()));
+  expect(showMessageNotification).not.toHaveBeenCalled();
 });
 
 /** Makes the next `count` IndexedDB write transactions fail, like a quota or transient IDB error. */

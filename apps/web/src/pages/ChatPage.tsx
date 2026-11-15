@@ -43,7 +43,7 @@ export default function ChatPage() {
       </>} />
     <h1 className="sr-only">{flow.conversationName}</h1>
     {flow.callUnsupported ? <Notice tone="warning" className="m-3">{t("encryptedCallsArenTSupportedOnThisDevice")}</Notice> : flow.callError && <Notice tone="danger" className="m-3">{flow.callError}</Notice>}
-    <div ref={flow.messageListRef} role="log" aria-label={t("messages")} aria-live="polite" aria-relevant="additions" className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 py-3">
+    <div ref={flow.messageListRef} role="log" data-call-message-area="" aria-label={t("messages")} aria-live="polite" aria-relevant="additions" className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 py-3">
       {(flow.hasOlderCachedMessages || flow.loadingOlderCachedMessages) && <div className="flex justify-center pb-2"><Button variant="ghost" size="sm" loading={flow.loadingOlderCachedMessages} onClick={() => void flow.handleLoadOlderCachedMessages()}>{t("loadOlderCachedMessages")}</Button></div>}
       {flow.conversationError && <Notice tone="danger">{flow.conversationError}</Notice>}
       {flow.conversationLoading && <div className="py-3 text-center"><Spinner label={t("loadingConversation")} /></div>}

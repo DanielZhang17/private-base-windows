@@ -1,11 +1,16 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { Device, User } from "@e2ee-chat/shared";
+import type { CallEventPayload, Device, User } from "@e2ee-chat/shared";
 import UnlockedAppEffects from "./UnlockedAppEffects.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { createNotificationWebSocket } from "../../services/notifications.js";
 import { resetMessageSyncState, runUnlockSync } from "../../lib/message-sync.js";
+import { requestNotificationPermission } from "../../lib/browser-notifications.js";
+import { api } from "../../services/api.js";
+import { deletePendingCall, getPendingCall } from "../../db/index.js";
+import { useCallStore } from "../../stores/callStore.js";
+import { clearRegisteredLocalCallState } from "../../platform/session-cleanup.js";
 
 vi.mock("../../stores/authStore.js", async () => {
   const { create } = await import("zustand");
@@ -26,6 +31,9 @@ beforeEach(() => {
   vi.resetAllMocks();
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.useFakeTimers();
+  vi.mocked(requestNotificationPermission).mockResolvedValue(true);
+  vi.mocked(deletePendingCall).mockResolvedValue(undefined);
+  useCallStore.getState().clearAllCalls();
   useAuthStore.setState({ user: { id: "bob" } as User, device: { id: "device-1" } as Device, accessToken: "old" });
   vi.mocked(createNotificationWebSocket).mockReturnValue({ ws: null, dispose });
   container = document.createElement("div");
@@ -34,10 +42,42 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await act(async () => root.unmount());
+  useCallStore.getState().clearAllCalls();
   container.remove();
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+const incoming: CallEventPayload = { event: "incoming", callId: "call-1", conversationId: "chat-1", callType: "audio", status: "ringing", fromUserId: "alice", initiatorId: "alice" };
+const conversation = { id: "chat-1", members: [{ userId: "alice", user: { displayName: "Alice" } }] };
+const emit = (payload: CallEventPayload) => vi.mocked(createNotificationWebSocket).mock.calls.at(-1)![0].onCallEvent(payload);
+it.each(["ringing", "active", "starting"])("retains existing busy-call checks when %s", async (state) => {
+  await act(async () => root.render(<UnlockedAppEffects />));
+  if (state === "starting") useCallStore.getState().beginCallStart();
+  else useCallStore.setState({ activeCallId: "other", callStatus: state as "ringing" | "active" });
+  await act(async () => emit(incoming));
+  expect(api.get).not.toHaveBeenCalled();
+});
+it.each(["lock", "session change", "end", "busy"])("drops late caller metadata after %s", async (reason) => {
+  let resolve!: (value: unknown) => void;
+  vi.mocked(api.get).mockReturnValue(new Promise((r) => { resolve = r; }));
+  await act(async () => root.render(<UnlockedAppEffects />));
+  await act(async () => emit(incoming));
+  if (reason === "lock") clearRegisteredLocalCallState();
+  if (reason === "session change") await act(async () => useAuthStore.setState({ device: { id: "new-device" } as Device }));
+  if (reason === "end") await act(async () => emit({ ...incoming, event: "ended", status: "ended" }));
+  if (reason === "busy") useCallStore.setState({ activeCallId: "other", callStatus: "active" });
+  await act(async () => resolve(conversation));
+  expect(useCallStore.getState().activeCallId).toBe(reason === "busy" ? "other" : null);
+});
+it("resolves the app-known caller name and marks only the current secure invite ready", async () => {
+  vi.mocked(api.get).mockResolvedValue(conversation);
+  vi.mocked(getPendingCall).mockResolvedValue({ expiresAt: Date.now() + 60_000 } as Awaited<ReturnType<typeof getPendingCall>>);
+  await act(async () => root.render(<UnlockedAppEffects />));
+  await act(async () => emit(incoming));
+  expect(useCallStore.getState()).toMatchObject({ activeCallId: "call-1", callerName: "Alice", keyReady: true });
 });
 
 it("keeps sync, sockets and timers alive across token and profile updates", async () => {
@@ -73,4 +113,12 @@ it("tears down only for a device/user change, logout or unmount", async () => {
   await act(async () => root.unmount());
   expect(dispose).toHaveBeenCalledTimes(4);
   expect(resetMessageSyncState).toHaveBeenCalledTimes(4);
+});
+
+it("ignores duplicate incoming events without resetting an existing secure invite", async () => {
+  useCallStore.getState().setIncomingCall({ callId: "call-1", conversationId: "chat-1", initiatorId: "alice", callerUserId: "alice", callType: "audio", keyReady: true });
+  await act(async () => root.render(<UnlockedAppEffects />));
+  await act(async () => emit(incoming));
+  expect(api.get).not.toHaveBeenCalled();
+  expect(useCallStore.getState().keyReady).toBe(true);
 });

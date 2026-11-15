@@ -1,4 +1,6 @@
 import { create } from "zustand";
+import { registerLocalCallCleanup } from "../platform/session-cleanup.js";
+import { stopAllCapturedTracks } from "../platform/media.js";
 import type { CallStatus, CallType } from "@e2ee-chat/shared";
 
 interface BaseCallMeta {
@@ -8,7 +10,19 @@ interface BaseCallMeta {
   initiatorId: string;
 }
 
+type OutgoingCallMeta = BaseCallMeta & { conversationName?: string | null };
+
 interface CallState {
+  pendingCallStart: { token: symbol; callId: string | null } | null;
+  beginCallStart: () => symbol | null;
+  bindCallStart: (token: symbol, callId: string) => boolean;
+  finishCallStart: (token: symbol) => void;
+  /** This tab only; a local end/lock/sign-out invalidates pending call work. */
+  localCallEpoch: number;
+  // In-memory and tab-local: never persisted, broadcast, or inferred from server status.
+  localCallOwnership: { callId: string; reason: "started" | "accepted" } | null;
+  acceptLocalCall: (callId: string) => boolean;
+  releaseCallOwnership: (callId: string) => void;
   activeCallId: string | null;
   conversationId: string | null;
   callType: CallType | null;
@@ -33,7 +47,7 @@ interface CallState {
       keyReady?: boolean;
     },
   ) => void;
-  setOutgoingCall: (meta: BaseCallMeta & { conversationName?: string | null }) => void;
+  setOutgoingCall: (meta: OutgoingCallMeta, token?: symbol) => boolean;
   hydrateCall: (
     meta: BaseCallMeta & {
       status: CallStatus;
@@ -55,14 +69,18 @@ interface CallState {
   addRemoteStream: (userId: string, stream: MediaStream) => void;
   toggleMute: () => void;
   toggleVideo: () => void;
-  clearCall: () => void;
+  clearCall: (callId: string) => void;
+  clearAllCalls: () => void;
   isMinimized: boolean;
   setMinimized: (minimized: boolean) => void;
 }
 
 function resetState(state: CallState) {
   state.localStream?.getTracks().forEach((track) => track.stop());
+  state.remoteStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
   return {
+    pendingCallStart: null,
+    localCallOwnership: null,
     activeCallId: null,
     conversationId: null,
     callType: null,
@@ -83,6 +101,9 @@ function resetState(state: CallState) {
 }
 
 export const useCallStore = create<CallState>()((set) => ({
+  pendingCallStart: null,
+  localCallEpoch: 0,
+  localCallOwnership: null,
   activeCallId: null,
   conversationId: null,
   callType: null,
@@ -101,6 +122,8 @@ export const useCallStore = create<CallState>()((set) => ({
   isMinimized: false,
   setIncomingCall: (meta) =>
     set(() => ({
+      localCallOwnership: null,
+      isMinimized: false,
       activeCallId: meta.callId,
       conversationId: meta.conversationId,
       callType: meta.callType,
@@ -114,23 +137,65 @@ export const useCallStore = create<CallState>()((set) => ({
       keyReady: meta.keyReady ?? false,
       remoteStreams: new Map(),
     })),
-  setOutgoingCall: (meta) =>
-    set(() => ({
-      activeCallId: meta.callId,
-      conversationId: meta.conversationId,
-      callType: meta.callType,
-      callStatus: "ringing",
-      direction: "outgoing",
-      initiatorId: meta.initiatorId,
-      callerUserId: meta.initiatorId,
-      callerName: null,
-      callerAvatarUrl: null,
-      conversationName: meta.conversationName ?? null,
-      keyReady: true,
-      remoteStreams: new Map(),
-    })),
+  beginCallStart: () => {
+    let token: symbol | null = null;
+    set((state) => {
+      if (state.pendingCallStart || state.callStatus === "active" || state.callStatus === "ringing") return state;
+      token = Symbol("call-start");
+      return { ...resetState(state), pendingCallStart: { token, callId: null } };
+    });
+    return token;
+  },
+  bindCallStart: (token, callId) => {
+    let bound = false;
+    set((state) => {
+      if (state.pendingCallStart?.token !== token) return state;
+      bound = true;
+      return { pendingCallStart: { token, callId } };
+    });
+    return bound;
+  },
+  finishCallStart: (token) => set((state) => state.pendingCallStart?.token === token ? { pendingCallStart: null } : state),
+  setOutgoingCall: (meta, token) => {
+    let started = false;
+    set((state) => {
+      if (token && (state.pendingCallStart?.token !== token || state.pendingCallStart.callId !== meta.callId)) return state;
+      started = true;
+      return {
+        pendingCallStart: null,
+        localCallOwnership: { callId: meta.callId, reason: "started" },
+        isMinimized: false,
+        activeCallId: meta.callId,
+        conversationId: meta.conversationId,
+        callType: meta.callType,
+        callStatus: "ringing",
+        direction: "outgoing",
+        initiatorId: meta.initiatorId,
+        callerUserId: meta.initiatorId,
+        callerName: null,
+        callerAvatarUrl: null,
+        conversationName: meta.conversationName ?? null,
+        keyReady: true,
+        remoteStreams: new Map(),
+      };
+    });
+    return started;
+  },
+  acceptLocalCall: (callId) => {
+    let accepted = false;
+    set((state) => {
+      if (state.activeCallId !== callId || state.direction !== "incoming" || !state.keyReady ||
+          (state.callStatus !== "ringing" && state.callStatus !== "active")) return {};
+      accepted = true;
+      return { pendingCallStart: null, localCallOwnership: { callId, reason: "accepted" }, callStatus: "active" };
+    });
+    return accepted;
+  },
+  releaseCallOwnership: (callId) => set((state) => state.localCallOwnership?.callId === callId ? { localCallOwnership: null, localCallEpoch: state.localCallEpoch + 1 } : {}),
   hydrateCall: (meta) =>
     set((state) => ({
+      localCallOwnership: state.localCallOwnership?.callId === meta.callId &&
+        (meta.status === "ringing" || meta.status === "active") ? state.localCallOwnership : null,
       activeCallId: meta.callId,
       conversationId: meta.conversationId,
       callType: meta.callType,
@@ -144,7 +209,17 @@ export const useCallStore = create<CallState>()((set) => ({
       keyReady: meta.keyReady ?? state.keyReady,
     })),
   updateCallStatus: (callId, status) =>
-    set((state) => (state.activeCallId === callId ? { callStatus: status } : {})),
+    set((state) => {
+      const ended = status === "ended" || status === "missed" || status === "declined";
+      if (state.activeCallId === callId) return {
+        callStatus: status,
+        ...(ended ? { localCallOwnership: null, localCallEpoch: state.localCallEpoch + 1 } : {}),
+      };
+      if (ended && state.pendingCallStart?.callId === callId) return {
+        pendingCallStart: null, localCallEpoch: state.localCallEpoch + 1,
+      };
+      return state;
+    }),
   markKeyReady: (callId, ready = true) =>
     set((state) => (state.activeCallId === callId ? { keyReady: ready } : {})),
   setCallDetails: (callId, details) =>
@@ -172,8 +247,19 @@ export const useCallStore = create<CallState>()((set) => ({
     }),
   toggleVideo: () =>
     set((state) => ({ isVideoOff: !state.isVideoOff })),
-  clearCall: () =>
-    set((state) => resetState(state as CallState)),
+  clearCall: (callId) => set((state) => {
+    // An unresolved/newer Start belongs to a different operation, even before its ID is known.
+    if (state.activeCallId && state.activeCallId !== callId) return state;
+    if (state.pendingCallStart && state.pendingCallStart.callId !== callId) return state;
+    if (state.activeCallId !== callId && state.pendingCallStart?.callId !== callId) return state;
+    return { ...resetState(state), localCallEpoch: state.localCallEpoch + 1 };
+  }),
+  clearAllCalls: () => set((state) => ({ ...resetState(state), localCallEpoch: state.localCallEpoch + 1 })),
   setMinimized: (minimized) =>
     set(() => ({ isMinimized: minimized })),
 }));
+
+registerLocalCallCleanup(() => {
+  try { useCallStore.getState().clearAllCalls(); }
+  finally { stopAllCapturedTracks(); }
+});

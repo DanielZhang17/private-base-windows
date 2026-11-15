@@ -1,6 +1,7 @@
 import { act } from "react";
+import type { SendDirectBatchResponse } from "@e2ee-chat/shared";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useConversation } from "./useConversation.js";
@@ -9,22 +10,33 @@ import { loadOlderPersistedConversationMessages } from "../../lib/message-sync.j
 import { createChatWebSocket } from "../../services/ws.js";
 import { supportsE2EECalling } from "../../services/webrtc.js";
 import { E2EECallUnsupportedError } from "../../platform/calls.js";
+import { useAuthStore } from "../../stores/authStore.js";
+import { sendDirectPayloadFanout } from "../../lib/direct-messages.js";
+import { deletePendingCall, savePendingCall } from "../../db/index.js";
+import { useCallStore } from "../../stores/callStore.js";
 import { useChatStore } from "../../stores/chatStore.js";
 
 vi.mock("./useSendMessage.js", () => ({ useSendMessage: () => ({ outgoing: [], handleSend: vi.fn(), handleSendFile: vi.fn() }) }));
-vi.mock("../../stores/authStore.js", async () => { const { create } = await import("zustand"); return { useAuthStore: create(() => ({ user: { id: "alice" } })) }; });
+vi.mock("../../stores/authStore.js", async () => { const { create } = await import("zustand"); return { useAuthStore: create(() => ({ user: { id: "alice" }, device: { id: "device" }, sessionId: "session", accessToken: "token" })) }; });
 vi.mock("../../services/api.js", () => ({ api: { get: vi.fn(), post: vi.fn(), delete: vi.fn(), patch: vi.fn() } }));
 vi.mock("../../services/ws.js", () => ({ createChatWebSocket: vi.fn() }));
 vi.mock("../../services/webrtc.js", () => ({ supportsE2EECalling: vi.fn(() => true) }));
 vi.mock("../../lib/message-sync.js", () => ({ loadPersistedConversationMessages: async () => ({ hasOlder: false }), syncConversationMessages: vi.fn(), ingestMessageFrame: vi.fn(), loadOlderPersistedConversationMessages: vi.fn() }));
 vi.mock("../../lib/conversation-cache.js", () => ({ upsertConversationInCache: vi.fn(), refreshConversationList: vi.fn() }));
-vi.mock("../../db/index.js", () => ({ saveMessage: vi.fn() }));
+vi.mock("../../db/index.js", () => ({ saveMessage: vi.fn(), getPendingCall: vi.fn(async () => ({})), savePendingCall: vi.fn(async () => {}), deletePendingCall: vi.fn(async () => {}) }));
+vi.mock("../../lib/direct-messages.js", () => ({ sendDirectPayloadFanout: vi.fn(async () => {}) }));
 let root: Root;
 let state: ReturnType<typeof useConversation>;
 let socket: WebSocket;
+let pathname: string;
+function LocationProbe() { pathname = useLocation().pathname; return null; }
 function Probe() { state = useConversation(); return null; }
 beforeEach(() => {
   vi.clearAllMocks(); vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  useCallStore.getState().clearAllCalls();
+  useAuthStore.setState({ user: { id: "alice" }, device: { id: "device" }, sessionId: "session", accessToken: "token" } as never);
+  vi.mocked(api.post).mockReset().mockResolvedValue({} as never);
+  vi.mocked(sendDirectPayloadFanout).mockReset().mockResolvedValue({} as SendDirectBatchResponse);
   useChatStore.setState({ outgoingRemovalNotices: new Set() });
   vi.mocked(supportsE2EECalling).mockReturnValue(true);
   socket = { readyState: 1, send: vi.fn(), close: vi.fn(() => { Object.assign(socket, { readyState: 3 }); }) } as unknown as WebSocket;
@@ -35,7 +47,7 @@ beforeEach(() => {
 afterEach(async () => { await act(async () => root.unmount()); vi.useRealTimers(); vi.unstubAllGlobals(); });
 async function render() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
-  await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/chat/chat"]}><Routes><Route path="/chat/:conversationId" element={<Probe />} /></Routes></MemoryRouter></QueryClientProvider>));
+  await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/chat/chat"]}><LocationProbe /><Routes><Route path="/chat/:conversationId" element={<Probe />} /><Route path="/call/:callId" element={null} /></Routes></MemoryRouter></QueryClientProvider>));
 }
 it("keeps removal notices scoped to their conversation and supports dismissal", async () => {
   useChatStore.getState().addOutgoingRemovalNotice("other-chat");
@@ -112,4 +124,139 @@ it("does not schedule scroll work for an older-message load that finishes after 
   expect(frame).not.toHaveBeenCalled();
   frame.mockRestore();
   root = createRoot(document.createElement("div"));
+});
+
+
+it("round 4: delayed cleanup of A does not cancel a pending redial B", async () => {
+  const { ensureSodium } = await import("@e2ee-chat/crypto");
+  await ensureSodium();
+  useCallStore.getState().setOutgoingCall({ callId: "A", conversationId: "chat", callType: "audio", initiatorId: "alice" });
+  useCallStore.getState().updateCallStatus("A", "ended");
+  vi.mocked(api.get).mockResolvedValue({ id: "chat", type: "direct", members: [] } as never);
+  let resolve!: (value: never) => void;
+  vi.mocked(api.post).mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+  await render();
+  await act(async () => { await new Promise((done) => setTimeout(done, 0)); });
+  let pending!: Promise<void>;
+  await act(async () => { pending = state.handleStartCall("audio"); });
+  expect(state.startingCallType).toBe("audio");
+  await act(async () => useCallStore.getState().clearCall("A"));
+  await act(async () => {
+    resolve({ call: { id: "B", conversationId: "chat", type: "audio", initiatorId: "alice", status: "ringing" }, created: true } as never);
+    await pending;
+  });
+  expect(useCallStore.getState().activeCallId).toBe("B");
+  expect(useCallStore.getState().localCallOwnership).toEqual({ callId: "B", reason: "started" });
+  expect(pathname).toBe("/call/B");
+});
+
+
+it("round 4: a local lock cancels the pending Start token before its response arrives", async () => {
+  vi.mocked(api.get).mockResolvedValue({ id: "chat", type: "direct", members: [] } as never);
+  let resolve!: (value: never) => void;
+  vi.mocked(api.post).mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+  await render();
+  await act(async () => { await new Promise((done) => setTimeout(done, 0)); });
+  let pending!: Promise<void>;
+  await act(async () => { pending = state.handleStartCall("audio"); });
+  expect(useCallStore.getState().pendingCallStart).not.toBeNull();
+  const { clearRegisteredLocalCallState } = await import("../../platform/session-cleanup.js");
+  await act(async () => clearRegisteredLocalCallState());
+  await act(async () => {
+    resolve({ call: { id: "B", conversationId: "chat", type: "audio", initiatorId: "alice", status: "ringing" }, created: true } as never);
+    await pending;
+  });
+  expect(useCallStore.getState().pendingCallStart).toBeNull();
+  expect(useCallStore.getState().localCallOwnership).toBeNull();
+  expect(pathname).toBe("/chat/chat");
+});
+
+
+it.each(["resolve", "reject"])("round 5: lock during pending fanout cleans the created call immediately, before fanout %s", async (outcome) => {
+  vi.mocked(api.get).mockResolvedValue({ id: "chat", type: "direct", members: [] } as never);
+  vi.mocked(api.post).mockImplementation(async (path) => (path === "/api/calls/initiate"
+    ? { call: { id: "B", conversationId: "chat", type: "audio", initiatorId: "alice", status: "ringing" }, created: true } : {}) as never);
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  vi.mocked(sendDirectPayloadFanout).mockReturnValueOnce(new Promise<SendDirectBatchResponse>((yes, no) => { resolve = () => yes({} as SendDirectBatchResponse); reject = no; }));
+  await render();
+  await act(async () => { await new Promise((done) => setTimeout(done, 0)); });
+  let pending!: Promise<void>;
+  await act(async () => { pending = state.handleStartCall("audio"); });
+  expect(savePendingCall).toHaveBeenCalledWith(expect.objectContaining({ id: "B" }));
+  expect(sendDirectPayloadFanout).toHaveBeenCalledOnce();
+  const { clearRegisteredLocalCallState } = await import("../../platform/session-cleanup.js");
+  await act(async () => clearRegisteredLocalCallState());
+  expect(deletePendingCall).toHaveBeenCalledWith("B");
+  expect(api.post).toHaveBeenCalledWith("/api/calls/B/end");
+  await act(async () => { if (outcome === "resolve") resolve(); else reject(new Error("Fanout cancelled")); await pending; });
+  expect(useCallStore.getState().localCallOwnership).toBeNull();
+  expect(pathname).toBe("/chat/chat");
+  expect(vi.mocked(api.post).mock.calls.filter(([path]) => path.endsWith("/end"))).toHaveLength(1);
+});
+
+it("round 5: cancellation before any server call exists makes no end request", async () => {
+  vi.mocked(api.get).mockResolvedValue({ id: "chat", type: "direct", members: [] } as never);
+  let reject!: (error: Error) => void;
+  vi.mocked(api.post).mockReturnValueOnce(new Promise((_yes, no) => { reject = no; }));
+  await render();
+  await act(async () => { await new Promise((done) => setTimeout(done, 0)); });
+  let pending!: Promise<void>;
+  await act(async () => { pending = state.handleStartCall("audio"); });
+  const { clearRegisteredLocalCallState } = await import("../../platform/session-cleanup.js");
+  await act(async () => clearRegisteredLocalCallState());
+  await act(async () => { reject(new Error("Request cancelled before creation")); await pending; });
+  expect(api.post).toHaveBeenCalledOnce();
+  expect(api.post).toHaveBeenCalledWith("/api/calls/initiate", expect.anything());
+  expect(deletePendingCall).not.toHaveBeenCalled();
+  expect(savePendingCall).not.toHaveBeenCalled();
+  expect(sendDirectPayloadFanout).not.toHaveBeenCalled();
+});
+
+it.each(["newer action", "sign-out"])("round 5: cancellation by %s cleans only the created call's key", async (reason) => {
+  vi.mocked(api.get).mockResolvedValue({ id: "chat", type: "direct", members: [] } as never);
+  vi.mocked(api.post).mockImplementation(async (path) => (path === "/api/calls/initiate"
+    ? { call: { id: "B", conversationId: "chat", type: "audio", initiatorId: "alice", status: "ringing" }, created: true } : {}) as never);
+  let resolve!: () => void;
+  vi.mocked(sendDirectPayloadFanout).mockReturnValueOnce(new Promise<SendDirectBatchResponse>((done) => { resolve = () => done({} as SendDirectBatchResponse); }));
+  await render();
+  await act(async () => { await new Promise((done) => setTimeout(done, 0)); });
+  let pending!: Promise<void>;
+  await act(async () => { pending = state.handleStartCall("audio"); });
+  await act(async () => {
+    if (reason === "sign-out") useAuthStore.setState({ user: null, sessionId: null, accessToken: null } as never);
+    else {
+      useCallStore.getState().clearCall("B");
+      useCallStore.getState().setOutgoingCall({ callId: "C", conversationId: "chat", callType: "audio", initiatorId: "alice" });
+    }
+  });
+  expect(deletePendingCall).toHaveBeenCalledWith("B");
+  await act(async () => { resolve(); await pending; });
+  const endCalls = vi.mocked(api.post).mock.calls.filter(([path]) => path.endsWith("/end"));
+  if (reason === "sign-out") expect(endCalls).toHaveLength(0);
+  else {
+    expect(endCalls).toEqual([["/api/calls/B/end"]]);
+    expect(useCallStore.getState().localCallOwnership).toEqual({ callId: "C", reason: "started" });
+    expect(deletePendingCall).not.toHaveBeenCalledWith("C");
+  }
+  expect(pathname).toBe("/chat/chat");
+});
+
+it("round 5: a key write finishing after cancellation cannot recreate the pending key", async () => {
+  vi.mocked(api.get).mockResolvedValue({ id: "chat", type: "direct", members: [] } as never);
+  vi.mocked(api.post).mockImplementation(async (path) => (path === "/api/calls/initiate"
+    ? { call: { id: "B", conversationId: "chat", type: "audio", initiatorId: "alice", status: "ringing" }, created: true } : {}) as never);
+  let finishWrite!: () => void;
+  vi.mocked(savePendingCall).mockReturnValueOnce(new Promise<void>((done) => { finishWrite = done; }));
+  await render();
+  await act(async () => { await new Promise((done) => setTimeout(done, 0)); });
+  let pending!: Promise<void>;
+  await act(async () => { pending = state.handleStartCall("audio"); });
+  const { clearRegisteredLocalCallState } = await import("../../platform/session-cleanup.js");
+  await act(async () => clearRegisteredLocalCallState());
+  expect(deletePendingCall).toHaveBeenCalledWith("B");
+  await act(async () => { finishWrite(); await pending; });
+  expect(deletePendingCall).toHaveBeenCalledTimes(2);
+  expect(sendDirectPayloadFanout).not.toHaveBeenCalled();
+  expect(vi.mocked(api.post).mock.calls.filter(([path]) => path.endsWith("/end"))).toEqual([["/api/calls/B/end"]]);
 });

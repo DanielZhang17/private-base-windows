@@ -24,3 +24,4 @@ export { EmptyState, type EmptyStateProps } from "./EmptyState.js";
 export { Spinner, Skeleton, type SpinnerProps, type SkeletonProps } from "./Spinner.js";
 
 export { DarkSurface } from "./DarkSurface.js";
+export { Portal } from "./Portal.js";

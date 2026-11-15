@@ -26,6 +26,7 @@ it("prevents two conversation creates from concurrent form submissions", async (
   await render();
   await act(async () => state.setNewChatUsername("bob"));
   await act(async () => { await Promise.all([state.startNewChat(), state.startNewChat()]); });
+  expect(api.get).toHaveBeenCalledWith("/api/users/search?q=bob&exact=1");
   expect(api.post).toHaveBeenCalledTimes(1);
   expect(state.creatingChat).toBe(false);
 });
@@ -65,4 +66,22 @@ it("R2-unread: excludes a declined unread request while keeping remaining unread
   } finally {
     await act(async () => useChatStore.setState({ conversations: previous.conversations, unreadCounts: previous.unreadCounts }));
   }
+});
+
+it("shows the neutral privacy failure when group creation is rejected", async () => {
+  vi.mocked(api.post).mockRejectedValueOnce(new Error("One or more users are unavailable"));
+  await render();
+  await act(async () => state.setGroupMembers([{ id: "bob", username: "bob", displayName: "Bob", avatarUrl: null }]));
+  await act(async () => { await state.startNewGroup(); });
+  expect(state.newChatError).toBe("This person can't be added");
+  expect(state.groupMembers).toHaveLength(1);
+});
+
+it.each(["bobbie", "Bob"])("does not start a chat with %s when bob is hidden or missing", async username => {
+  vi.mocked(api.get).mockResolvedValue([{ id: "other", username }] as never);
+  await render();
+  await act(async () => state.setNewChatUsername("bob"));
+  await act(async () => { await state.startNewChat(); });
+  expect(state.newChatError).toBe("User not found");
+  expect(api.post).not.toHaveBeenCalled();
 });

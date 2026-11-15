@@ -283,8 +283,10 @@ export interface PasskeyRegistrationOptionsResponse {
     attestation: string;
     authenticatorSelection: {
       residentKey: string;
+      requireResidentKey?: boolean;
       userVerification: string;
     };
+    extensions?: { credProps: boolean };
     excludeCredentials: { id: string; type: "public-key"; transports?: string[] }[];
   };
 }
@@ -295,10 +297,9 @@ export interface PasskeyRegisterRequest {
   friendlyName: string;
 }
 
-export interface PasskeyLoginOptionsRequest {
-  username: string;
-  deviceId: string;
-}
+export type PasskeyLoginOptionsRequest =
+  | { username: string; deviceId: string }
+  | { handoff: { codeChallenge: string } };
 
 export interface PasskeyLoginOptionsResponse {
   challengeId: string;
@@ -311,12 +312,10 @@ export interface PasskeyLoginOptionsResponse {
   };
 }
 
-export interface PasskeyLoginRequest {
+export type PasskeyLoginRequest = {
   challengeId: string;
   credential: unknown;
-  username: string;
-  deviceId: string;
-}
+} & PasskeyLoginOptionsRequest;
 
 // Profile
 export interface UpdateProfileRequest {

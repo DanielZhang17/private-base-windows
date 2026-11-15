@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-passkey-handoff-start"
+description = "Starts a passkey handoff to the fixed Private Base origin and returns its matching callback."
+commands.allow = ["passkey_handoff_start"]

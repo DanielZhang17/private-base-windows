@@ -27,6 +27,7 @@ import {
 } from "@e2ee-chat/shared";
 import { saveKey, saveKeys, getKey, clearCryptoState } from "../db/index.js";
 import { api } from "../services/api.js";
+import { clearRegisteredLocalCallState } from "../platform/session-cleanup.js";
 
 const IDENTITY_KEY_ID = "identity";
 const SIGNED_PRE_KEY_ID = "signedPreKey";
@@ -650,6 +651,7 @@ export function lockLocalCryptoState(): void {
   _maintenance = null;
   _bundleUpload = null;
   _bundlePublished = false;
+  clearRegisteredLocalCallState();
 }
 
 /**

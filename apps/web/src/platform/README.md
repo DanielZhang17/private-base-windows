@@ -87,3 +87,24 @@ Windows notification clicks are only reported while a toast is on screen, per
 the [plugin documentation](https://v2.tauri.app/reference/javascript/notification/#onaction).
 Notification click callbacks are in memory and apply while the app is running;
 restoring navigation after an OS cold launch needs native lifecycle integration.
+
+Native passkey handoff (phase 1) is documented in [native-passkeys.md](../../../../docs/native-passkeys.md).
+`capabilities.nativePasskeys` is separate from browser WebAuthn. Phase 2 launchers
+advertise the `passkey_handoff_start` command before JS starts; older launchers
+keep this capability disabled. Login/settings show passkeys when either path is
+available. Handoff authentication still requires password unlock of local keys.
+
+Android background integration is enabled only by native Android plus the pre-JS
+`__PRIVATEBASE_NATIVE_CAPABILITIES__.backgroundConnection` and
+`.nativeCallNotifications` flags (exposed through `capabilities`). Older shells
+never receive the new commands. `android-background.ts` whitelists the app-command
+IPC fields; message notifications carry only conversation ID and sender name.
+`android-background-service.ts` serializes service changes and stores opt-in at
+`private-base:android-background:<userId>` on this device. UnlockedAppEffects owns
+its session; account teardown and local key lock synchronously invalidate work
+through `registerUnlockedSessionCleanup`, then stop the native service.
+CallProvider owns native notification routing and the single FIFO action drain.
+Hidden native wakeups may decline; Accept and conversation navigation wait for a
+visible unlocked session. Accept validates the current secure invite and server
+state before using the existing local-consent invitation owner. No native event
+payload or notification alone grants call ownership.

@@ -12,6 +12,7 @@ import { useUiPreferencesStore } from "../../stores/uiPreferencesStore.js";
 import { clearAll } from "../../db/index.js";
 import { lockLocalCryptoState, resetLocalCryptoState } from "../../lib/key-manager.js";
 import { generateRecoveryKey } from "../../lib/device-link.js";
+import { addNativePasskey } from "../../lib/native-passkeys.js";
 import { createPasskeyCredential, PasskeyUnsupportedError } from "../../lib/webauthn.js";
 import { capabilities } from "../../platform/capabilities.js";
 import { clearAccountScopedState } from "../../platform/session.js";
@@ -29,6 +30,8 @@ import {
 import { saveFile } from "../../platform/files.js";
 import { resolveAvatarImageUrl } from "./avatar.js";
 import { SETTINGS_SECTIONS, type SettingsSection } from "./sections.js";
+import { useBackgroundSettings } from "./useBackgroundSettings.js";
+import { usePrivacySettings } from "./usePrivacySettings.js";
 import { useSettingsBack } from "./useSettingsBack.js";
 
 const PASSKEY_OPTIONS_MAX_AGE_MS = 4 * 60 * 1000;
@@ -53,7 +56,10 @@ export function useSettings() {
   const [searchParams] = useSearchParams();
   const closeSection = useSettingsBack();
   const sectionParam = searchParams.get("section");
-  const selectedSection = SETTINGS_SECTIONS.some(([key]) => key === sectionParam) ? sectionParam as SettingsSection : null;
+  const background = useBackgroundSettings();
+  const privacy = usePrivacySettings(sectionParam === "privacy");
+  const selectedSection = SETTINGS_SECTIONS.some(([key]) => key === sectionParam) &&
+    (sectionParam !== "notifications" || background.supported) ? sectionParam as SettingsSection : null;
   const [confirmation, setConfirmation] = useState<{ kind: "passkey" | "emoji"; id: string; name: string } | null>(null);
   const [showDeleteAccount, setShowDeleteAccount] = useState(false);
   const [showForgetKeys, setShowForgetKeys] = useState(false);
@@ -100,7 +106,7 @@ export function useSettings() {
   useEffect(() => { setDisplayName(user?.displayName ?? ""); }, [user?.displayName]);
 
   const passkeysQuery = useQuery({
-    enabled: capabilities.passkeys,
+    enabled: capabilities.passkeys || capabilities.nativePasskeys,
     queryKey: ["passkeys"],
     queryFn: () => api.get<PasskeyInfo[]>("/api/passkeys"),
   });
@@ -203,7 +209,7 @@ export function useSettings() {
   const previewSend = appearanceValidation.send ?? storedPreferences.sendButtonColor;
 
   const handleRegisterPasskey = async () => {
-    if (!capabilities.passkeys) {
+    if (!capabilities.passkeys && !capabilities.nativePasskeys) {
       setPasskeyError(toErrorMessage(new PasskeyUnsupportedError()));
       return;
     }
@@ -214,6 +220,12 @@ export function useSettings() {
     setRegisteringPasskey(true);
     setPasskeyError(null);
     try {
+      if (capabilities.nativePasskeys) {
+        await addNativePasskey(passkeyName.trim());
+        setPasskeyName("");
+        await queryClient.invalidateQueries({ queryKey: ["passkeys"] });
+        return true;
+      }
       const registerOptions =
         cachedPasskeyOptions && Date.now() - cachedPasskeyOptions.fetchedAt < PASSKEY_OPTIONS_MAX_AGE_MS
           ? cachedPasskeyOptions
@@ -446,6 +458,7 @@ export function useSettings() {
   };
 
   return {
+    privacy,
     selectedSection, section: selectedSection ?? "appearance",
     compressAttachments: storedPreferences.compressAttachments ?? false,
     setCompressAttachments: (enabled: boolean) => {
@@ -479,7 +492,8 @@ export function useSettings() {
     colorInputValue: (value: string) => normalizeHexColor(value) ?? "#000000",
     copyRecoveryKey,
     capabilities,
-    passkeysSupported: capabilities.passkeys,
+    background,
+    passkeysSupported: capabilities.passkeys || capabilities.nativePasskeys,
     navigate,
     user,
     device,

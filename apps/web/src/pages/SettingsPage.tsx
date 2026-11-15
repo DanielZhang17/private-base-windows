@@ -47,6 +47,27 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
     <div className="min-h-0 grow overflow-y-auto pb-safe">
       <div className="mx-auto max-w-2xl space-y-7 p-4 sm:p-6">
 
+        {s.section === "notifications" && s.background.supported && <>
+          <label className="flex min-h-11 cursor-pointer items-center gap-3 text-sm">
+            <input type="checkbox" role="switch" className="toggle" checked={s.background.enabled}
+              disabled={s.background.busy} onChange={(event) => { void s.background.setEnabled(event.target.checked); }} />
+            {t("androidBackground.stayConnected")}
+          </label>
+          <p className="text-sm text-ink-muted">{t("androidBackground.battery")}</p>
+          {s.background.error && <Notice tone="danger">{t("androidBackground.permission")}</Notice>}
+          {s.background.enabled && s.background.status && !s.background.status.batteryExempt &&
+            <Notice tone="warning">{t("androidBackground.doze")}</Notice>}
+          {s.background.enabled && <Button variant="secondary" onClick={() => { void s.background.openSettings("battery"); }}>
+            {t("androidBackground.batterySettings")}
+          </Button>}
+          {s.background.status && !s.background.status.fullScreen && <>
+            <Notice tone="warning">{t("androidBackground.fullScreenFallback")}</Notice>
+            <Button variant="secondary" onClick={() => { void s.background.openSettings("fullScreen"); }}>
+              {t("androidBackground.fullScreenSettings")}
+            </Button>
+          </>}
+        </>}
+
         {s.section === "profile" && <>
 
           {s.profileError && <Notice tone="danger">
@@ -105,6 +126,42 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
             onChange={(event) => s.setCompressAttachments(event.target.checked)} />
           {t("compressAttachmentsByDefault")}
         </label>}
+
+        {s.section === "privacy" && <>
+          {s.privacy.loading && <Spinner label={t("loadingStatus")} />}
+          {s.privacy.error && <Notice tone="danger">{s.privacy.error}
+            <Button variant="ghost" onClick={s.privacy.retry}>{t("retry")}</Button>
+          </Notice>}
+          <section className="space-y-3">
+            <label className="flex min-h-11 cursor-pointer items-center gap-3 text-sm">
+              <input type="checkbox" role="switch" className="toggle" checked={s.privacy.data?.discoverable === false}
+                disabled={s.privacy.disabled} aria-describedby="hide-me-help"
+                onChange={(event) => { void s.privacy.save({ discoverable: !event.target.checked }).then(saved => { if (saved) success(localized("privacySaved")); }); }} />
+              {t("hideMe")}
+            </label>
+            <p id="hide-me-help" className="text-sm text-ink-muted">{t("hideMeHelp")}</p>
+          </section>
+          <Field label={t("groupInvitesLabel")}>
+            <Select value={s.privacy.data?.groupInvites ?? "everyone"} disabled={s.privacy.disabled}
+              onChange={(event) => { void s.privacy.save({ groupInvites: event.target.value as "everyone" | "contacts" | "nobody" }).then(saved => { if (saved) success(localized("privacySaved")); }); }}>
+              <option value="everyone">{t("groupInvitesEveryone")}</option>
+              <option value="contacts">{t("groupInvitesContacts")}</option>
+              <option value="nobody">{t("groupInvitesNobody")}</option>
+            </Select>
+          </Field>
+          {s.privacy.capture.capability && <section className="space-y-3 border-t border-line pt-6">
+            {s.privacy.capture.enabled !== undefined && <label className="flex min-h-11 cursor-pointer items-center gap-3 text-sm">
+              <input type="checkbox" role="switch" className="toggle" checked={s.privacy.capture.enabled}
+                disabled={s.privacy.capture.busy} aria-describedby="capture-protection-help"
+                onChange={(event) => { void s.privacy.capture.setEnabled(event.target.checked); }} />
+              {t("captureProtectionLabel")}
+            </label>}
+            <p id="capture-protection-help" className="text-sm text-ink-muted">{t(s.privacy.capture.capability === "full" ? "captureProtectionFull" : s.privacy.capture.capability === "recording" ? "captureProtectionRecording" : "captureProtectionBestEffort")}</p>
+            {s.privacy.capture.error && <Notice tone="danger">{s.privacy.capture.error}
+              {s.privacy.capture.enabled === undefined && <Button variant="ghost" onClick={s.privacy.capture.retry}>{t("retry")}</Button>}
+            </Notice>}
+          </section>}
+        </>}
 
         {s.section === "appearance" && <>
           <Field label={t("language")}>
@@ -222,7 +279,7 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
             >{t("createRecoveryKey")}</Button>}
           </section>
 
-          {s.capabilities.passkeys && <section className="space-y-4 border-t border-line pt-6">
+          {(s.capabilities.passkeys || s.capabilities.nativePasskeys) && <section className="space-y-4 border-t border-line pt-6">
             <h2 className="font-semibold">{t("passkeys")}</h2>
             <p className="text-sm text-ink-muted">{t("signInWithYourDeviceLockBiometricsOr")}</p>
             {s.passkeyError && <Notice tone="danger">

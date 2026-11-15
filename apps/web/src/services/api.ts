@@ -1,39 +1,11 @@
+import { isSameSession, type SessionSnapshot } from "./session-identity.js";
 import { useAuthStore } from "../stores/authStore.js";
 import { isNative } from "../platform/environment.js";
 import { navigate } from "../platform/navigation.js";
 import { clearAccountScopedState } from "../platform/session.js";
 
-const PAGE_PREVIEW_SUFFIX = ".e2ee-chat-web.pages.dev";
-const PRODUCTION_WEB_HOSTS = new Set(["chat.718788.xyz"]);
-const DEFAULT_CLOUDFLARE_API_ORIGIN = "https://chat-api.718788.xyz";
-
-function resolveApiBaseUrl(): string {
-  const configured = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
-  if (isNative()) {
-    if (!configured) throw new Error("Native clients require VITE_API_BASE_URL (for example https://chat-api.718788.xyz)");
-    let url: URL;
-    try {
-      url = new URL(configured);
-    } catch {
-      throw new Error("VITE_API_BASE_URL must be an absolute http(s) URL for native clients");
-    }
-    if (url.protocol !== "https:" && url.protocol !== "http:") {
-      throw new Error("VITE_API_BASE_URL must be an absolute http(s) URL for native clients");
-    }
-  }
-  if (configured) return configured.replace(/\/$/, "");
-
-  // In Pages preview/alias hosts, same-origin /auth and /api requests hit static hosting (405).
-  // Route them to the API Worker unless an explicit VITE_API_BASE_URL is set.
-  const host = location.hostname.toLowerCase();
-  if (host === "e2ee-chat-web.pages.dev" || host.endsWith(PAGE_PREVIEW_SUFFIX) || PRODUCTION_WEB_HOSTS.has(host)) {
-    return DEFAULT_CLOUDFLARE_API_ORIGIN;
-  }
-
-  return "";
-}
-
-const API_BASE_URL = resolveApiBaseUrl();
+import { resolveApiUrl, API_BASE_URL } from "./api-url.js";
+export { resolveApiUrl } from "./api-url.js";
 let refreshPromise: Promise<void> | null = null;
 
 /** End an expired session. Navigation stays in the SPA, so account state is cleared explicitly. */
@@ -41,11 +13,6 @@ function expireSession(): void {
   clearAccountScopedState();
   useAuthStore.getState().logout();
   navigate("/login");
-}
-
-export function resolveApiUrl(path: string): string {
-  if (/^https?:\/\//i.test(path)) return path;
-  return `${API_BASE_URL}${path}`;
 }
 
 export function resolveWsBaseUrl(): string {
@@ -73,26 +40,6 @@ export class ApiError extends Error {
   }
 }
 
-type SessionSnapshot = {
-  accessToken: string | null;
-  device: { id: string } | null;
-  authEpoch: number;
-  sessionId: string | null;
-};
-
-/**
- * Whether `now` is still the session a request started in. The per-login sessionId decides:
- * it changes on every login (even on the same device) and on logout, but not on an idle lock,
- * a session-identity repair or a token rotation, and it is shared by all tabs of that login.
- * Sessions persisted before sessionId existed fall back to the device id, then to authEpoch
- * (which alone would also change on an idle lock and can coincide across tabs).
- */
-function isSameSession(before: SessionSnapshot, now: SessionSnapshot): boolean {
-  if (!now.accessToken) return false;
-  if (before.sessionId || now.sessionId) return before.sessionId === now.sessionId;
-  if (before.device?.id && now.device?.id) return before.device.id === now.device.id;
-  return before.authEpoch === now.authEpoch;
-}
 
 type PersistedSession = {
   accessToken?: unknown;

@@ -74,6 +74,16 @@ export const createConversationSchema = z.object({
   type: z.enum(["direct", "group"]),
   memberUserIds: z.array(z.string()).min(1),
   name: z.string().max(128).optional(),
+}).refine(data => data.type !== "direct" || data.memberUserIds.length === 1, {
+  message: "Direct conversations require exactly one other member",
+  path: ["memberUserIds"],
+});
+
+export const updatePrivacySchema = z.object({
+  discoverable: z.boolean().optional(),
+  groupInvites: z.enum(["everyone", "contacts", "nobody"]).optional(),
+}).strict().refine(data => data.discoverable !== undefined || data.groupInvites !== undefined, {
+  message: "At least one field required",
 });
 
 export const addMembersSchema = z.object({
@@ -214,6 +224,9 @@ const webauthnCredential = z.object({
   type: z.literal("public-key"),
   response: webauthnCredentialResponse,
   authenticatorAttachment: z.string().optional(),
+  clientExtensionResults: z.object({
+    credProps: z.object({ rk: z.boolean().optional() }).optional(),
+  }).optional(),
 });
 
 export const passkeyRegisterSchema = z.object({
@@ -222,14 +235,29 @@ export const passkeyRegisterSchema = z.object({
   friendlyName: z.string().min(1).max(64),
 });
 
-export const passkeyLoginOptionsSchema = z.object({
-  username: z.string(),
+export const passkeyCodeChallengeSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
+const passkeyHandoffSchema = z.object({ codeChallenge: passkeyCodeChallengeSchema });
+
+export const passkeyLoginOptionsSchema = z.union([
+  z.object({ handoff: passkeyHandoffSchema }),
+  z.object({ username: z.string(), deviceId: z.string().trim().min(1) }),
+]);
+
+export const passkeyLoginSchema = z.union([
+  z.object({ challengeId: z.string().min(1), credential: webauthnCredential, handoff: passkeyHandoffSchema }),
+  z.object({ challengeId: z.string().min(1), credential: webauthnCredential, username: z.string(), deviceId: z.string().trim().min(1) }),
+]);
+
+export const passkeyHandoffRedeemSchema = z.object({
+  code: passkeyCodeChallengeSchema,
+  codeVerifier: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   deviceId: z.string().trim().min(1),
 });
-
-export const passkeyLoginSchema = z.object({
-  challengeId: z.string().min(1),
-  credential: webauthnCredential,
-  username: z.string(),
-  deviceId: z.string().trim().min(1),
+export const passkeyHandoffStartSchema = z.object({ codeChallenge: passkeyCodeChallengeSchema });
+export const passkeyTicketSchema = z.object({ ticket: passkeyCodeChallengeSchema });
+export const passkeyTicketRegisterSchema = passkeyRegisterSchema.omit({ friendlyName: true }).extend({ ticket: passkeyCodeChallengeSchema });
+export const passkeyHandoffCompleteSchema = z.object({
+  pendingId: z.string().min(1),
+  codeVerifier: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  friendlyName: z.string().trim().min(1).max(64).default("Private Base"),
 });

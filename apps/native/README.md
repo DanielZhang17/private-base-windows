@@ -257,6 +257,165 @@ the NSIS installer is `apps/native/src-tauri/target/debug/bundle/nsis/*-setup.ex
 These are unsigned test builds. Do not use the shared release-build example for
 this branch's validation.
 
+### Passkey browser handoff (phase 2)
+
+Windows registers `passkey_handoff_start(url, callbackScheme)` and opens the
+validated URL in the default browser through the existing Rust opener plugin.
+Only `https://chat.718788.xyz` (including an explicit default port 443) and exactly
+`/native/passkey/sign-in` or `/native/passkey/add` are accepted. Debug Rust builds
+also accept `http://localhost:5173` on those paths. The callback scheme must be
+`privatebase`. Userinfo, fragments, alternate ports, normalized/extra path
+segments and malformed or duplicate query parameters are rejected. Requests must
+carry the phase-1 state and challenge/ticket, without a verifier or extra fields.
+
+The Windows-only [deep-link configuration](src-tauri/tauri.windows.conf.json)
+associates `privatebase` in the current-user NSIS installer. At runtime,
+`tauri-plugin-deep-link` also registers the current executable under
+`HKCU\Software\Classes\privatebase`, supporting the raw debug executable without
+elevation. Running a different debug copy updates that user's association to the
+new executable. `tauri-plugin-single-instance` is installed first; its callback
+shows, unminimizes and focuses the existing main window on relaunch. A pure
+routing decision forwards only a matching, unexpired pending callback to
+deep-link's Rust listener; normal relaunches and invalid or unsolicited links
+only activate the window. Automatic single-instance `deep-link` forwarding is
+deliberately disabled to avoid forwarding unsolicited URLs or diagnostic logging
+of nonmatching schemes. A cold launch with a sole URL argument in another scheme
+is ignored before plugin initialization, which otherwise logs that URL in debug
+builds. See Tauri's [deep-link runtime registration](https://v2.tauri.app/plugin/deep-linking/#registering-desktop-deep-links-at-runtime).
+
+Only one session can wait at a time. The native listener accepts exactly
+`privatebase://passkey` with the originating state and expected `code` or
+`registered` result. Wrong-state, wrong-result, duplicate, expired and unsolicited
+callbacks are ignored, including cold-start links; no stored startup callback is
+replayed. A callback resolves only its initiating command. The five-minute timeout
+rejects with `"cancelled"`; invalid requests, a concurrent start, browser-open
+failure and other command failures reject with `"unsupported"`. Session cleanup
+also runs when the command future is dropped. URLs and callbacks are not logged
+or written to persistent storage.
+
+The Windows overlay defers main-window creation until registration has finished.
+The pre-JS initialization script merges into
+`window.__PRIVATEBASE_NATIVE_CAPABILITIES__`, preserving existing keys and adding
+`passkeyHandoff: true` only after successful registration. If registration fails,
+the window still opens without the passkey flag and the command returns
+`"unsupported"`. Other platforms register neither this
+command nor its capability advertisement. The
+[Windows capability](src-tauri/capabilities/windows-passkey.json) grants only
+`allow-passkey-handoff-start` to the local `main` window. The renderer receives no
+deep-link getter, registration or event-listener permissions.
+
+New direct dependencies are pinned exactly: deep-link 2.6.3 and single-instance
+2.5.5 (both published October 28, 2026), plus the existing locked Tokio 1.54.1
+(October 21, 2026). All predate this change by at least two weeks. The two plugins
+are also dev dependencies so host tests compile the Windows Tauri command and
+builder wiring without launching an app or requiring the Windows SDK.
+
+Phase-2 verification on this Mac:
+
+```text
+cargo test --locked
+test result: ok. 13 passed; 0 failed
+cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo]
+cargo fmt --check
+# exits 0
+npx vitest run
+Tests 24 passed (24)
+# JSON Schema validation of shared + merged Windows config and Windows capability
+PASS
+cargo check --target x86_64-pc-windows-msvc --locked
+Err value: NotAttempted("llvm-rc")
+```
+
+The cross-check reads the Windows overlay and resolves its capability before
+failing in `tauri-winres`; this host has no Windows resource compiler/SDK. It
+cannot build or launch a Windows executable. On Windows, run the debug build
+above, then check both sign-in and add-passkey with a test account, callback
+delivery and normal relaunch activation of an already running/minimized instance,
+and the capability flag before the frontend starts. Confirm the raw executable
+and current-user installer both register the scheme, a second pending invoke
+rejects with `"unsupported"`, a
+browser dismissed without a callback times out after five minutes with
+`"cancelled"`, and wrong-state/result, replayed and cold-start callbacks do not
+complete a session. No emulator, simulator or existing app was touched here.
+
+### Windows capture protection
+
+Capture protection defaults to **on**, including the sign-in screen. Native code
+loads `capture-protection.json` using Tauri's `app_config_dir()` before building
+the main window. On Windows the file is
+`%APPDATA%\xyz.chat718788.e2eechat\capture-protection.json`, containing
+`{"enabled":true}` or `{"enabled":false}`. Only an explicit boolean false disables
+protection; missing, unreadable or corrupt values default to true. The Windows
+overlay retains `contentProtected: true` as its default; the deferred builder
+overrides it with the persisted value. Tao applies display affinity before
+creating the webview or showing the window. The window stays hidden until the
+additional checked Win32 call succeeds; a failure aborts startup.
+The pre-JS script merges `captureProtection: "full"` alongside the passkey flag,
+even when passkey registration fails, without replacing other capability keys.
+
+`invoke("get_capture_protection")` returns `{ enabled: boolean }` from native
+state. `invoke("set_capture_protection", { enabled })` returns `Promise<void>`
+and persists the value before setting affinity on every current app window,
+including `main`. Writes use a synced temporary file and replacement in the same
+directory, preserving the previous file on write/replacement failure. A native
+mutex serializes reads and updates. Persistence failure rejects without changing
+the windows; affinity failure restores the previous preference and window state
+and reports any rollback errors. Repeating the same value is idempotent. The
+[permissions](src-tauri/permissions/capture-protection.toml) allow only these
+two commands, and their [Windows capability](src-tauri/capabilities/windows-capture-protection.json)
+grants them only to the local `main` window. No general window-control or renderer
+config-file permission is granted. The web app reads native state and does not
+store or replay a localStorage preference.
+
+The checked call uses `RtlGetVersion` to choose `WDA_EXCLUDEFROMCAPTURE` from
+Windows 10 version 2004 (build 19041) onward and `WDA_MONITOR` on older builds.
+Disabling always sets `WDA_NONE`. See Microsoft's
+[display-affinity API](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity)
+for the supported capture APIs and DWM requirement. The direct `windows`
+dependency is pinned to the existing locked **0.62.2**
+([published October 6, 2025](https://docs.rs/crate/windows/0.62.2)), with only the
+features needed for affinity and OS-version lookup; no locked package versions
+change.
+
+Verification for this change on the macOS host:
+
+```text
+cargo test --locked
+# 24 passed; 0 failed (includes persistence, write/replace failure and rollback)
+cargo clippy -- -D warnings
+cargo clippy --all-targets --locked --offline -- -D warnings
+# Finished dev profile; no warnings
+cargo fmt --check
+# exits 0
+npx --no-install vitest run
+# 26 passed (includes capability merge and least-privilege checks)
+# JSON Schema: shared + merged Windows config and all 4 capabilities
+PASS
+cargo check --target x86_64-pc-windows-msvc --locked --offline
+# exits 101: NotAttempted("llvm-rc")
+```
+
+Cargo checks use a writable temporary `CARGO_HOME` because the default cache is
+read-only in this sandbox. The persistence tests cover default-on, restart
+roundtrips, malformed values, failed writes/replacements leaving window state
+unchanged, and affinity failure restoring the previous state. Host tests also
+type-check both capture commands, the invoke handler and deferred window setup.
+An isolated `x86_64-pc-windows-msvc` harness imports the actual capture module,
+window setup and command wiring; it also passes Clippy with `-D warnings` without
+the application's resource-compilation step.
+The Windows resource compiler/SDK is missing, so a full Windows build and launch
+remain unverified. On Windows 10 2004+/Windows 11,
+manually test screenshots, Snipping Tool and recording immediately from cold
+launch at sign-in, then after disabling, enabling and repeating each command.
+Confirm a relaunch restores the selected value, both native capability keys coexist
+when passkeys are available, and other app windows follow the command. On an older
+build, confirm captures show blank window content with `WDA_MONITOR`. With the
+shared web UI integrated, verify a stored opt-out applies before the sign-in page
+loads and the toggle takes effect immediately. Use the unsigned debug build
+instructions above.
+
 ### Testing the Windows CI artifacts
 
 `.github/workflows/native-windows.yml` runs on pushes to `native/windows` and

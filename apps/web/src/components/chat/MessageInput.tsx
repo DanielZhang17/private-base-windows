@@ -10,7 +10,7 @@ export default function MessageInput(props: ComposerOptions) {
   useLocale();
   const input = useComposer(props);
   const [attachOpen, setAttachOpen] = useState(false);
-  return <form onSubmit={input.handleSubmit} className={`shrink-0 border-t border-line px-2 pt-2 pb-safe ${input.dragging ? "bg-brand-soft" : "bg-surface"}`}>
+  return <form data-call-avoid="bottom" onSubmit={input.handleSubmit} className={`shrink-0 border-t border-line px-2 pt-2 pb-safe ${input.dragging ? "bg-brand-soft" : "bg-surface"}`}>
     {input.pendingFile && <div className="mb-2 rounded-control bg-sunken px-3 text-sm">
       <div className="flex items-center gap-2">
         <span className="min-w-0 flex-1 truncate">{input.pendingFile.name} · {formatBytes(input.pendingFile.size)}</span>

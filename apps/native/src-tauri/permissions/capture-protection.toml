@@ -1,0 +1,9 @@
+[[permission]]
+identifier = "allow-get-capture-protection"
+description = "Reads the native capture-protection preference."
+commands.allow = ["get_capture_protection"]
+
+[[permission]]
+identifier = "allow-set-capture-protection"
+description = "Enables or disables capture protection on the application's native windows."
+commands.allow = ["set_capture_protection"]

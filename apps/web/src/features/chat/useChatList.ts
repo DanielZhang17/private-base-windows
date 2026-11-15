@@ -98,9 +98,9 @@ export function useChatList() {
     setCreatingChat(true);
     try {
       const matches = await api.get<SearchUserResult[]>(
-        `/api/users/search?q=${encodeURIComponent(username)}`
+        `/api/users/search?q=${encodeURIComponent(username)}&exact=1`
       );
-      const target = matches.find((u) => u.username.toLowerCase() === username.toLowerCase()) ?? matches[0];
+      const target = matches.find((u) => u.username === username);
 
       if (!target) {
         setNewChatError(localized("userNotFound"));

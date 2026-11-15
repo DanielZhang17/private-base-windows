@@ -3,7 +3,7 @@ import { capabilities } from "./capabilities.js";
 import { E2EECallUnsupportedError, supportsE2EECalling } from "./calls.js";
 import {
   acceptCallOffer, addReceiverTransform, addSenderTransform, attachLocalTracks,
-  createPeerConnection, deriveCallKey, initiateCall,
+  createPeerConnection, deriveCallKey, initiateCall, disposeCallTransforms,
 } from "../services/webrtc.js";
 import { api } from "../services/api.js";
 
@@ -80,7 +80,7 @@ function script() {
   vi.stubGlobal("RTCPeerConnection", Peer);
   vi.stubGlobal("RTCRtpSender", ScriptSender);
   vi.stubGlobal("RTCRtpReceiver", ScriptReceiver);
-  vi.stubGlobal("Worker", vi.fn());
+  vi.stubGlobal("Worker", class { terminate = vi.fn(); });
   vi.stubGlobal("RTCRtpScriptTransform", vi.fn());
 }
 
@@ -97,7 +97,7 @@ beforeEach(async () => {
   vi.mocked(api.get).mockResolvedValue({ iceServers: [] });
   callKey = await deriveCallKey(new Uint8Array(32), "test-call");
 });
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { disposeCallTransforms(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("E2EE call capability and setup", () => {
   it("blocks every setup entry point before capture, TURN, SDP or signaling when transforms are unavailable", async () => {
@@ -160,6 +160,58 @@ describe("E2EE call capability and setup", () => {
     expect(onRemote).toHaveBeenCalledWith(remoteStream);
     await acceptCallOffer(pc, socket as unknown as WebSocket, "encrypted-offer");
     expect(peer.createAnswer).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains the script transform and worker on an existing sender until the call owner disposes it", async () => {
+    script();
+    const pc = await createPeerConnection("call", callKey, vi.fn());
+    const peer = Peer.instances[0];
+    attachLocalTracks(pc, media([track()]), callKey);
+    const sender = peer.senders[0] as ScriptSender;
+    const transform = sender.transform;
+    const worker = vi.mocked(RTCRtpScriptTransform).mock.calls[0][0] as Worker;
+    addSenderTransform(sender as unknown as RTCRtpSender, callKey);
+    expect(sender.transform).toBe(transform);
+    expect(RTCRtpScriptTransform).toHaveBeenCalledOnce();
+    expect(worker.terminate).not.toHaveBeenCalled();
+    pc.close();
+    disposeCallTransforms();
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    const nextPc = await createPeerConnection("next", callKey, vi.fn());
+    attachLocalTracks(nextPc, media([track()]), callKey);
+    expect(vi.mocked(RTCRtpScriptTransform).mock.calls[1][0]).not.toBe(worker);
+  });
+
+  it("does not construct a peer when local ownership is revoked while TURN is loading", async () => {
+    legacy();
+    let resolve!: (credentials: { iceServers: never[] }) => void;
+    vi.mocked(api.get).mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+    let current = true;
+    const setup = createPeerConnection("call", callKey, vi.fn(), () => current);
+    current = false;
+    resolve({ iceServers: [] });
+    await expect(setup).rejects.toMatchObject({ name: "AbortError" });
+    expect(Peer.instances).toHaveLength(0);
+  });
+
+  it.each(["remote", "answer", "local"] as const)("stops offer answering after a stale %s description/answer continuation", async (step) => {
+    legacy();
+    const pc = await createPeerConnection("call", callKey, vi.fn());
+    const peer = Peer.instances[0];
+    let resolve!: (answer: RTCSessionDescriptionInit) => void;
+    const waiting = new Promise<RTCSessionDescriptionInit>((done) => { resolve = done; });
+    const deferredStep = { remote: peer.setRemoteDescription, answer: peer.createAnswer, local: peer.setLocalDescription }[step];
+    deferredStep.mockReturnValueOnce(waiting as never);
+    let current = true;
+    const answering = acceptCallOffer(pc, socket as unknown as WebSocket, "offer", () => current);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    expect(deferredStep).toHaveBeenCalledOnce();
+    current = false;
+    resolve({ type: "answer", sdp: "late-answer" });
+    await answering;
+    expect(socket.send).not.toHaveBeenCalled();
+    if (step === "remote") expect(peer.createAnswer).not.toHaveBeenCalled();
+    if (step !== "local") expect(peer.setLocalDescription).not.toHaveBeenCalled();
   });
 
   it.each(["legacy", "script"])("closes and stops capture before any signaling when %s transform setup throws", async (mode) => {

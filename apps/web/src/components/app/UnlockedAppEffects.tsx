@@ -12,6 +12,8 @@ import { useCallStore } from "../../stores/callStore.js";
 import { usePresenceStore } from "../../stores/presenceStore.js";
 import { useChatStore } from "../../stores/chatStore.js";
 import { useConnectionStore } from "../../stores/connectionStore.js";
+import { startBackgroundSession } from "../../platform/android-background-service.js";
+import { registerUnlockedSessionCleanup } from "../../platform/session-cleanup.js";
 
 function getConversationName(conversation: ConversationWithMembers, localUserId: string): string {
   if (conversation.name) return conversation.name;
@@ -21,11 +23,14 @@ function getConversationName(conversation: ConversationWithMembers, localUserId:
     .join(", ");
 }
 
-async function waitForCallOffer(callId: string): Promise<boolean> {
+async function waitForCallOffer(callId: string, isCurrent: () => boolean): Promise<boolean> {
   for (let attempt = 0; attempt < 5; attempt++) {
+    if (!isCurrent()) return false;
     await syncMessages({ force: true });
+    if (!isCurrent()) return false;
     const pendingCall = await getPendingCall(callId);
-    if (pendingCall) return true;
+    if (!isCurrent()) return false;
+    if (pendingCall && pendingCall.expiresAt > Date.now()) return true;
     await new Promise((resolve) => window.setTimeout(resolve, 400));
   }
   return false;
@@ -35,12 +40,20 @@ export default function UnlockedAppEffects() {
   useLocale();
   const userId = useAuthStore((state) => state.user?.id);
   const deviceId = useAuthStore((state) => state.device?.id);
+  const sessionId = useAuthStore((state) => state.sessionId);
   const setOnline = useConnectionStore((state) => state.setOnline);
 
   useEffect(() => {
     if (!userId || !deviceId) return;
 
     let disposed = false;
+    const current = () => {
+      const auth = useAuthStore.getState();
+      return !disposed && !!auth.accessToken && auth.user?.id === userId && auth.device?.id === deviceId && auth.sessionId === sessionId;
+    };
+    const stopBackground = startBackgroundSession(userId, current);
+    const unregister = registerUnlockedSessionCleanup(() => { disposed = true; });
+    const retiredCallIds = new Set<string>();
     let socketDispose: (() => void) | null = null;
     let messageSyncTimer: number | null = null;
     const cleanupTimer = window.setInterval(() => {
@@ -57,19 +70,23 @@ export default function UnlockedAppEffects() {
 
     const handleCallEvent = async (payload: CallEventPayload) => {
       try {
-        if (disposed) return;
+        if (!current()) return;
 
         if (payload.event === "incoming") {
           const currentCall = useCallStore.getState();
           if (
-            currentCall.activeCallId &&
-            currentCall.activeCallId !== payload.callId &&
-            (currentCall.callStatus === "ringing" || currentCall.callStatus === "active")
+            retiredCallIds.has(payload.callId) ||
+            currentCall.pendingCallStart ||
+            (currentCall.activeCallId && (currentCall.callStatus === "ringing" || currentCall.callStatus === "active"))
           ) {
             return;
           }
 
           const conversation = await api.get<ConversationWithMembers>(`/api/conversations/${payload.conversationId}`);
+          if (!current() || retiredCallIds.has(payload.callId)) return;
+          const latest = useCallStore.getState();
+          if (latest.pendingCallStart || (latest.activeCallId &&
+              (latest.callStatus === "ringing" || latest.callStatus === "active"))) return;
           const caller = conversation.members.find((member) => member.userId === payload.fromUserId);
 
           useCallStore.getState().setIncomingCall({
@@ -84,13 +101,15 @@ export default function UnlockedAppEffects() {
             keyReady: false,
           });
 
-          const keyReady = await waitForCallOffer(payload.callId);
-          if (!disposed && keyReady) {
+          const keyReady = await waitForCallOffer(payload.callId, () => current() && !retiredCallIds.has(payload.callId) &&
+            useCallStore.getState().activeCallId === payload.callId && useCallStore.getState().callStatus === "ringing");
+          if (current() && !retiredCallIds.has(payload.callId) && keyReady) {
             useCallStore.getState().markKeyReady(payload.callId, true);
           }
           return;
         }
 
+        retiredCallIds.add(payload.callId);
         useCallStore.getState().updateCallStatus(payload.callId, payload.status);
 
         if (payload.event === "accepted") {
@@ -102,7 +121,7 @@ export default function UnlockedAppEffects() {
           if (disposed) return;
           const current = useCallStore.getState();
           if (current.activeCallId === payload.callId && current.callStatus === payload.status) {
-            useCallStore.getState().clearCall();
+            useCallStore.getState().clearCall(payload.callId);
           }
         }, 1500);
       } catch (err) {
@@ -173,7 +192,7 @@ export default function UnlockedAppEffects() {
     window.addEventListener("offline", handleOffline);
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
-    void requestNotificationPermission();
+    void requestNotificationPermission().catch(() => undefined);
 
     void Promise.all([
       runUnlockSync(),
@@ -185,6 +204,8 @@ export default function UnlockedAppEffects() {
 
     return () => {
       disposed = true;
+      unregister();
+      stopBackground();
       window.clearInterval(cleanupTimer);
       window.clearInterval(syncPollTimer);
       if (messageSyncTimer !== null) {
@@ -196,7 +217,7 @@ export default function UnlockedAppEffects() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       resetMessageSyncState();
     };
-  }, [userId, deviceId, setOnline]);
+  }, [userId, deviceId, sessionId, setOnline]);
 
   return null;
 }

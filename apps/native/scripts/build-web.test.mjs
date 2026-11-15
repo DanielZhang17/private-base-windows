@@ -186,6 +186,18 @@ describe("native workspace wiring", () => {
     expect(capability.permissions).toEqual(["dialog:allow-save", "fs:allow-write-file"]);
   });
 
+  it("limits the Windows passkey handoff to the local main window", () => {
+    const capability = JSON.parse(read("../src-tauri/capabilities/windows-passkey.json"));
+    expect(capability.windows).toEqual(["main"]);
+    expect(capability.platforms).toEqual(["windows"]);
+    expect(capability.remote).toBeUndefined();
+    expect(capability.local).not.toBe(false);
+    expect(capability.permissions).toEqual(["allow-passkey-handoff-start"]);
+    // No deep-link getters/registration or event-listener grants to the renderer.
+    const permission = read("../src-tauri/permissions/passkey-handoff.toml");
+    expect(permission).toContain('commands.allow = ["passkey_handoff_start"]');
+  });
+
   it("allows only the exact avatar image sources in the CSP", () => {
     const config = JSON.parse(read("../src-tauri/tauri.conf.json"));
     expect(config.app.security.csp["img-src"]).toBe(

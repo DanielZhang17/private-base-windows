@@ -74,6 +74,7 @@ export async function createPasskeyCredential(
     transports?: string[];
   };
   authenticatorAttachment?: string;
+  clientExtensionResults?: { credProps?: { rk?: boolean } };
 }> {
   requirePasskeys();
   const publicKey: PublicKeyCredentialCreationOptions = {
@@ -89,8 +90,10 @@ export async function createPasskeyCredential(
     attestation: serverOptions.attestation as AttestationConveyancePreference,
     authenticatorSelection: {
       residentKey: serverOptions.authenticatorSelection.residentKey as ResidentKeyRequirement,
+      requireResidentKey: serverOptions.authenticatorSelection.requireResidentKey,
       userVerification: serverOptions.authenticatorSelection.userVerification as UserVerificationRequirement,
     },
+    extensions: serverOptions.extensions,
     excludeCredentials: serverOptions.excludeCredentials.map((c) => ({
       id: toBuffer(base64urlToBytes(c.id)),
       type: c.type,
@@ -113,6 +116,7 @@ export async function createPasskeyCredential(
       transports: attestationResponse.getTransports?.() ?? [],
     },
     authenticatorAttachment: (credential as any).authenticatorAttachment ?? undefined,
+    clientExtensionResults: credential.getClientExtensionResults?.(),
   };
 }
 

@@ -15,6 +15,7 @@ import {
 } from "@e2ee-chat/shared";
 import { toBase64Url } from "@e2ee-chat/crypto";
 import { api } from "../../services/api.js";
+import { cleanupCallBestEffort } from "../../services/call-cleanup.js";
 import { createChatWebSocket } from "../../services/ws.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { useCallStore } from "../../stores/callStore.js";
@@ -91,6 +92,7 @@ export function useConversation() {
   const previousLastMessageIdRef = useRef<string | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [newMessagesBelowCount, setNewMessagesBelowCount] = useState(0);
+  const startingCallTokenRef = useRef<symbol | null>(null);
   const [startingCallType, setStartingCallType] = useState<"audio" | "video" | null>(null);
   const [callError, setCallError] = useState<LocalizedMessage | null>(null);
   const [callUnsupported, setCallUnsupported] = useState(false);
@@ -403,20 +405,55 @@ export function useConversation() {
       return;
     }
 
+    const token = useCallStore.getState().beginCallStart();
+    if (!token) return;
+    startingCallTokenRef.current = token;
     setStartingCallType(callType);
     setCallError(null);
     setCallUnsupported(false);
 
-    let callId: string | null = null;
+    const startingSession = useAuthStore.getState();
+    let cancelled = false;
+    let createdCallId: string | null = null;
+    let promoted = false;
+    let cleanupStarted = false;
+    let pendingKeyWrite: Promise<void> | null = null;
+    const isCurrentStart = () => {
+      const currentSession = useAuthStore.getState();
+      return !cancelled && useCallStore.getState().pendingCallStart?.token === token &&
+        currentSession.user?.id === startingSession.user?.id && currentSession.sessionId === startingSession.sessionId &&
+        currentSession.device?.id === startingSession.device?.id;
+    };
+    const cleanupCreatedCall = () => {
+      if (!createdCallId || promoted || cleanupStarted) return;
+      cleanupStarted = true;
+      const id = createdCallId;
+      void cleanupCallBestEffort(id, startingSession);
+      // A write already in flight may commit after the first deletion.
+      if (pendingKeyWrite) void pendingKeyWrite.then(() => deletePendingCall(id)).catch(() => undefined);
+    };
+    const cancelIfInvalid = () => {
+      if (!isCurrentStart()) {
+        cancelled = true;
+        cleanupCreatedCall();
+        stopWatching();
+      }
+    };
+    const unsubscribeCall = useCallStore.subscribe(cancelIfInvalid);
+    const unsubscribeAuth = useAuthStore.subscribe(cancelIfInvalid);
+    const stopWatching = () => { unsubscribeCall(); unsubscribeAuth(); };
     try {
+      if (!isCurrentStart()) return;
       const response = await api.post<InitiateCallResponse>("/api/calls/initiate", {
         conversationId,
         type: callType,
       });
-      callId = response.call.id;
+      if (response.created) createdCallId = response.call.id;
+      if (!isCurrentStart() || !useCallStore.getState().bindCallStart(token, response.call.id)) return;
 
       if (!response.created) {
         const existing = await getPendingCall(response.call.id);
+        if (!isCurrentStart()) return;
         if (!existing) {
           throw new LocalizedError("aCallIsAlreadyInProgressForThis");
         }
@@ -425,7 +462,7 @@ export function useConversation() {
         const expiresAt = createdAt + CALL_RING_TIMEOUT_MS;
         const callKey = toBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 
-        await savePendingCall({
+        pendingKeyWrite = savePendingCall({
           id: response.call.id,
           conversationId,
           initiatorId: user.id,
@@ -435,7 +472,10 @@ export function useConversation() {
           expiresAt: Math.max(expiresAt, createdAt + CALL_KEY_RECOVERY_TTL_MS),
           direction: "outgoing",
         });
+        await pendingKeyWrite;
+        pendingKeyWrite = null;
 
+        if (!isCurrentStart()) return;
         const payload = JSON.stringify({
           kind: "call_offer",
           callId: response.call.id,
@@ -447,32 +487,32 @@ export function useConversation() {
           initiatorId: user.id,
         });
 
-        try {
-          await sendDirectPayloadFanout(conversation, crypto.randomUUID(), payload, "system");
-        } catch (error) {
-          await deletePendingCall(response.call.id).catch(() => undefined);
-          await api.post(`/api/calls/${response.call.id}/end`);
-          throw error;
-        }
+        await sendDirectPayloadFanout(conversation, crypto.randomUUID(), payload, "system");
       }
 
-      setOutgoingCall({
+      if (!isCurrentStart()) return;
+      stopWatching();
+      promoted = setOutgoingCall({
         callId: response.call.id,
         conversationId,
         callType,
         initiatorId: user.id,
         conversationName,
-      });
-      navigate(`/call/${response.call.id}`);
+      }, token);
+      if (promoted) navigate(`/call/${response.call.id}`);
     } catch (err: any) {
+      if (!isCurrentStart()) return;
       console.error("Failed to start call:", err);
-      if (callId) {
-        await deletePendingCall(callId).catch(() => undefined);
-      }
       setCallError(toErrorMessage(err, "failedToStartCall"));
       setCallUnsupported(err instanceof E2EECallUnsupportedError);
     } finally {
-      setStartingCallType(null);
+      stopWatching();
+      cleanupCreatedCall();
+      useCallStore.getState().finishCallStart(token);
+      if (startingCallTokenRef.current === token) {
+        startingCallTokenRef.current = null;
+        setStartingCallType(null);
+      }
     }
   };
 

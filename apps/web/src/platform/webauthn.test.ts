@@ -43,3 +43,24 @@ describe("passkey capability guard", () => {
     expect(get).toHaveBeenCalledTimes(1);
   });
 });
+
+it.each([true, false, undefined])("passes native discoverability requirements and serializes credProps rk=%s", async (rk) => {
+  const bytes = new Uint8Array([1, 2, 3]).buffer;
+  const extensions = rk === undefined ? {} : { credProps: { rk } };
+  create.mockResolvedValue({ id: "key", rawId: bytes,
+    response: { clientDataJSON: bytes, attestationObject: bytes },
+    getClientExtensionResults: () => extensions,
+  });
+  const credential = await createPasskeyCredential({
+    challenge: "AQID", rp: { name: "Private Base", id: "chat.718788.xyz" },
+    user: { id: "AQID", name: "sam", displayName: "Sam" },
+    pubKeyCredParams: [{ type: "public-key", alg: -7 }], timeout: 60000, attestation: "none",
+    authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "preferred" },
+    extensions: { credProps: true }, excludeCredentials: [],
+  });
+  expect(create).toHaveBeenCalledWith({ publicKey: expect.objectContaining({
+    authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "preferred" },
+    extensions: { credProps: true },
+  }) });
+  expect(JSON.parse(JSON.stringify(credential)).clientExtensionResults).toEqual(extensions);
+});

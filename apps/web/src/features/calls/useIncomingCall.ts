@@ -1,32 +1,26 @@
-import { renderMessage, type LocalizedMessage } from "../../i18n/messages.js";
-import { toErrorMessage } from "../shared/errors.js";
+import { useContext, useEffect, useState } from "react";
 import { useLocale } from "../../i18n/index.js";
-import { useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { api } from "../../services/api.js";
 import { useCallStore } from "../../stores/callStore.js";
 import { capabilities } from "../../platform/capabilities.js";
+import { IncomingCallContext } from "./IncomingCallContext.js";
 
+/** Modal view state over the persistent invitation owner. */
 export function useIncomingCall() {
   useLocale();
-  const navigate = useNavigate();
+  const owner = useContext(IncomingCallContext);
+  if (!owner) throw new Error("useIncomingCall must be used inside CallProvider");
   const call = useCallStore();
-  const busy = useRef(false);
-  const [loadingAction, setLoadingAction] = useState<"accept" | "decline" | null>(null);
-  const [error, setError] = useState<LocalizedMessage | null>(null);
-  const callUnsupported = !capabilities.e2eeCalls;
-  const respond = async (action: "accept" | "decline") => {
-    if (busy.current || !call.activeCallId || (action === "accept" && (!call.keyReady || callUnsupported))) return;
-    busy.current = true;
-    setLoadingAction(action);
-    setError(null);
-    try {
-      await api.post(`/api/calls/${call.activeCallId}/${action}`);
-      call.updateCallStatus(call.activeCallId, action === "accept" ? "active" : "declined");
-      if (action === "accept") navigate(`/call/${call.activeCallId}`);
-    } catch (err) { setError(toErrorMessage(err, "couldNotRespondToCall")); }
-    finally { busy.current = false; setLoadingAction(null); }
+  const [hidden, setHidden] = useState(document.hidden);
+  useEffect(() => {
+    const changed = () => setHidden(document.hidden);
+    document.addEventListener("visibilitychange", changed);
+    return () => document.removeEventListener("visibilitychange", changed);
+  }, []);
+  return {
+    callerName: call.callerName, callerAvatarUrl: call.callerAvatarUrl, callType: call.callType,
+    keyReady: call.keyReady,
+    visible: !(capabilities.nativeCallNotifications && hidden) && !!call.activeCallId && !!call.callType && call.direction === "incoming" && call.callStatus === "ringing",
+    callUnsupported: !capabilities.e2eeCalls,
+    ...owner,
   };
-  return { callerName: call.callerName, callerAvatarUrl: call.callerAvatarUrl, callType: call.callType,
-    keyReady: call.keyReady, visible: !!call.activeCallId && !!call.callType && call.direction === "incoming" && call.callStatus === "ringing", loadingAction, error: error ? renderMessage(error) : error, callUnsupported, respond };
 }

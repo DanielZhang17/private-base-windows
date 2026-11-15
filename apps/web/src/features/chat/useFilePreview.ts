@@ -1,12 +1,11 @@
 import { renderMessage, LocalizedError, type LocalizedMessage } from "../../i18n/messages.js";
 import { toErrorMessage } from "../shared/errors.js";
 import { useLocale, getLocale } from "../../i18n/index.js";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { decryptFile } from "@e2ee-chat/crypto";
 import type { FileEncryptionKey } from "@e2ee-chat/crypto";
 import { ApiError, api, resolveApiUrl } from "../../services/api.js";
 import { useAuthStore } from "../../stores/authStore.js";
-import { getCachedFile, setCachedFile } from "../../db/index.js";
 import { fileUrlResolver } from "../../lib/file-url-resolver.js";
 import { useFileSave } from "../../features/chat/useFileSave.js";
 
@@ -44,6 +43,8 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
   const { saveUnsupported, handleSave } = useFileSave();
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const loadedBlob = useRef<Blob | null>(null);
+  const urlRef = useRef<string | null>(null);
+  const requestRef = useRef<AbortController | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<LocalizedMessage | null>(null);
   const [expired, setExpired] = useState(false);
@@ -52,40 +53,22 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
   const isVideo = mimeType.startsWith("video/");
   const isInline = isImage || isVideo;
 
-  useEffect(() => {
-    if (!isInline) return;
-    void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fileId]);
-
-  useEffect(() => {
-    return () => {
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [objectUrl]);
-
-  async function load(): Promise<Blob | null> {
+  const load = useCallback(async (): Promise<Blob | null> => {
+    requestRef.current?.abort();
+    const request = new AbortController();
+    requestRef.current = request;
+    const isCurrent = () => requestRef.current === request && !request.signal.aborted;
     setLoading(true);
     setError(null);
     setExpired(false);
     try {
-      // 1. Check IndexedDB cache first
-      const cached = await getCachedFile(fileId);
-      if (cached && cached.expiresAt > Date.now()) {
-        loadedBlob.current = cached.blob;
-        const nextUrl = URL.createObjectURL(cached.blob);
-        setObjectUrl((prev) => {
-          if (prev) URL.revokeObjectURL(prev);
-          return nextUrl;
-        });
-        return cached.blob;
-      }
-
-      // 2. Cache miss — fetch, decrypt, cache
+      // Only encrypted bytes are fetched; decrypted bytes remain in memory.
       let resolvedUrl: { downloadUrl: string | null; expiresAt: number | null } | null = null;
       for (let attempt = 0; attempt <= ATTACHMENT_RETRY_DELAYS_MS.length; attempt += 1) {
+        if (!isCurrent()) return null;
         try {
           resolvedUrl = await fileUrlResolver.resolve(fileId);
+          if (!isCurrent()) return null;
           if (resolvedUrl.downloadUrl) break;
           
           if (attempt === ATTACHMENT_RETRY_DELAYS_MS.length) {
@@ -96,8 +79,9 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
             await sleep(ATTACHMENT_RETRY_DELAYS_MS[attempt]);
           }
         } catch (err: any) {
+          if (!isCurrent()) return null;
           if (err instanceof ApiError && err.code === "FILE_EXPIRED") {
-            setExpired(true);
+            if (isCurrent()) setExpired(true);
             return null;
           }
           if (attempt === ATTACHMENT_RETRY_DELAYS_MS.length) throw err;
@@ -105,6 +89,7 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
         }
       }
 
+      if (!isCurrent()) return null;
       if (!resolvedUrl?.downloadUrl) {
         throw new LocalizedError("fileDownloadUrlWasUnavailable");
       }
@@ -115,6 +100,7 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
       }
 
       const response = await fetch(resolveApiUrl(resolvedUrl.downloadUrl), {
+        signal: request.signal,
         headers: {
           Authorization: `Bearer ${token}`,
         },
@@ -126,26 +112,19 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
       const encryptedBytes = new Uint8Array(await response.arrayBuffer());
       const key: FileEncryptionKey = { key: fileKey, iv: fileIv };
       const decrypted = await decryptFile(encryptedBytes, key);
+      if (!isCurrent()) return null;
       const blob = new Blob([toArrayBufferView(decrypted)], { type: mimeType });
       loadedBlob.current = blob;
 
-      // 3. Store in IndexedDB
-      await setCachedFile({
-        id: fileId,
-        blob,
-        mimeType,
-        fileName,
-        cachedAt: Date.now(),
-        expiresAt: resolvedUrl.expiresAt ?? Date.now(),
-      });
-
-      const nextUrl = URL.createObjectURL(blob);
-      setObjectUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return nextUrl;
-      });
+      if (isInline) {
+        const nextUrl = URL.createObjectURL(blob);
+        if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+        urlRef.current = nextUrl;
+        setObjectUrl(nextUrl);
+      }
       return blob;
     } catch (err: any) {
+      if (!isCurrent()) return null;
       if (err instanceof ApiError && err.code === "FILE_EXPIRED") {
         setExpired(true);
         return null;
@@ -153,9 +132,22 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
       setError(toErrorMessage(err, "failedToLoadFile"));
       return null;
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
-  }
+  }, [fileId, fileKey, fileIv, mimeType, isInline]);
+
+  useEffect(() => {
+    setObjectUrl(null);
+    loadedBlob.current = null;
+    if (isInline) void load();
+    return () => {
+      requestRef.current?.abort();
+      requestRef.current = null;
+      loadedBlob.current = null;
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+      urlRef.current = null;
+    };
+  }, [load, isInline]);
 
   async function handleDownload() {
     if (saveUnsupported) return;

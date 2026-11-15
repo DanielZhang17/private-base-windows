@@ -1,8 +1,22 @@
+import { supportsPasskeyHandoff } from "./passkeyHandoff.js";
 import { isNative, platformName } from "./environment.js";
 import { supportsE2EECalling } from "./calls.js";
 
 // Getters keep feature detection current, including after browser API initialization.
 export const capabilities = {
+  get captureProtection(): "full" | "recording" | "best-effort" | undefined {
+    if (!isNative()) return undefined;
+    const value = window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.captureProtection;
+    return value === "full" || value === "recording" || value === "best-effort" ? value : undefined;
+  },
+  get backgroundConnection(): boolean {
+    return isNative() && platformName() === "android" &&
+      window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.backgroundConnection === true;
+  },
+  get nativeCallNotifications(): boolean {
+    return isNative() && platformName() === "android" &&
+      window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.nativeCallNotifications === true;
+  },
   get saveFile(): boolean {
     const platform = platformName();
     return platform !== "ios" && platform !== "android";
@@ -12,6 +26,9 @@ export const capabilities = {
       typeof window.PublicKeyCredential !== "undefined" &&
       typeof navigator.credentials?.create === "function" &&
       typeof navigator.credentials?.get === "function";
+  },
+  get nativePasskeys(): boolean {
+    return supportsPasskeyHandoff();
   },
   get systemNotifications(): boolean {
     return isNative() || typeof Notification !== "undefined";

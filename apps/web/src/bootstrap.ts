@@ -1,7 +1,9 @@
 import { i18n, initializeLocale } from "./i18n/index.js";
+import { configureNativeViewport } from "./platform/viewport.js";
 
 /** Locale failures must never prevent the app from mounting. English is bundled. */
 export async function bootstrap(render: () => void): Promise<void> {
+  configureNativeViewport();
   try {
     await initializeLocale();
   } catch {
