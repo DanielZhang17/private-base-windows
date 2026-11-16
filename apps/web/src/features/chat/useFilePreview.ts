@@ -49,9 +49,10 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
   const [error, setError] = useState<LocalizedMessage | null>(null);
   const [expired, setExpired] = useState(false);
 
-  const isImage = mimeType.startsWith("image/");
-  const isVideo = mimeType.startsWith("video/");
-  const isInline = isImage || isVideo;
+  const type = mimeType.trim().toLowerCase();
+  const isImage = type.startsWith("image/");
+  const isVideo = type.startsWith("video/");
+  const isInline = isImage || (isVideo && document.createElement("video").canPlayType(type) !== "");
 
   const load = useCallback(async (): Promise<Blob | null> => {
     requestRef.current?.abort();

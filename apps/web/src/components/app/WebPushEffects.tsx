@@ -1,0 +1,93 @@
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { useLocale, t } from "../../i18n/index.js";
+import { useAuthStore } from "../../stores/authStore.js";
+import { registerUnlockedSessionCleanup } from "../../platform/session-cleanup.js";
+import { disableWebPush, storePushLocale } from "../../services/web-push.js";
+import { api } from "../../services/api.js";
+import { pushSessionIdentity } from "../../services/push-session.js";
+import { isSameSession } from "../../services/session-identity.js";
+import { keysLoaded } from "../../lib/key-manager.js";
+
+function validDestination(value: unknown): value is string {
+  return typeof value === "string" && (value === "/?push=message" ||
+    /^\/(chat|call)\/[A-Za-z0-9_-]{1,128}$/.test(value) ||
+    /^\/call\/[A-Za-z0-9_-]{1,128}\?push=call$/.test(value));
+}
+
+export default function WebPushEffects({ unlocked }: { unlocked: boolean }) {
+  const { locale } = useLocale();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const sessionId = useAuthStore((state) => state.sessionId);
+  const userId = useAuthStore((state) => state.user?.id);
+  const deviceId = useAuthStore((state) => state.device?.id);
+  const accessToken = useAuthStore((state) => state.accessToken);
+  const live = useRef(unlocked);
+  live.current = unlocked;
+  const requestEpoch = useRef(0);
+  const queryHandled = useRef(false);
+  useLayoutEffect(() => { requestEpoch.current++; }, [location]);
+  useEffect(() => {
+    if (!unlocked) requestEpoch.current++;
+  }, [unlocked]);
+  useEffect(() => () => { requestEpoch.current++; }, []);
+
+  const resolveMessage = useCallback(() => {
+    const auth = useAuthStore.getState();
+    if (!live.current || !keysLoaded() || !auth.accessToken) return;
+    const epoch = ++requestEpoch.current;
+    const current = () => {
+      const next = useAuthStore.getState();
+      return requestEpoch.current === epoch && live.current && keysLoaded() && isSameSession(auth, next) &&
+        next.user?.id === auth.user?.id && next.device?.id === auth.device?.id;
+    };
+    void api.get<{ conversationId: string | null }>("/api/push/target").then(({ conversationId }) => {
+      if (current()) navigate(conversationId ? `/chat/${encodeURIComponent(conversationId)}` : "/");
+    }).catch(() => { if (current()) navigate("/"); });
+  }, [navigate]);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const worker = navigator.serviceWorker;
+    const open = (event: MessageEvent) => {
+      if (!live.current || !keysLoaded() || !useAuthStore.getState().accessToken ||
+          event.data?.type !== "push-open" || !validDestination(event.data.destination)) return;
+      requestEpoch.current++;
+      if (event.data.destination === "/?push=message") resolveMessage();
+      else navigate(event.data.destination);
+    };
+    worker.addEventListener("message", open);
+    return () => worker.removeEventListener("message", open);
+  }, [navigate, resolveMessage]);
+  useEffect(() => {
+    void storePushLocale(locale, t("webPush.newMessage"), t("webPush.incomingCall")).catch(() => undefined);
+  }, [locale]);
+  useEffect(() => {
+    // Explicit lock/sign-out clears subscriptions. Closing the tab keeps delivery enabled.
+    if (!unlocked) return;
+    const session = userId && deviceId ? { userId, deviceId, loginIdentity: pushSessionIdentity(useAuthStore.getState()) } : null;
+    return registerUnlockedSessionCleanup(() => {
+      requestEpoch.current++;
+      void disableWebPush(accessToken, { accountTeardown: true, session }).catch(() => undefined);
+    });
+  }, [unlocked, userId, deviceId, accessToken, sessionId]);
+  useEffect(() => useAuthStore.subscribe((next, previous) => {
+    if (previous.accessToken && (next.sessionId !== previous.sessionId || next.user?.id !== previous.user?.id || next.device?.id !== previous.device?.id)) {
+      const session = previous.user && previous.device ? { userId: previous.user.id, deviceId: previous.device.id, loginIdentity: pushSessionIdentity(previous) } : null;
+      void disableWebPush(previous.accessToken, { accountTeardown: true, session }).catch(() => undefined);
+    }
+  }), []);
+  useEffect(() => {
+    const search = new URLSearchParams(location.search);
+    if (search.get("push") !== "message") return;
+    // Consume this legacy URL hint once, even when the base router forwards it through unlock.
+    search.delete("push");
+    const resolve = !queryHandled.current && unlocked && keysLoaded() && !!useAuthStore.getState().accessToken;
+    queryHandled.current = true;
+    // Successful lookup navigation consumes the hint; do not cancel it with an interim route change.
+    if (resolve) resolveMessage();
+    else navigate({ pathname: location.pathname, search: search.size ? `?${search}` : "", hash: location.hash }, { replace: true });
+  }, [location.pathname, location.search, location.hash, unlocked, sessionId, userId, deviceId, navigate, resolveMessage]);
+  return null;
+}

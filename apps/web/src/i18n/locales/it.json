@@ -436,6 +436,7 @@
   "callSetupFailed": "Configurazione della chiamata non riuscita",
   "couldNotRespondToCall": "Impossibile rispondere alla chiamata",
   "fileEncryptionWasInterruptedAttachTheFileAgain": "La crittografia del file è stata interrotta. Allega nuovamente il file.",
+  "fileCouldNotBeUploaded": "Non è stato possibile caricare questo file",
   "today": "Oggi",
   "yesterday": "Ieri",
   "photoMessagePreview": "Foto",
@@ -695,5 +696,11 @@
   "privacySaved": "Impostazioni di privacy salvate",
   "privacySaveFailed": "Impossibile salvare le impostazioni di privacy. Riprova.",
   "privacyLoadFailed": "Impossibile caricare le impostazioni di privacy. Riprova.",
-  "personCannotBeAdded": "Questa persona non può essere aggiunta"
+  "personCannotBeAdded": "Questa persona non può essere aggiunta",
+  "webPush.allowClosed": "Consenti notifiche quando l’app è chiusa",
+  "webPush.privacy": "Le notifiche non mostrano nomi o contenuti dei messaggi. Si disattivano bloccando l’app o uscendo dall’account.",
+  "webPush.iosHint": "Su iPhone o iPad, aggiungi Private Base alla schermata Home, poi aprila da lì per attivare le notifiche.",
+  "webPush.error": "Impossibile modificare le notifiche. Controlla l’autorizzazione del browser e la connessione, poi riprova.",
+  "webPush.newMessage": "Nuovo messaggio",
+  "webPush.incomingCall": "Chiamata in arrivo"
 }

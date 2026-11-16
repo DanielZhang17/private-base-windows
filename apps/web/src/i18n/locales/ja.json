@@ -436,6 +436,7 @@
   "callSetupFailed": "通話セットアップに失敗しました",
   "couldNotRespondToCall": "着信への応答に失敗しました",
   "fileEncryptionWasInterruptedAttachTheFileAgain": "ファイル暗号化が中断されました。ファイルを再度添付してください。",
+  "fileCouldNotBeUploaded": "このファイルをアップロードできませんでした",
   "today": "今日",
   "yesterday": "昨日",
   "photoMessagePreview": "写真",
@@ -695,5 +696,11 @@
   "privacySaved": "プライバシー設定を保存しました",
   "privacySaveFailed": "プライバシー設定を保存できませんでした。もう一度お試しください。",
   "privacyLoadFailed": "プライバシー設定を読み込めませんでした。もう一度お試しください。",
-  "personCannotBeAdded": "この人を追加できません"
+  "personCannotBeAdded": "この人を追加できません",
+  "webPush.allowClosed": "アプリを閉じているときも通知を許可",
+  "webPush.privacy": "通知には名前やメッセージ内容を表示しません。ロックまたはログアウトすると、この通知はオフになります。",
+  "webPush.iosHint": "iPhone または iPad では、Private Base をホーム画面に追加し、そこから開いて通知を有効にしてください。",
+  "webPush.error": "通知を変更できませんでした。ブラウザーの権限と接続を確認して再試行してください。",
+  "webPush.newMessage": "新しいメッセージ",
+  "webPush.incomingCall": "着信"
 }

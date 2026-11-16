@@ -436,6 +436,7 @@
   "callSetupFailed": "통화 설정 실패",
   "couldNotRespondToCall": "전화에 응답할 수 없습니다.",
   "fileEncryptionWasInterruptedAttachTheFileAgain": "파일 암호화가 중단되었습니다. 파일을 다시 첨부하세요.",
+  "fileCouldNotBeUploaded": "이 파일을 업로드할 수 없습니다",
   "today": "오늘",
   "yesterday": "어제",
   "photoMessagePreview": "사진",
@@ -695,5 +696,11 @@
   "privacySaved": "개인정보 보호 설정이 저장되었습니다",
   "privacySaveFailed": "개인정보 보호 설정을 저장하지 못했습니다. 다시 시도해 주세요.",
   "privacyLoadFailed": "개인정보 보호 설정을 불러오지 못했습니다. 다시 시도해 주세요.",
-  "personCannotBeAdded": "이 사람을 추가할 수 없습니다"
+  "personCannotBeAdded": "이 사람을 추가할 수 없습니다",
+  "webPush.allowClosed": "앱이 닫혀 있을 때 알림 허용",
+  "webPush.privacy": "알림에 이름이나 메시지 내용이 표시되지 않습니다. 잠그거나 로그아웃하면 이 알림이 꺼집니다.",
+  "webPush.iosHint": "iPhone 또는 iPad에서는 Private Base를 홈 화면에 추가한 후 홈 화면에서 열어 알림을 활성화하세요.",
+  "webPush.error": "알림을 변경할 수 없습니다. 브라우저 권한과 연결을 확인하고 다시 시도하세요.",
+  "webPush.newMessage": "새 메시지",
+  "webPush.incomingCall": "수신 전화"
 }

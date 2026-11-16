@@ -436,6 +436,7 @@
   "callSetupFailed": "无法建立通话",
   "couldNotRespondToCall": "无法响应来电",
   "fileEncryptionWasInterruptedAttachTheFileAgain": "文件加密已中断。请重新添加此文件。",
+  "fileCouldNotBeUploaded": "无法上传此文件",
   "today": "今天",
   "yesterday": "昨天",
   "photoMessagePreview": "照片",
@@ -695,5 +696,11 @@
   "privacySaved": "隐私设置已保存",
   "privacySaveFailed": "无法保存隐私设置。请重试。",
   "privacyLoadFailed": "无法加载隐私设置。请重试。",
-  "personCannotBeAdded": "无法添加此人"
+  "personCannotBeAdded": "无法添加此人",
+  "webPush.allowClosed": "允许在应用关闭时接收通知",
+  "webPush.privacy": "通知不显示姓名或消息内容。锁定或退出登录后，此类通知将关闭。",
+  "webPush.iosHint": "在 iPhone 或 iPad 上，请将 Private Base 添加到主屏幕，然后从主屏幕打开以启用通知。",
+  "webPush.error": "无法更改通知。请检查浏览器权限和网络连接，然后重试。",
+  "webPush.newMessage": "新消息",
+  "webPush.incomingCall": "来电"
 }

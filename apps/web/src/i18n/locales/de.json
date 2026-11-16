@@ -436,6 +436,7 @@
   "callSetupFailed": "Anrufaufbau fehlgeschlagen",
   "couldNotRespondToCall": "Konnte nicht auf den Anruf antworten",
   "fileEncryptionWasInterruptedAttachTheFileAgain": "Die Dateiverschlüsselung wurde unterbrochen. Hängen Sie die Datei erneut an.",
+  "fileCouldNotBeUploaded": "Diese Datei konnte nicht hochgeladen werden",
   "today": "Heute",
   "yesterday": "Gestern",
   "photoMessagePreview": "Foto",
@@ -695,5 +696,11 @@
   "privacySaved": "Datenschutzeinstellungen gespeichert",
   "privacySaveFailed": "Datenschutzeinstellungen konnten nicht gespeichert werden. Versuche es erneut.",
   "privacyLoadFailed": "Datenschutzeinstellungen konnten nicht geladen werden. Versuche es erneut.",
-  "personCannotBeAdded": "Diese Person kann nicht hinzugefügt werden"
+  "personCannotBeAdded": "Diese Person kann nicht hinzugefügt werden",
+  "webPush.allowClosed": "Benachrichtigungen bei geschlossener App erlauben",
+  "webPush.privacy": "Benachrichtigungen zeigen keine Namen oder Nachrichteninhalte. Beim Sperren oder Abmelden werden diese Benachrichtigungen deaktiviert.",
+  "webPush.iosHint": "Füge Private Base auf dem iPhone oder iPad zum Home-Bildschirm hinzu und öffne es dort, um Benachrichtigungen zu aktivieren.",
+  "webPush.error": "Benachrichtigungen konnten nicht geändert werden. Prüfe die Browserberechtigung und deine Verbindung und versuche es erneut.",
+  "webPush.newMessage": "Neue Nachricht",
+  "webPush.incomingCall": "Eingehender Anruf"
 }

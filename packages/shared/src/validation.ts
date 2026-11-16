@@ -8,13 +8,26 @@ import {
 
 export const ALLOWED_MIME_TYPES = [
   "image/jpeg", "image/png", "image/gif", "image/webp", "image/heic",
+  "image/avif", "image/heif", "image/heic-sequence", "image/heif-sequence",
   "audio/mpeg", "audio/ogg", "audio/webm", "audio/mp4",
-  "video/mp4", "video/webm", "video/ogg",
+  "video/mp4", "video/webm", "video/ogg", "video/quicktime",
   "application/pdf",
   "application/octet-stream",
 ] as const;
 
 const base64url = z.string().regex(/^[A-Za-z0-9_-]+$/);
+export const pushSubscriptionSchema = z.object({
+  endpoint: z.string().url().max(2048).refine((value) => value.startsWith("https://"), "HTTPS is required"),
+  keys: z.object({
+    p256dh: z.string().regex(/^B[A-Za-z0-9_-]{86}$/),
+    auth: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
+  }).strict(),
+  expirationTime: z.number().nullable().optional(),
+}).strict();
+export const deletePushSubscriptionSchema = z.union([
+  z.object({ endpoint: z.string().url().max(2048) }).strict(),
+  z.object({ all: z.literal(true) }).strict(),
+]);
 const recoveryKey = z.string().trim().min(16).max(128);
 const ttlSeconds = z.number().int().min(MIN_TIMED_MESSAGE_TTL_SECONDS).max(MAX_TIMED_MESSAGE_TTL_SECONDS);
 const customEmojiShortcode = z.string().trim().regex(/^[a-z0-9_]{2,32}$/);

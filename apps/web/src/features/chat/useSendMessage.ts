@@ -11,6 +11,7 @@ import { useAuthStore } from "../../stores/authStore.js";
 import { useChatStore } from "../../stores/chatStore.js";
 import { retryOutgoing, refreshOutgoingQueue, setFilePreparing } from "./outgoingQueue.js";
 import { useOutgoingQueue } from "./useOutgoingQueue.js";
+import { uploadMimeType } from "./uploadMimeType.js";
 
 export function useSendMessage(conversation: ConversationWithMembers | undefined) {
   useLocale();
@@ -27,7 +28,7 @@ export function useSendMessage(conversation: ConversationWithMembers | undefined
     };
     const row: LocalOutgoing = {
       id: message.id, queuedAt: timestamp, userId: user.id, deviceId: device.id, conversationId: conversation.id, conversationType: conversation.type,
-      ttlSeconds: options.ttlSeconds, steps: [], attempts: 0, status: "sending", retryable: !file,
+      ttlSeconds: options.ttlSeconds, steps: [], sendDispatched: false, attempts: 0, status: "sending", retryable: !file,
       nextAttemptAt: null, error: file ? INTERRUPTED_FILE_ERROR : null,
     };
     useChatStore.getState().addMessage(conversation.id, message);
@@ -37,10 +38,11 @@ export function useSendMessage(conversation: ConversationWithMembers | undefined
       await saveQueuedMessage(message, row);
       if (file && fileKey) {
         const encrypted = await encryptFile(new Uint8Array(await file.arrayBuffer()), fileKey);
-        row.upload = { bytes: new Uint8Array(encrypted), mimeType: file.type || "application/octet-stream" };
+        row.upload = { bytes: new Uint8Array(encrypted), mimeType: uploadMimeType(file) };
         row.retryable = true;
         row.error = null;
         if (!await updateOutgoingIfPresent(row, message)) return;
+        setFilePreparing(message.id, false);
       }
       await retryOutgoing(message.id);
     } catch (error) {

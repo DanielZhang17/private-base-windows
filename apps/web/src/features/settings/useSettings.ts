@@ -31,6 +31,7 @@ import { saveFile } from "../../platform/files.js";
 import { resolveAvatarImageUrl } from "./avatar.js";
 import { SETTINGS_SECTIONS, type SettingsSection } from "./sections.js";
 import { useBackgroundSettings } from "./useBackgroundSettings.js";
+import { useWebPushSettings } from "./useWebPushSettings.js";
 import { usePrivacySettings } from "./usePrivacySettings.js";
 import { useSettingsBack } from "./useSettingsBack.js";
 
@@ -57,9 +58,10 @@ export function useSettings() {
   const closeSection = useSettingsBack();
   const sectionParam = searchParams.get("section");
   const background = useBackgroundSettings();
+  const webPush = useWebPushSettings();
   const privacy = usePrivacySettings(sectionParam === "privacy");
   const selectedSection = SETTINGS_SECTIONS.some(([key]) => key === sectionParam) &&
-    (sectionParam !== "notifications" || background.supported) ? sectionParam as SettingsSection : null;
+    (sectionParam !== "notifications" || background.supported || webPush.visible) ? sectionParam as SettingsSection : null;
   const [confirmation, setConfirmation] = useState<{ kind: "passkey" | "emoji"; id: string; name: string } | null>(null);
   const [showDeleteAccount, setShowDeleteAccount] = useState(false);
   const [showForgetKeys, setShowForgetKeys] = useState(false);
@@ -493,6 +495,7 @@ export function useSettings() {
     copyRecoveryKey,
     capabilities,
     background,
+    webPush,
     passkeysSupported: capabilities.passkeys || capabilities.nativePasskeys,
     navigate,
     user,

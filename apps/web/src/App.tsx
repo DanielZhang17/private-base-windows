@@ -16,6 +16,7 @@ import SettingsLayout from "./components/layout/SettingsLayout.js";
 import UnlockedAppEffects from "./components/app/UnlockedAppEffects.js";
 import UiPreferencesEffects from "./components/app/UiPreferencesEffects.js";
 import SessionRepairEffects from "./components/app/SessionRepairEffects.js";
+import WebPushEffects from "./components/app/WebPushEffects.js";
 
 function FullScreenLoader() {
   return (
@@ -88,6 +89,7 @@ export default function App() {
   return (
     <ToastProvider>
       <SessionRepairEffects />
+      <WebPushEffects unlocked={phase === "unlocked"} />
       <UiPreferencesEffects />
       {phase === "unlocked" && <UnlockedAppEffects />}
 

@@ -6,6 +6,7 @@ import { createNotificationWebSocket } from "../../services/notifications.js";
 import { cleanupExpiredFileCache, cleanupExpiredPendingCalls, deletePendingCall, getPendingCall } from "../../db/index.js";
 import { pruneExpiredPlaintext, resetMessageSyncState, syncMessages, runUnlockSync } from "../../lib/message-sync.js";
 import { requestNotificationPermission } from "../../lib/browser-notifications.js";
+import { isNative } from "../../platform/environment.js";
 import { refreshConversationList } from "../../lib/conversation-cache.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { useCallStore } from "../../stores/callStore.js";
@@ -192,7 +193,7 @@ export default function UnlockedAppEffects() {
     window.addEventListener("offline", handleOffline);
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
-    void requestNotificationPermission().catch(() => undefined);
+    if (isNative()) void requestNotificationPermission().catch(() => undefined);
 
     void Promise.all([
       runUnlockSync(),

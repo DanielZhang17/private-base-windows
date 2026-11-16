@@ -436,6 +436,7 @@
   "callSetupFailed": "Échec de la configuration de l'appel",
   "couldNotRespondToCall": "Impossible de répondre à l'appel",
   "fileEncryptionWasInterruptedAttachTheFileAgain": "Le chiffrement des fichiers a été interrompu. Joignez à nouveau le fichier.",
+  "fileCouldNotBeUploaded": "Ce fichier n’a pas pu être envoyé",
   "today": "Aujourd'hui",
   "yesterday": "Hier",
   "photoMessagePreview": "Photo",
@@ -695,5 +696,11 @@
   "privacySaved": "Réglages de confidentialité enregistrés",
   "privacySaveFailed": "Impossible d’enregistrer les réglages de confidentialité. Réessayez.",
   "privacyLoadFailed": "Impossible de charger les réglages de confidentialité. Réessayez.",
-  "personCannotBeAdded": "Cette personne ne peut pas être ajoutée"
+  "personCannotBeAdded": "Cette personne ne peut pas être ajoutée",
+  "webPush.allowClosed": "Autoriser les notifications lorsque l’application est fermée",
+  "webPush.privacy": "Les notifications n’affichent ni noms ni contenu des messages. Elles sont désactivées au verrouillage ou à la déconnexion.",
+  "webPush.iosHint": "Sur iPhone ou iPad, ajoutez Private Base à l’écran d’accueil, puis ouvrez l’application depuis cet écran pour activer les notifications.",
+  "webPush.error": "Impossible de modifier les notifications. Vérifiez l’autorisation du navigateur et votre connexion, puis réessayez.",
+  "webPush.newMessage": "Nouveau message",
+  "webPush.incomingCall": "Appel entrant"
 }

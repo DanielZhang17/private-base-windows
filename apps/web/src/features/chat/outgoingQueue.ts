@@ -5,6 +5,7 @@ import type {
   SendMessageResponse,
 } from "@e2ee-chat/shared";
 import { api } from "../../services/api.js";
+import { uploadMimeType } from "./uploadMimeType.js";
 import {
   discardQueuedMessage,
   getAllOutgoing,
@@ -16,6 +17,7 @@ import {
   completeOutgoingIfPresent,
   type LocalOutgoing,
   type LocalMessage,
+  type OutgoingStep,
 } from "../../db/index.js";
 import { prepareDirectPayloadFanout } from "../../lib/direct-messages.js";
 import { encryptGroupText } from "../../lib/message-processor.js";
@@ -38,6 +40,20 @@ let consumers = 0;
 function compareRows(left: LocalOutgoing, right: LocalOutgoing) { return left.queuedAt - right.queuedAt || left.id.localeCompare(right.id); }
 function sameConversation(left: LocalOutgoing, right: LocalOutgoing) {
   return left.userId === right.userId && left.deviceId === right.deviceId && left.conversationId === right.conversationId;
+}
+function isMessageStep(step: OutgoingStep) {
+  return step.body.type !== "sender_key_distribution";
+}
+function stepMayHaveBeenDispatched(row: LocalOutgoing, step: OutgoingStep) {
+  // Legacy prepared envelopes lack per-step markers; preserve them conservatively.
+  return !!step.completed || (step.sendDispatched ?? row.sendDispatched ?? true);
+}
+function messageMayHaveBeenDispatched(row: LocalOutgoing) {
+  return row.steps.some((step) => isMessageStep(step) && stepMayHaveBeenDispatched(row, step));
+}
+function blocksLaterMessages(row: LocalOutgoing) {
+  return row.status === "sending" || row.retryable
+    || (row.conversationType === "group" && messageMayHaveBeenDispatched(row));
 }
 let queueSnapshot: LocalOutgoing[] = [];
 export const getQueueSnapshot = () => queueSnapshot;
@@ -65,7 +81,7 @@ export async function refreshOutgoingQueue() {
   timer = undefined;
   if (!consumers) return;
   const due = queueSnapshot.filter((row, index) => row.retryable && !inFlight.has(row.id)
-    && !queueSnapshot.slice(0, index).some((earlier) => sameConversation(earlier, row)));
+    && !queueSnapshot.slice(0, index).some((earlier) => sameConversation(earlier, row) && blocksLaterMessages(earlier)));
   if (due.length) timer = setTimeout(() => { void drain().catch(console.error); }, Math.max(0, Math.min(...due.map((row) => row.nextAttemptAt ?? 0)) - Date.now()));
 }
 
@@ -105,6 +121,7 @@ async function renewUpload(row: LocalOutgoing) {
   // The message endpoint explicitly rejected this reservation before accepting its envelope.
   // Keep any completed sender-key distribution, then prepare a new file envelope locally.
   row.steps = row.steps.filter((step) => step.distributed);
+  row.sendDispatched = false;
   await persistOutgoing(row);
 }
 
@@ -116,14 +133,32 @@ function contentToSend(row: LocalOutgoing, message: LocalMessage) {
   return message.type === "file" && row.fileId ? JSON.stringify({ ...JSON.parse(message.content), fileId: row.fileId }) : message.content;
 }
 
+function isMimeTypeValidationError(error: unknown) {
+  const failure = error as { status?: number; body?: { error?: { fieldErrors?: { mimeType?: unknown } } } } | null;
+  const errors = failure?.body?.error?.fieldErrors?.mimeType;
+  return failure?.status === 400 && Array.isArray(errors) && errors.length > 0;
+}
+
 async function prepare(row: LocalOutgoing, message: LocalMessage | undefined, current: () => boolean) {
   if (!current()) return;
   if (row.upload && !row.upload.uploaded) {
     for (let renewal = 0; ; renewal++) {
       if (!row.upload.uploadUrl) {
-        const upload = await api.post<{ fileId: string; uploadUrl: string }>("/api/files/upload-url", {
-          conversationId: row.conversationId, mimeType: row.upload.mimeType, sizeBytes: row.upload.bytes.length,
+        const request = (mimeType: string) => api.post<{ fileId: string; uploadUrl: string }>("/api/files/upload-url", {
+          conversationId: row.conversationId, mimeType, sizeBytes: row.upload!.bytes.length,
         });
+        const mimeType = uploadMimeType({ type: row.upload.mimeType });
+        let upload: { fileId: string; uploadUrl: string };
+        try {
+          upload = await request(mimeType);
+        } catch (error) {
+          if (!current()) return;
+          if (mimeType === "application/octet-stream" || !isMimeTypeValidationError(error)) throw error;
+          // Older servers may reject a newly supported media type during rollout.
+          row.upload.mimeType = "application/octet-stream";
+          await persistOutgoing(row);
+          upload = await request("application/octet-stream");
+        }
         if (!current()) return;
         row.fileId = upload.fileId;
         row.upload.uploadUrl = upload.uploadUrl;
@@ -156,18 +191,18 @@ async function prepare(row: LocalOutgoing, message: LocalMessage | undefined, cu
     if (row.conversationType === "direct") {
       const body = await prepareDirectPayloadFanout(conversation, row.id, contentToSend(row, message), message.type as DecryptedMessage["type"], { ttlSeconds: row.ttlSeconds, fileId: row.fileId });
       if (!current()) return;
-      row.steps = [{ path: "/api/messages/send-direct-batch", body }];
+      row.steps = [{ path: "/api/messages/send-direct-batch", body, sendDispatched: false }];
     } else {
       const distribution = row.steps.length ? null : await prepareSenderKeyDistribution(conversation);
       if (!current()) return;
       // Persist a prepared distribution even if encrypting the following message fails.
       if (distribution) {
-        row.steps = [distribution];
+        row.steps = [{ ...distribution, sendDispatched: false }];
         await persistOutgoing(row);
       }
       const encrypted = await encryptGroupText(row.conversationId, contentToSend(row, message));
       if (!current()) return;
-      row.steps.push({ path: "/api/messages/send", body: { id: row.id, conversationId: row.conversationId, type: message.type as DecryptedMessage["type"], ...encrypted, ttlSeconds: row.ttlSeconds, fileId: row.fileId } });
+      row.steps.push({ path: "/api/messages/send", body: { id: row.id, conversationId: row.conversationId, type: message.type as DecryptedMessage["type"], ...encrypted, ttlSeconds: row.ttlSeconds, fileId: row.fileId }, sendDispatched: false });
     }
     await persistOutgoing(row);
   });
@@ -179,13 +214,35 @@ async function attempt(id: string) {
   const initial = await getOutgoing(id);
   if (!initial || !belongsToSession(initial)) return;
   if (await retireOrphan(initial)) return;
-  // Sender Keys do not retain skipped receive keys. A later message must never overtake
-  // an earlier failed send (or an unfinished sender-key distribution).
   const rows = await getAllOutgoing();
-  for (const earlier of rows.filter((entry) => sameConversation(entry, initial) && compareRows(entry, initial) < 0)) {
+  if (initial.status === "failed" && !initial.retryable) {
+    // Unresolved group ciphertext keeps its position so newer chain indices cannot
+    // overtake it. Direct and definitely unsent group retries join the queue tail.
+    if (!blocksLaterMessages(initial)) initial.queuedAt = Math.max(Date.now(), ...rows.map((row) => row.queuedAt + 1));
+    if (!messageMayHaveBeenDispatched(initial)) {
+      // Replay any possibly accepted distribution unchanged, but encrypt the unsent
+      // message at the current chain position after later messages may have passed it.
+      initial.steps = initial.steps.filter((step) => !isMessageStep(step) && stepMayHaveBeenDispatched(initial, step))
+        .map((step) => ({ ...step, sendDispatched: true }));
+      initial.sendDispatched = false;
+    }
+    initial.status = "sending";
+    initial.retryable = true;
+    initial.error = null;
+    initial.nextAttemptAt = null;
+    const message = await getMessageById(id);
+    const sending = message ? { ...message, status: "sending" } : undefined;
+    if (!await updateOutgoingIfPresent(initial, sending, { ifUnchanged: true })) return;
+    if (sending && belongsToSession(initial)) showMessage(sending);
+  }
+  // Pending/auto-retrying envelopes must stay ordered, including sender-key distributions.
+  for (const earlier of rows.filter((entry) => entry.id !== id && sameConversation(entry, initial) && compareRows(entry, initial) < 0)) {
+    const pending = await getOutgoing(earlier.id);
+    if (!pending || compareRows(pending, initial) >= 0) continue;
+    if (!blocksLaterMessages(pending)) { await retireOrphan(pending); continue; }
     // An active attempt can still hold display content while preparing its envelope.
-    if (inFlight.has(earlier.id)) return;
-    if (!await retireOrphan(earlier) && await getOutgoing(earlier.id)) return;
+    if (inFlight.has(pending.id)) return;
+    if (!await retireOrphan(pending) && await getOutgoing(pending.id)) return;
   }
   // Retirement and ordering checks await IndexedDB; another tab may have progressed meanwhile.
   const row = await getOutgoing(id);
@@ -197,6 +254,11 @@ async function attempt(id: string) {
     if (message?.type === "file" && !row.fileId && !row.upload && row.steps.length === 0) throw new Error(INTERRUPTED_FILE_ERROR);
     row.attempts += 1;
     row.status = "sending";
+    row.retryable = true;
+    for (const step of row.steps) step.sendDispatched ??= row.sendDispatched ?? true;
+    row.sendDispatched = messageMayHaveBeenDispatched(row);
+    // A refresh must not normalize an old error and invalidate this attempt's revision.
+    row.error = null;
     row.nextAttemptAt = null;
     await persistOutgoing(row);
     if (message) showMessage({ ...message, status: "sending" });
@@ -209,6 +271,12 @@ async function attempt(id: string) {
         for (const step of row.steps) {
           if (step.completed) continue;
           if (!current()) return;
+          if (!step.sendDispatched) {
+            step.sendDispatched = true;
+            if (isMessageStep(step)) row.sendDispatched = true;
+            await persistOutgoing(row);
+            if (!current()) return;
+          }
           result = await api.post<SendMessageResponse>(step.path, step.body);
           if (!current()) return;
           if (step.distributed) await finishSenderKeyDistribution(row.conversationId, step);
@@ -237,7 +305,7 @@ async function attempt(id: string) {
     row.attempts = Math.max(1, row.attempts);
     row.status = "failed";
     row.retryable = retryable;
-    row.error = outgoingErrorKey(error);
+    row.error = !retryable && row.upload && !row.upload.uploaded ? "fileCouldNotBeUploaded" : outgoingErrorKey(error);
     row.nextAttemptAt = retryable ? Date.now() + RETRY_DELAYS[Math.min(row.attempts - 1, RETRY_DELAYS.length - 1)] : null;
     const failed = message ? { ...message, status: "failed" } : undefined;
     if (!await updateOutgoingIfPresent(row, failed, { ifUnchanged: true })) return;
@@ -274,29 +342,39 @@ export async function discardOutgoing(id: string) {
     await discardQueuedMessage(id);
     useChatStore.getState().removeMessages([id]);
   });
-  await refreshOutgoingQueue();
+  await drain();
 }
 async function drain(online = false) {
   const rows = await getAllOutgoing();
-  await Promise.all(rows.map(async (snapshot) => {
-    if (belongsToSession(snapshot) && !inFlight.has(snapshot.id)) {
-      await withConversationLock(snapshot, async () => {
-        const row = await getOutgoing(snapshot.id);
-        if (!row || !belongsToSession(row) || inFlight.has(row.id) || preparingFiles.has(row.id)) return;
-        if (await retireOrphan(row)) return;
-        if (row.status === "sending" && !row.retryable && row.error) {
-          row.status = "failed";
-          const message = await getMessageById(row.id);
-          if (message?.type === "file" && !row.fileId && !row.upload && row.steps.length === 0) row.error = INTERRUPTED_FILE_ERROR;
-          const failed = message ? { ...message, status: "failed" } : undefined;
-          // The lock does not cover another tab's initial file encryption. Compare
-          // the revision and write both records in one transaction after the await.
-          if (await updateOutgoingIfPresent(row, failed, { ifUnchanged: true }) && failed) showMessage(failed);
-        }
-      });
+  const conversations = new Map<string, LocalOutgoing[]>();
+  for (const row of rows.sort(compareRows)) {
+    const key = JSON.stringify([row.userId, row.deviceId, row.conversationId]);
+    const pending = conversations.get(key) ?? [];
+    pending.push(row);
+    conversations.set(key, pending);
+  }
+  await Promise.all([...conversations.values()].map(async (pending) => {
+    for (const snapshot of pending) {
+      if (belongsToSession(snapshot) && !inFlight.has(snapshot.id)) {
+        await withConversationLock(snapshot, async () => {
+          const row = await getOutgoing(snapshot.id);
+          if (!row || !belongsToSession(row) || inFlight.has(row.id) || preparingFiles.has(row.id)) return;
+          if (await retireOrphan(row)) return;
+          if (row.status === "sending" && !row.retryable) {
+            row.status = "failed";
+            row.error ??= "messageNotSent";
+            const message = await getMessageById(row.id);
+            if (message?.type === "file" && !row.fileId && !row.upload && row.steps.length === 0) row.error = INTERRUPTED_FILE_ERROR;
+            const failed = message ? { ...message, status: "failed" } : undefined;
+            // The lock does not cover another tab's initial file encryption. Compare
+            // the revision and write both records in one transaction after the await.
+            if (await updateOutgoingIfPresent(row, failed, { ifUnchanged: true }) && failed) showMessage(failed);
+          }
+        });
+      }
+      const row = await getOutgoing(snapshot.id);
+      if (row && belongsToSession(row) && row.retryable && (online || row.nextAttemptAt === null || row.nextAttemptAt <= Date.now())) await retryOutgoing(row.id);
     }
-    const row = await getOutgoing(snapshot.id);
-    if (row && belongsToSession(row) && row.retryable && (online || row.nextAttemptAt === null || row.nextAttemptAt <= Date.now())) await retryOutgoing(row.id);
   }));
   await refreshOutgoingQueue();
 }

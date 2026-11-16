@@ -10,7 +10,7 @@ import { useCallSession } from "./useCall.js";
 import { useMediaElement } from "./useMediaElement.js";
 import CallBubble from "../../components/calls/CallBubble.js";
 import IncomingCallModal from "../../components/calls/IncomingCallModal.js";
-import { capabilities } from "../../platform/capabilities.js";
+import { usePushCallInvitation } from "./usePushCallInvitation.js";
 
 /** Mounted above Routes for the whole unlocked session, including persistent audio. */
 export function CallProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
@@ -25,6 +25,7 @@ export function CallProvider({ enabled, children }: { enabled: boolean; children
   // Retain an accepted call through its end state, but never own a declined invitation.
   // A reload has no in-memory owner: a stale /call URL must not restart capture.
   const callId = enabled && (activeCallId === ownerId.current || showingOwnedEnd) ? ownerId.current ?? undefined : undefined;
+  usePushCallInvitation(enabled, match?.params.callId);
   const invitation = useCallInvitationOwner(enabled);
   const call = useCallSession(callId ?? undefined, invitation.pendingLocalAcceptance, invitation.finishNativeCaptureWait);
   lastStage.current = call.stage;
@@ -35,7 +36,7 @@ export function CallProvider({ enabled, children }: { enabled: boolean; children
   return <IncomingCallContext.Provider value={invitation}><CallContext.Provider value={call}>
     {children}
     {enabled && <CallQueue />}
-    {enabled && match && capabilities.nativeCallNotifications && <IncomingCallModal />}
+    {enabled && match && <IncomingCallModal />}
     {enabled && call.remoteEntries.map(([id, stream]) => <RemoteAudio key={id} stream={stream} />)}
     {minimized && <CallBubble />}
   </CallContext.Provider></IncomingCallContext.Provider>;

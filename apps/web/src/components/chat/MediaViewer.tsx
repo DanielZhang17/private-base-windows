@@ -10,14 +10,15 @@ interface MediaViewerProps {
   fileName: string;
   isVideo: boolean;
   onClose: () => void;
+  onError?: () => void;
   onSave?: () => void;
 }
 
-function ImageView({ objectUrl, fileName, onClose }: Pick<MediaViewerProps, "objectUrl" | "fileName" | "onClose">) {
+function ImageView({ objectUrl, fileName, onClose, onError }: Pick<MediaViewerProps, "objectUrl" | "fileName" | "onClose" | "onError">) {
   const { stageRef, media, zoom, swipe, dragging, setNatural, toggleZoom, pointerHandlers } = useMediaGestures(onClose);
   return <>
     <div ref={stageRef} className="media-viewer-stage media-viewer-image-stage" {...pointerHandlers}>
-      <img src={objectUrl} alt={fileName} draggable={false} className="media-viewer-image"
+      <img src={objectUrl} alt={fileName} draggable={false} className="media-viewer-image" onError={onError ?? onClose}
         onLoad={(event) => setNatural({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })}
         data-dragging={dragging || undefined}
         style={{ width: media.width || undefined, height: media.height || undefined, transform: `translate(${zoom.x}px, ${zoom.y + swipe}px) scale(${zoom.scale})` }} />
@@ -28,7 +29,7 @@ function ImageView({ objectUrl, fileName, onClose }: Pick<MediaViewerProps, "obj
   </>;
 }
 
-export default function MediaViewer({ objectUrl, fileName, isVideo, onClose, onSave }: MediaViewerProps) {
+export default function MediaViewer({ objectUrl, fileName, isVideo, onClose, onError, onSave }: MediaViewerProps) {
   useLocale();
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -47,7 +48,7 @@ export default function MediaViewer({ objectUrl, fileName, isVideo, onClose, onS
       {onSave && <IconButton icon="download" label={t("download", { fileName })} onClick={onSave} />}
     </div>
     {isVideo ? <div className="media-viewer-stage" onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <video ref={videoRef} src={objectUrl} aria-label={fileName} className="media-viewer-video" tabIndex={0} controls playsInline autoPlay />
-    </div> : <ImageView objectUrl={objectUrl} fileName={fileName} onClose={onClose} />}
+      <video ref={videoRef} src={objectUrl} aria-label={fileName} className="media-viewer-video" tabIndex={0} controls playsInline autoPlay onError={onError ?? onClose} />
+    </div> : <ImageView objectUrl={objectUrl} fileName={fileName} onClose={onClose} onError={onError} />}
   </DarkSurface></Portal>;
 }

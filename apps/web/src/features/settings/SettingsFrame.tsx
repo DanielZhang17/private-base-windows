@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { useAuthStore } from "../../stores/authStore.js";
 import { api } from "../../services/api.js";
+import { showWebPushSettings } from "../../services/web-push.js";
 import { capabilities } from "../../platform/capabilities.js";
 import { resolveAvatarImageUrl } from "./avatar.js";
 import { AppShell, Avatar, BottomBar, EmptyState, Icon, ListItem, NavItem, NavRail, TopBar, ToastProvider, Button } from "../../ui/index.js";
@@ -66,7 +67,7 @@ export function SettingsFrame({ section, detail, detailActive = true, title, onS
           </div>
 
           <ul role="list" className="space-y-1">
-            {SETTINGS_SECTIONS.filter(([key]) => key !== "notifications" || capabilities.backgroundConnection).map(([key, label, icon]) => <li key={key}>
+            {SETTINGS_SECTIONS.filter(([key]) => key !== "notifications" || capabilities.backgroundConnection || showWebPushSettings()).map(([key, label, icon]) => <li key={key}>
               <ListItem
                 leading={<Icon name={icon} size={22} />}
                 title={t(label)}

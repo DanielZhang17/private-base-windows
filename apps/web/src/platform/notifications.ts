@@ -15,8 +15,7 @@ let actionListener: Promise<unknown> | undefined;
 let actionTypes: { locale: Locale; registered: Promise<void> } | undefined;
 const OPEN_ACTION = "e2ee-open";
 
-// A dismissed prompt leaves the permission undecided. Passive requests (an incoming message)
-// may prompt only once per session; explicit requests may always ask again.
+// Native passive requests may prompt once per session. Browser prompts require a gesture.
 let passivePromptUsed = false;
 
 async function ensurePermission(passive: boolean): Promise<boolean> {
@@ -35,7 +34,7 @@ async function ensurePermission(passive: boolean): Promise<boolean> {
   if (typeof Notification === "undefined") return false;
   if (Notification.permission === "granted") return true;
   if (Notification.permission === "denied") return false;
-  return mayPrompt() && await Notification.requestPermission() === "granted";
+  return !passive && await Notification.requestPermission() === "granted";
 }
 
 /** An explicit request: prompts whenever the permission is still undecided. */
@@ -44,8 +43,8 @@ export function requestNotificationPermission(): Promise<boolean> {
 }
 
 /**
- * Returns false when notifications are unavailable or the user denies permission. Prompts for
- * permission at most once per session; use `requestNotificationPermission()` to ask again.
+ * Returns false when notifications are unavailable or permission is absent. Native clients may
+ * prompt once per session; browsers request permission only through explicit settings gestures.
  */
 export async function notify(options: NotificationOptions): Promise<boolean> {
   if (!await ensurePermission(true)) return false;

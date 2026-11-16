@@ -18,15 +18,16 @@ const dom = setupDom();
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubGlobal("URL", class extends URL { static createObjectURL = vi.fn(() => "blob:preview"); static revokeObjectURL = vi.fn(); });
-  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, arrayBuffer: async () => new Uint8Array([99]).buffer })));
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, headers: new Headers({ "content-type": "application/octet-stream" }), arrayBuffer: async () => new Uint8Array([99]).buffer })));
   vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
   vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+  vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("probably");
 });
 afterEach(() => { vi.restoreAllMocks(); });
 const render = (mimeType = "application/pdf", fileId = "file") => dom.render(<FilePreview fileId={fileId} fileName="private.pdf" mimeType={mimeType} fileKey="key" fileIv="iv" sizeBytes={3} />);
 const download = () => dom.container().querySelector<HTMLButtonElement>('[aria-label="Download private.pdf"]')!;
 
-it.each(["application/pdf", "image/png"])("saves decrypted %s through the adapter without persisting plaintext", async (mimeType) => {
+it.each(["application/pdf", "image/png", "video/mp4", "application/x-apple-diskimage"])("saves decrypted %s with the payload type despite the server's octet-stream type", async (mimeType) => {
   await render(mimeType);
   await click(download());
   expect(decryptFile).toHaveBeenCalledExactlyOnceWith(new Uint8Array([99]), { key: "key", iv: "iv" });
@@ -110,4 +111,48 @@ it("does not create a blob URL if decryption finishes after unmount", async () =
   await act(async () => finish(new Uint8Array([1, 2, 3])));
   expect(URL.createObjectURL).not.toHaveBeenCalled();
   expect(setCachedFile).not.toHaveBeenCalled();
+});
+
+const newMediaTypes = ["image/avif", "image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence", "video/quicktime"];
+it.each(newMediaTypes)("previews and opens decrypted %s when the platform can decode it", async (mimeType) => {
+  await render(mimeType);
+  expect(vi.mocked(URL.createObjectURL).mock.calls[0][0]).toMatchObject({ type: mimeType });
+  const preview = dom.container().querySelector("img,video")!;
+  expect(preview.tagName).toBe(mimeType.startsWith("image/") ? "IMG" : "VIDEO");
+  await click(preview.closest("button")!);
+  expect(document.querySelector('[role="dialog"] img,[role="dialog"] video')?.getAttribute("src")).toBe("blob:preview");
+  await press("Escape");
+});
+
+it.each(newMediaTypes.flatMap((mimeType) => ["inline", "viewer"].map((surface) => ({ mimeType, surface }))))("falls back from $surface decode errors for $mimeType to the downloadable file card", async ({ mimeType, surface }) => {
+  await render(mimeType);
+  const preview = dom.container().querySelector("img,video")!;
+  if (surface === "viewer") await click(preview.closest("button")!);
+  const failed = surface === "viewer" ? document.querySelector('[role="dialog"] img,[role="dialog"] video')! : preview;
+  await act(async () => { failed.dispatchEvent(new Event("error")); });
+  expect(dom.container().querySelector("img,video")).toBeNull();
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+  expect(dom.container().textContent).toContain("private.pdf");
+  expect(dom.container().textContent).toContain("3 B");
+  expect(download()).not.toBeNull();
+  await click(download());
+  expect(saveFile).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ type: mimeType, size: 3 }), "private.pdf");
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it("uses the file card immediately when canPlayType reports unsupported QuickTime", async () => {
+  vi.mocked(HTMLMediaElement.prototype.canPlayType).mockReturnValue("");
+  await render("video/quicktime");
+  expect(HTMLMediaElement.prototype.canPlayType).toHaveBeenCalledWith("video/quicktime");
+  expect(dom.container().querySelector("video")).toBeNull();
+  expect(fetch).not.toHaveBeenCalled();
+  await click(download());
+  expect(saveFile).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ type: "video/quicktime" }), "private.pdf");
+});
+
+it("allows previews again when an unsupported attachment is replaced", async () => {
+  await render("image/heic");
+  await act(async () => { dom.container().querySelector("img")!.dispatchEvent(new Event("error")); });
+  await render("image/avif", "other");
+  expect(dom.container().querySelector("img")?.getAttribute("src")).toBe("blob:preview");
 });

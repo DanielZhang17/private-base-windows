@@ -50,6 +50,24 @@ it("keeps failed messages in the log with one-tap retry and queue discard", asyn
   await act(async () => discardButton.click());
   expect(discard).toHaveBeenCalledWith("failed");
 });
+it("shows a rejected file as failed with its upload reason and Discard", async () => {
+  const discard = vi.fn();
+  await renderFlow({
+    outgoing: [{ id: "failed-file", status: "failed", retryable: false, error: "This file couldn't be uploaded" }], discard,
+    conversationMessages: [{ id: "failed-file", senderId: "alice", type: "file", content: JSON.stringify({ fileName: "installer.dmg" }), timestamp: 1000, status: "failed" }],
+  });
+  const log = container.querySelector('[role="log"]')!;
+  expect(log.querySelector(".bubble-failed")?.textContent).toBe("installer.dmg");
+  expect(log.textContent).toContain("Not sent");
+  expect(log.textContent).not.toContain("Sending");
+  expect(log.textContent).not.toContain("Encrypting");
+  await act(async () => log.querySelector<HTMLButtonElement>('[aria-label="Failed message actions"]')!.click());
+  const dialog = document.body.querySelector('[role="dialog"]')!;
+  expect(dialog.textContent).toContain("This file couldn't be uploaded");
+  const discardButton = [...dialog.querySelectorAll("button")].find((button) => button.textContent === "Discard")!;
+  await act(async () => discardButton.click());
+  expect(discard).toHaveBeenCalledWith("failed-file");
+});
 it("shows a dismissible retirement notice without blocking the conversation composer", async () => {
   const dismissOutgoingRemoval = vi.fn();
   await renderFlow({ outgoingRemoved: true, dismissOutgoingRemoval });

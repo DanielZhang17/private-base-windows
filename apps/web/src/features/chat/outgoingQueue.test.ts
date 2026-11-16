@@ -6,7 +6,7 @@ import { api } from "../../services/api.js";
 import { prepareDirectPayloadFanout } from "../../lib/direct-messages.js";
 import { prepareSenderKeyDistribution, finishSenderKeyDistribution } from "../../lib/group-session.js";
 import { encryptGroupText } from "../../lib/message-processor.js";
-import { discardOutgoing, getQueueSnapshot, refreshOutgoingQueue, retryOutgoing, startOutgoingQueue } from "./outgoingQueue.js";
+import { discardOutgoing, getQueueSnapshot, refreshOutgoingQueue, retryOutgoing, startOutgoingQueue, subscribeQueue } from "./outgoingQueue.js";
 
 vi.mock("../../stores/authStore.js", async () => {
   const { create } = await import("zustand");
@@ -26,6 +26,12 @@ async function seed(overrides: Partial<LocalOutgoing> = {}) {
   await saveQueuedMessage({ id: "message", conversationId: "chat", senderId: "alice", type: "text", content: "private text", timestamp: Date.now(), expiresAt: Date.now() + 60000, expiryKind: "retention", status: "sending" }, {
     id: "message", queuedAt: 1, conversationId: "chat", conversationType: "direct", userId: "alice", deviceId: "device", ttlSeconds: null, attempts: 0,
     status: "sending", retryable: true, error: null, nextAttemptAt: null, steps: [], ...overrides,
+  });
+}
+async function queueText(id: string, queuedAt: number) {
+  await saveQueuedMessage({ ...(await getMessageById("message"))!, id, type: "text", content: id, status: "sending" }, {
+    ...(await getOutgoing("message"))!, id, queuedAt, steps: [], upload: undefined, fileId: undefined,
+    sendDispatched: false, attempts: 0, status: "sending", retryable: true, nextAttemptAt: null, error: null,
   });
 }
 beforeEach(async () => {
@@ -57,6 +63,58 @@ it.each([0, 429, 503])("keeps a failed %s send durably and reuses its ciphertext
   expect(vi.mocked(api.post).mock.calls).toEqual([["/api/messages/send-direct-batch", body], ["/api/messages/send-direct-batch", body]]);
   expect(await getAllOutgoing()).toEqual([]);
   expect(await getMessageById("message")).toMatchObject({ status: "sent", timestamp: 123 });
+});
+
+it.each(["direct", "group"] as const)("replays the same %s envelope after a response-parse failure or lost connection", async (conversationType) => {
+  for (const failure of [new SyntaxError("Invalid JSON response"), networkError()]) {
+    await seed({ conversationType, sendDispatched: false });
+    let encryptions = 0;
+    vi.mocked(prepareDirectPayloadFanout).mockImplementation(async () => ({ ...body, messages: [{ ...body.messages[0], ciphertext: `ciphertext-${++encryptions}` }] }) as never);
+    vi.mocked(encryptGroupText).mockImplementation(async () => ({ ciphertext: `ciphertext-${++encryptions}`, iv: "iv", header: "header" }));
+    let accepted: string | undefined;
+    let dispatches = 0;
+    const dispatchMarkers: (boolean | undefined)[] = [];
+    vi.mocked(api.post).mockImplementation(async (_path, payload) => {
+      dispatchMarkers.push((await getOutgoing("message"))?.sendDispatched);
+      dispatches++;
+      const envelope = JSON.stringify(payload);
+      if (accepted === undefined) { accepted = envelope; throw failure; }
+      // Model the endpoint's idempotency check: a different envelope cannot get the receipt.
+      if (envelope !== accepted) throw Object.assign(new Error("Different envelope"), { status: 409 });
+      return response as never;
+    });
+    await retryOutgoing("message");
+    const failed = (await getOutgoing("message"))!;
+    expect(failed).toMatchObject({ status: "failed", retryable: failure instanceof TypeError, sendDispatched: true });
+    const steps = structuredClone(failed.steps);
+    await retryOutgoing("message");
+    expect(dispatches).toBe(2);
+    expect(dispatchMarkers).toEqual([true, true]);
+    expect(encryptions).toBe(1);
+    expect(JSON.stringify(steps[0].body)).toBe(accepted);
+    expect(await getOutgoing("message")).toBeUndefined();
+    expect(await getMessageById("message")).toMatchObject({ status: "sent", timestamp: response.serverTimestamp });
+  }
+});
+
+it("keeps a legacy terminal envelope with unknown dispatch state intact on retry", async () => {
+  await seed({ status: "failed", retryable: false, steps: [{ path: "/api/messages/send-direct-batch", body: body as never }] });
+  await retryOutgoing("message");
+  expect(prepareDirectPayloadFanout).not.toHaveBeenCalled();
+  expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/messages/send-direct-batch", body);
+  expect(await getOutgoing("message")).toBeUndefined();
+});
+
+it.each(["direct", "group"] as const)("retries %s preparation with fresh encryption after a pre-send failure", async (conversationType) => {
+  await seed({ conversationType, sendDispatched: false });
+  const encrypt = conversationType === "direct" ? vi.mocked(prepareDirectPayloadFanout) : vi.mocked(encryptGroupText);
+  encrypt.mockRejectedValueOnce(new Error("Preparation failed"));
+  await retryOutgoing("message");
+  expect(await getOutgoing("message")).toMatchObject({ status: "failed", retryable: false, sendDispatched: false });
+  expect(api.post).not.toHaveBeenCalled();
+  await retryOutgoing("message");
+  expect(encrypt).toHaveBeenCalledTimes(2);
+  expect(await getOutgoing("message")).toBeUndefined();
 });
 
 it("uses 2s, 5s, 15s, 60s backoff, and restores queued envelopes after reload", async () => {
@@ -126,6 +184,103 @@ it("checks upload HTTP errors and retains encrypted upload bytes for retry", asy
   expect(await getOutgoing("message")).toBeUndefined();
 });
 
+it.each(["upload-url", "PUT"])("marks a file rejected with 400 by %s failed and keeps Discard available", async (stage) => {
+  await seed({ upload: { bytes: new Uint8Array([1, 2, 3]), mimeType: "application/x-apple-diskimage" } });
+  await saveMessage({ ...(await getMessageById("message"))!, type: "file", content: JSON.stringify({ fileId: "", fileName: "installer.dmg", mimeType: "application/x-apple-diskimage" }) });
+  const error = Object.assign(new Error("Invalid upload"), { status: 400 });
+  vi.mocked(api.post).mockResolvedValue({ fileId: "file", uploadUrl: "/upload" } as never);
+  if (stage === "upload-url") vi.mocked(api.post).mockRejectedValueOnce(error);
+  else vi.mocked(api.put).mockRejectedValueOnce(error);
+  await retryOutgoing("message");
+  expect(await getOutgoing("message")).toMatchObject({ status: "failed", retryable: false, nextAttemptAt: null, error: "fileCouldNotBeUploaded" });
+  expect(await getMessageById("message")).toMatchObject({ status: "failed" });
+  expect(useChatStore.getState().messages.get("chat")).toMatchObject([{ status: "failed" }]);
+  expect(prepareDirectPayloadFanout).not.toHaveBeenCalled();
+  const stop = startOutgoingQueue();
+  try {
+    window.dispatchEvent(new Event("online"));
+    await refreshOutgoingQueue();
+    expect(api.post).toHaveBeenCalledTimes(1);
+    await discardOutgoing("message");
+    expect(await getOutgoing("message")).toBeUndefined();
+    expect(await getMessageById("message")).toBeUndefined();
+  } finally { stop(); }
+});
+
+it("persists a failed upload retry even when its previous error needs normalization", async () => {
+  await seed({ status: "failed", error: "Legacy upload diagnostic", upload: { bytes: new Uint8Array([1]), mimeType: "application/octet-stream" } });
+  await saveMessage({ ...(await getMessageById("message"))!, type: "file" });
+  vi.mocked(api.post).mockRejectedValueOnce(Object.assign(new Error("Invalid upload"), { status: 400 }));
+  await retryOutgoing("message");
+  expect(await getOutgoing("message")).toMatchObject({ status: "failed", retryable: false });
+  expect(await getMessageById("message")).toMatchObject({ status: "failed" });
+  expect(useChatStore.getState().messages.get("chat")).toMatchObject([{ status: "failed" }]);
+});
+
+it.each(["upload-url", "PUT"])("keeps network, 429 and 5xx %s failures retryable", async (stage) => {
+  for (const error of [networkError(), Object.assign(new Error("Unavailable"), { status: 503 }), Object.assign(new Error("Rate limit exceeded"), { status: 429 })]) {
+    await seed({ upload: { bytes: new Uint8Array([1, 2, 3]), mimeType: "application/x-apple-diskimage" } });
+    await saveMessage({ ...(await getMessageById("message"))!, type: "file", content: JSON.stringify({ fileId: "", fileName: "installer.dmg", mimeType: "application/x-apple-diskimage" }) });
+    vi.mocked(api.post).mockImplementation(async (path) => (path === "/api/files/upload-url" ? { fileId: "file", uploadUrl: "/upload" } : response) as never);
+    if (stage === "upload-url") vi.mocked(api.post).mockRejectedValueOnce(error);
+    else vi.mocked(api.put).mockRejectedValueOnce(error);
+    await retryOutgoing("message");
+    expect(await getOutgoing("message")).toMatchObject({ status: "failed", retryable: true, nextAttemptAt: expect.any(Number) });
+    expect(await getMessageById("message")).toMatchObject({ status: "failed" });
+    await retryOutgoing("message");
+    expect(await getOutgoing("message")).toBeUndefined();
+    expect(await getMessageById("message")).toMatchObject({ status: "sent" });
+  }
+});
+
+it.each(["image/avif", "image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence", "video/quicktime"])("retries an older server's %s MIME rejection once as octet-stream without failing the attempt", async (mimeType) => {
+  await seed({ upload: { bytes: new Uint8Array([1, 2, 3]), mimeType } });
+  const content = JSON.stringify({ fileId: "", fileName: "original", mimeType, fileKey: "secret", iv: "iv" });
+  await saveMessage({ ...(await getMessageById("message"))!, type: "file", content });
+  const attempts: number[] = [];
+  vi.mocked(api.post).mockImplementation(async (path, payload) => {
+    if (path !== "/api/files/upload-url") return response as never;
+    attempts.push((await getOutgoing("message"))!.attempts);
+    if ((payload as { mimeType: string }).mimeType !== "application/octet-stream") {
+      throw Object.assign(new Error("Invalid enum value"), { status: 400, body: { error: { formErrors: [], fieldErrors: { mimeType: ["Unsupported type"] } } } });
+    }
+    return { fileId: "file", uploadUrl: "/upload" } as never;
+  });
+  await retryOutgoing("message");
+  expect(vi.mocked(api.post).mock.calls.filter(([path]) => path === "/api/files/upload-url").map(([, payload]) => (payload as { mimeType: string }).mimeType)).toEqual([mimeType, "application/octet-stream"]);
+  expect(attempts).toEqual([1, 1]);
+  expect(api.put).toHaveBeenCalledOnce();
+  expect(await getOutgoing("message")).toBeUndefined();
+  expect(await getMessageById("message")).toMatchObject({ status: "sent", content: JSON.stringify({ ...JSON.parse(content), fileId: "file" }) });
+  expect(vi.mocked(prepareDirectPayloadFanout).mock.calls[0][2]).toBe(JSON.stringify({ ...JSON.parse(content), fileId: "file" }));
+});
+
+it("stops after one failed MIME fallback and remembers octet-stream for the next manual retry", async () => {
+  await seed({ upload: { bytes: new Uint8Array([1]), mimeType: "image/avif" } });
+  await saveMessage({ ...(await getMessageById("message"))!, type: "file", content: JSON.stringify({ fileId: "", mimeType: "image/avif" }) });
+  vi.mocked(api.post).mockRejectedValue(Object.assign(new Error("Invalid type"), { status: 400, body: { error: { fieldErrors: { mimeType: ["Invalid type"] } } } }));
+  await retryOutgoing("message");
+  expect(api.post).toHaveBeenCalledTimes(2);
+  expect(await getOutgoing("message")).toMatchObject({ status: "failed", retryable: false, attempts: 1, upload: { mimeType: "application/octet-stream" } });
+  vi.mocked(api.post).mockImplementation(async (path) => (path === "/api/files/upload-url" ? { fileId: "file", uploadUrl: "/upload" } : response) as never);
+  await retryOutgoing("message");
+  expect(vi.mocked(api.post).mock.calls[2]).toEqual(["/api/files/upload-url", { conversationId: "chat", mimeType: "application/octet-stream", sizeBytes: 1 }]);
+  expect(await getOutgoing("message")).toBeUndefined();
+});
+
+it.each([
+  { status: 400, fieldErrors: { sizeBytes: ["Too large"] }, mimeType: "image/avif" },
+  { status: 403, fieldErrors: { mimeType: ["Unsupported"] }, mimeType: "image/avif" },
+  { status: 503, fieldErrors: { mimeType: ["Unsupported"] }, mimeType: "image/avif" },
+  { status: 400, fieldErrors: { mimeType: ["Unsupported"] }, mimeType: "application/octet-stream" },
+])("does not hide other validation/server errors or repeat octet-stream ($status, $mimeType)", async ({ status, fieldErrors, mimeType }) => {
+  await seed({ upload: { bytes: new Uint8Array([1]), mimeType } });
+  vi.mocked(api.post).mockRejectedValue(Object.assign(new Error("Rejected"), { status, body: { error: { fieldErrors } } }));
+  await retryOutgoing("message");
+  expect(api.post).toHaveBeenCalledTimes(1);
+  expect(await getOutgoing("message")).toMatchObject({ status: "failed", attempts: 1, retryable: status >= 500 });
+});
+
 it("does not replay another user's pending messages or commit results after logout", async () => {
   await seed({ userId: "bob" });
   await retryOutgoing("message");
@@ -160,6 +315,136 @@ it("keeps later group sends behind a failed send so Sender Keys are received in 
   await retryOutgoing("second");
   expect(encryptGroupText).toHaveBeenCalledTimes(2);
   expect(await getAllOutgoing()).toEqual([]);
+});
+
+it("delivers two texts in order while an earlier permanently rejected file stays failed", async () => {
+  await seed({ upload: { bytes: new Uint8Array([1]), mimeType: "application/octet-stream" } });
+  await saveMessage({ ...(await getMessageById("message"))!, type: "file", content: JSON.stringify({ fileId: "", fileName: "installer.dmg" }) });
+  vi.mocked(api.post).mockRejectedValueOnce(Object.assign(new Error("Invalid upload"), { status: 400 }));
+  await retryOutgoing("message");
+  vi.mocked(prepareDirectPayloadFanout).mockImplementation(async (_conversation, id) => ({ ...body, messages: [{ ...body.messages[0], id }] }) as never);
+  const published = vi.fn();
+  const unsubscribe = subscribeQueue(published);
+  const stop = startOutgoingQueue();
+  try {
+    // Let the startup drain finish with only the terminal failure. The scheduler
+    // must wake this now-idle queue when later messages arrive.
+    await vi.waitFor(() => expect(published).toHaveBeenCalled());
+    await queueText("second", 2);
+    await queueText("third", 3);
+    await refreshOutgoingQueue();
+    await vi.waitFor(async () => {
+      expect(await getMessageById("second")).toMatchObject({ status: "sent" });
+      expect(await getMessageById("third")).toMatchObject({ status: "sent" });
+    });
+    expect(vi.mocked(api.post).mock.calls.filter(([path]) => path === "/api/messages/send-direct-batch").map(([, payload]) => (payload as typeof body).messages[0].id)).toEqual(["second", "third"]);
+    expect(await getOutgoing("message")).toMatchObject({ status: "failed", retryable: false });
+    expect(await getMessageById("message")).toMatchObject({ status: "failed" });
+  } finally { stop(); unsubscribe(); }
+});
+
+it.each(["network", "429"])("keeps later texts behind a retryable %s file failure until it succeeds", async (failure) => {
+  await seed({ upload: { bytes: new Uint8Array([1]), mimeType: "application/octet-stream" } });
+  await saveMessage({ ...(await getMessageById("message"))!, type: "file", content: JSON.stringify({ fileId: "", fileName: "installer.dmg" }) });
+  vi.mocked(api.post).mockRejectedValueOnce(failure === "network" ? networkError() : Object.assign(new Error("Rate limit exceeded"), { status: 429 }));
+  await retryOutgoing("message");
+  await queueText("second", 2);
+  await queueText("third", 3);
+  vi.mocked(prepareDirectPayloadFanout).mockImplementation(async (_conversation, id) => ({ ...body, messages: [{ ...body.messages[0], id }] }) as never);
+  await retryOutgoing("second");
+  await retryOutgoing("third");
+  expect(api.post).toHaveBeenCalledTimes(1);
+  expect(await getMessageById("second")).toMatchObject({ status: "sending" });
+  vi.mocked(api.post).mockImplementation(async (path) => (path === "/api/files/upload-url" ? { fileId: "file", uploadUrl: "/upload" } : response) as never);
+  const stop = startOutgoingQueue();
+  try {
+    await retryOutgoing("message");
+    await vi.waitFor(async () => expect(await getAllOutgoing()).toEqual([]));
+    expect(vi.mocked(api.post).mock.calls.filter(([path]) => path === "/api/messages/send-direct-batch").map(([, payload]) => (payload as typeof body).messages[0].id)).toEqual(["message", "second", "third"]);
+  } finally { stop(); }
+});
+
+it.each([true, false])("flushes both waiting texts immediately on discard without a queue consumer or online event (retryable: %s)", async (retryable) => {
+  await seed({ status: "failed", retryable, nextAttemptAt: retryable ? Date.now() + 60000 : null });
+  await queueText("second", 2);
+  await queueText("third", 3);
+  vi.mocked(prepareDirectPayloadFanout).mockImplementation(async (_conversation, id) => ({ ...body, messages: [{ ...body.messages[0], id }] }) as never);
+  if (retryable) {
+    await retryOutgoing("second");
+    expect(api.post).not.toHaveBeenCalled();
+  }
+  await discardOutgoing("message");
+  expect(await getAllOutgoing()).toEqual([]);
+  expect(await getMessageById("second")).toMatchObject({ status: "sent" });
+  expect(await getMessageById("third")).toMatchObject({ status: "sent" });
+  expect(vi.mocked(api.post).mock.calls.map(([, payload]) => (payload as typeof body).messages[0].id)).toEqual(["second", "third"]);
+});
+
+it("moves a terminal group retry after pending work and encrypts it at the current chain position", async () => {
+  await seed({ conversationType: "group", status: "failed", retryable: false, sendDispatched: false, steps: [{ path: "/api/messages/send", body: { id: "message", conversationId: "chat", type: "text", ciphertext: "outdated", iv: "iv", header: "old" } }] });
+  await queueText("second", 2);
+  await retryOutgoing("message");
+  expect(api.post).not.toHaveBeenCalled();
+  expect(await getOutgoing("message")).toMatchObject({ status: "sending", retryable: true, steps: [] });
+  expect((await getOutgoing("message"))!.queuedAt).toBeGreaterThan((await getOutgoing("second"))!.queuedAt);
+  await retryOutgoing("second");
+  await retryOutgoing("message");
+  expect(encryptGroupText).toHaveBeenNthCalledWith(1, "chat", "second");
+  expect(encryptGroupText).toHaveBeenNthCalledWith(2, "chat", "private text");
+  expect(JSON.stringify(vi.mocked(api.post).mock.calls)).not.toContain("outdated");
+  expect(await getAllOutgoing()).toEqual([]);
+});
+
+it.each([
+  { status: "failed", result: "success" }, { status: "failed", result: "permanent failure" },
+  { status: "sending", result: "success" }, { status: "sending", result: "permanent failure" },
+] as const)("recovers a reload mid-manual-retry of a $status row and lets later messages send after $result", async ({ status, result }) => {
+  await seed({ status, retryable: false, error: status === "failed" ? "messageNotSent" : null, sendDispatched: false });
+  let finishLookup!: (value: never) => void;
+  vi.mocked(api.get).mockReturnValueOnce(new Promise((resolve) => { finishLookup = resolve; }));
+  const sending = retryOutgoing("message");
+  let stop: (() => void) | undefined;
+  try {
+    await vi.waitFor(() => expect(api.get).toHaveBeenCalledOnce());
+    // The durable record at the interruption point must be recoverable without its old runtime.
+    expect(await getOutgoing("message")).toMatchObject({ status: "sending", retryable: true, error: null, sendDispatched: false });
+    await queueText("second", Date.now() + 1);
+    vi.resetModules();
+    useAuthStore.setState({ sessionId: "reloaded-session" } as never);
+    const restored = await import("./outgoingQueue.js");
+    vi.mocked(api.post).mockImplementation(async (_path, payload) => {
+      if (result === "permanent failure" && (payload as typeof body).messages[0].id === "message") throw Object.assign(new Error("Rejected"), { status: 403 });
+      return response as never;
+    });
+    vi.mocked(prepareDirectPayloadFanout).mockImplementation(async (_conversation, id) => ({ ...body, messages: [{ ...body.messages[0], id }] }) as never);
+    stop = restored.startOutgoingQueue();
+    await vi.waitFor(async () => expect(await getMessageById("second")).toMatchObject({ status: "sent" }));
+    if (result === "success") expect(await getOutgoing("message")).toBeUndefined();
+    else {
+      expect(await getOutgoing("message")).toMatchObject({ status: "failed", retryable: false, error: "messageNotSent" });
+      expect(await getMessageById("message")).toMatchObject({ status: "failed" });
+      await restored.discardOutgoing("message");
+    }
+    expect(await getAllOutgoing()).toEqual([]);
+  } finally {
+    stop?.();
+    finishLookup({ id: "chat", type: "direct", members: [] } as never);
+    await sending;
+  }
+});
+
+it("repairs an older stuck manual-retry row without an error and releases later messages", async () => {
+  await seed({ status: "sending", retryable: false, error: null });
+  await queueText("second", 2);
+  vi.mocked(prepareDirectPayloadFanout).mockImplementation(async (_conversation, id) => ({ ...body, messages: [{ ...body.messages[0], id }] }) as never);
+  const stop = startOutgoingQueue();
+  try {
+    await vi.waitFor(async () => expect(await getMessageById("second")).toMatchObject({ status: "sent" }));
+    expect(await getOutgoing("message")).toMatchObject({ status: "failed", retryable: false, error: "messageNotSent" });
+    expect(await getMessageById("message")).toMatchObject({ status: "failed" });
+    await discardOutgoing("message");
+    expect(await getAllOutgoing()).toEqual([]);
+  } finally { stop(); }
 });
 
 it("turns a file whose encryption was interrupted by reload into a visible failed send", async () => {
@@ -412,6 +697,7 @@ it("F3: retains uploaded ciphertext through a lost send response and renews an e
   await saveOutgoing(restored);
   await retryOutgoing("message");
   expect(vi.mocked(api.put).mock.calls.map(([path]) => path)).toEqual(["/old-upload", "/new-upload"]);
+  expect(api.post).toHaveBeenCalledWith("/api/files/upload-url", { conversationId: "chat", mimeType: "image/png", sizeBytes: bytes.length });
   for (const [, buffer] of vi.mocked(api.put).mock.calls) expect(new Uint8Array(buffer as ArrayBuffer)).toEqual(bytes);
   expect(await getOutgoing("message")).toBeUndefined();
   expect(JSON.parse((await getMessageById("message"))!.content).fileId).toBe("new-file");
@@ -425,6 +711,7 @@ it("F3: renews a reservation when a resumed PUT returns 404", async () => {
   await retryOutgoing("message");
   expect(await getOutgoing("message")).toBeUndefined();
   expect(api.put).toHaveBeenCalledWith("/renewed", new Uint8Array([4, 5]).buffer);
+  expect(api.post).toHaveBeenCalledWith("/api/files/upload-url", { conversationId: "chat", mimeType: "image/png", sizeBytes: 2 });
 });
 
 it("F4: discard waits on the same conversation lock as a retry in another tab", async () => {

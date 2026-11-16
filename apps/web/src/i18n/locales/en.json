@@ -436,6 +436,7 @@
   "callSetupFailed": "Call setup failed",
   "couldNotRespondToCall": "Could not respond to call",
   "fileEncryptionWasInterruptedAttachTheFileAgain": "File encryption was interrupted. Attach the file again.",
+  "fileCouldNotBeUploaded": "This file couldn't be uploaded",
   "today": "Today",
   "yesterday": "Yesterday",
   "photoMessagePreview": "Photo",
@@ -695,5 +696,11 @@
   "privacySaved": "Privacy settings saved",
   "privacySaveFailed": "Could not save privacy settings. Try again.",
   "privacyLoadFailed": "Could not load privacy settings. Try again.",
-  "personCannotBeAdded": "This person can't be added"
+  "personCannotBeAdded": "This person can't be added",
+  "webPush.allowClosed": "Allow notifications when the app is closed",
+  "webPush.privacy": "Notifications show no names or message content. Locking or signing out turns these notifications off.",
+  "webPush.iosHint": "On iPhone or iPad, add Private Base to your Home Screen, then open it there to enable notifications.",
+  "webPush.error": "Could not change notifications. Check browser permission and your connection, then try again.",
+  "webPush.newMessage": "New message",
+  "webPush.incomingCall": "Incoming call"
 }

@@ -436,6 +436,7 @@
   "callSetupFailed": "Falha na configuração da chamada",
   "couldNotRespondToCall": "Não foi possível responder à chamada",
   "fileEncryptionWasInterruptedAttachTheFileAgain": "A criptografia do arquivo foi interrompida. Anexe o arquivo novamente.",
+  "fileCouldNotBeUploaded": "Não foi possível enviar este arquivo",
   "today": "Hoje",
   "yesterday": "Ontem",
   "photoMessagePreview": "Foto",
@@ -695,5 +696,11 @@
   "privacySaved": "Configurações de privacidade salvas",
   "privacySaveFailed": "Não foi possível salvar as configurações de privacidade. Tente novamente.",
   "privacyLoadFailed": "Não foi possível carregar as configurações de privacidade. Tente novamente.",
-  "personCannotBeAdded": "Não é possível adicionar esta pessoa"
+  "personCannotBeAdded": "Não é possível adicionar esta pessoa",
+  "webPush.allowClosed": "Permitir notificações com o aplicativo fechado",
+  "webPush.privacy": "As notificações não mostram nomes nem conteúdo das mensagens. Elas são desativadas ao bloquear o aplicativo ou sair da conta.",
+  "webPush.iosHint": "No iPhone ou iPad, adicione o Private Base à tela de início e abra-o por lá para ativar as notificações.",
+  "webPush.error": "Não foi possível alterar as notificações. Verifique a permissão do navegador e a conexão e tente novamente.",
+  "webPush.newMessage": "Nova mensagem",
+  "webPush.incomingCall": "Chamada recebida"
 }

@@ -479,6 +479,8 @@ export interface OutgoingStep {
   body: SendMessageRequest | SendDirectBatchRequest;
   distributed?: { senderDeviceId: string; senderKeyId: number; recipientDeviceIds: string[] };
   completed?: boolean;
+  /** Persisted before this step's POST, independently of other envelopes in the row. */
+  sendDispatched?: boolean;
 }
 export interface LocalOutgoing {
   id: string;
@@ -493,6 +495,8 @@ export interface LocalOutgoing {
   fileId?: string;
   upload?: { bytes: Uint8Array; mimeType: string; uploadUrl?: string; uploaded?: boolean };
   steps: OutgoingStep[];
+  /** Dispatch of this message's ciphertext, excluding sender-key distributions. */
+  sendDispatched?: boolean;
   attempts: number;
   status: "sending" | "failed";
   retryable: boolean;

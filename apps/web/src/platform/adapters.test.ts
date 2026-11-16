@@ -174,15 +174,15 @@ describe("notifications", () => {
     expect(native.sendNotification).not.toHaveBeenCalled();
   });
 
-  it("requests web permission, respects denial and handles an absent API", async () => {
+  it("does not prompt passively, respects denial and handles an absent API", async () => {
     const { notify } = await import("./notifications.js");
     WebNotification.permission = "default";
     WebNotification.requestPermission.mockResolvedValue("denied");
     expect(await notify({ title: "New message" })).toBe(false);
-    expect(WebNotification.requestPermission).toHaveBeenCalledTimes(1);
+    expect(WebNotification.requestPermission).not.toHaveBeenCalled();
     WebNotification.permission = "denied";
     expect(await notify({ title: "New message" })).toBe(false);
-    expect(WebNotification.requestPermission).toHaveBeenCalledTimes(1);
+    expect(WebNotification.requestPermission).not.toHaveBeenCalled();
     vi.stubGlobal("Notification", undefined);
     expect(await notify({ title: "New message" })).toBe(false);
     expect(WebNotification.instances).toHaveLength(0);
@@ -250,22 +250,22 @@ describe("notifications", () => {
     expect(native.sendNotification).toHaveBeenCalledTimes(1);
   });
 
-  it("prompts passively only once per session after a dismissed web prompt", async () => {
+  it("prompts on web only from explicit user requests", async () => {
     const { showMessageNotification, requestNotificationPermission } = await import("../lib/browser-notifications.js");
     const { notify } = await import("./notifications.js");
     WebNotification.permission = "default";
     WebNotification.requestPermission.mockResolvedValue("default");
-    // Two messages arriving together and a later one share a single prompt.
+    // Background message notifications cannot initiate a browser permission prompt.
     showMessageNotification("Alice", "chat-1");
     showMessageNotification("Bob", "chat-2");
     expect(await notify({ title: "Later message" })).toBe(false);
-    expect(WebNotification.requestPermission).toHaveBeenCalledTimes(1);
+    expect(WebNotification.requestPermission).not.toHaveBeenCalled();
     expect(WebNotification.instances).toHaveLength(0);
-    // An explicit request may ask again, without re-arming the passive prompt.
+    // The settings gesture may request permission.
     expect(await requestNotificationPermission()).toBe(false);
-    expect(WebNotification.requestPermission).toHaveBeenCalledTimes(2);
+    expect(WebNotification.requestPermission).toHaveBeenCalledTimes(1);
     expect(await notify({ title: "Still dismissed" })).toBe(false);
-    expect(WebNotification.requestPermission).toHaveBeenCalledTimes(2);
+    expect(WebNotification.requestPermission).toHaveBeenCalledTimes(1);
     // Once permission is granted, notifications are shown.
     WebNotification.permission = "granted";
     expect(await notify({ title: "Granted" })).toBe(true);

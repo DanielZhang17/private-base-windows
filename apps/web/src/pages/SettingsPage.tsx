@@ -47,6 +47,17 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
     <div className="min-h-0 grow overflow-y-auto pb-safe">
       <div className="mx-auto max-w-2xl space-y-7 p-4 sm:p-6">
 
+        {s.section === "notifications" && s.webPush?.visible && <>
+          {s.webPush.supported && <label className="flex min-h-11 cursor-pointer items-center gap-3 text-sm">
+            <input type="checkbox" role="switch" className="toggle" checked={s.webPush.enabled}
+              disabled={s.webPush.busy} onChange={(event) => { void s.webPush.toggle(event.target.checked); }} />
+            {t("webPush.allowClosed")}
+          </label>}
+          <p className="text-sm text-ink-muted">{t("webPush.privacy")}</p>
+          {s.webPush.iosHint && <Notice tone="info">{t("webPush.iosHint")}</Notice>}
+          {s.webPush.error && <Notice tone="danger">{t("webPush.error")}</Notice>}
+        </>}
+
         {s.section === "notifications" && s.background.supported && <>
           <label className="flex min-h-11 cursor-pointer items-center gap-3 text-sm">
             <input type="checkbox" role="switch" className="toggle" checked={s.background.enabled}
