@@ -12,13 +12,13 @@ class FakeSocket {
   static instances: FakeSocket[] = [];
   readyState = FakeSocket.CONNECTING;
   onopen?: () => void;
-  onclose?: () => void;
+  onclose?: (event: { code: number }) => void;
   onerror?: () => void;
   onmessage?: (event: { data: string }) => void;
   send = vi.fn();
   constructor(public url: string, public protocols: string[]) { FakeSocket.instances.push(this); }
   open() { this.readyState = FakeSocket.OPEN; this.onopen?.(); }
-  close() { this.readyState = 3; this.onclose?.(); }
+  close(code = 1000) { this.readyState = 3; this.onclose?.({ code }); }
 }
 const callbacks = () => ({ onCallEvent: vi.fn(), onConversationEvent: vi.fn(), onMessageEvent: vi.fn(), onProfileEvent: vi.fn() });
 const latest = () => FakeSocket.instances[FakeSocket.instances.length - 1];
@@ -114,4 +114,17 @@ describe("notification reconnects", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(FakeSocket.instances).toHaveLength(3);
   });
+});
+
+it.each([false, true])("stops reconnecting on 4403 (opened=%s)", async (opened) => {
+  const options = { ...callbacks(), onClose: vi.fn() };
+  const socket = createNotificationWebSocket(options);
+  if (opened) latest().open();
+  latest().close(4403);
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(FakeSocket.instances).toHaveLength(1);
+  expect(options.onClose).toHaveBeenCalledOnce();
+  expect(api.get).not.toHaveBeenCalled();
+  expect(vi.getTimerCount()).toBe(0);
+  socket.dispose();
 });

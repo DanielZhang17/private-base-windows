@@ -3,7 +3,7 @@ import { expect, it } from "vitest";
 import ts from "typescript";
 // Append each workstream's views here. Tests may import their test infrastructure.
 const views = import.meta.glob([
-  "./SettingsPage.tsx", "./DeviceLinkPage.tsx", "./VerifyPage.tsx",
+  "./SettingsPage.tsx", "./DeviceLinkPage.tsx", "./VerifyPage.tsx", "./ClientsPage.tsx",
   "../components/avatar/AvatarPicker.tsx",
 ], { query: "?raw", import: "default", eager: true });
 it.each(Object.entries(views))("%s keeps application logic behind features", (file, source) => {

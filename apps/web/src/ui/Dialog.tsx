@@ -1,17 +1,20 @@
 import { t, useLocale } from "../i18n/index.js";
-import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Button, IconButton } from "./Button.js";
 import { cx } from "./cx.js";
 import { Icon } from "./Icon.js";
 import type { IconName } from "./icons/paths.js";
 import { useModalFocus } from "./useModalFocus.js";
 import { Portal } from "./Portal.js";
+import { OVERLAY_RANK, registerOverlay } from "./overlay-stack.js";
 
 interface OverlayProps {
   open: boolean;
   /** Called on Esc, scrim click and the close button. Not called while `dismissible` is false. */
   onClose: () => void;
   title: ReactNode;
+  ariaLabel?: string;
+  closeButtonSize?: "sm" | "md";
   description?: ReactNode;
   /** When false, Esc and the scrim do nothing and no close button is shown: the user must pick an action. */
   dismissible?: boolean;
@@ -32,6 +35,8 @@ function Overlay({
   open,
   onClose,
   title,
+  ariaLabel,
+  closeButtonSize = "sm",
   description,
   dismissible = true,
   initialFocusRef,
@@ -47,6 +52,7 @@ function Overlay({
   const panelRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
 
+  useLayoutEffect(() => open ? registerOverlay({ kind: "modal", rank: OVERLAY_RANK.dialog }) : undefined, [open]);
   useModalFocus({ open, onClose, dismissible, panelRef, bodyRef, initialFocusRef });
 
   if (!open) return null;
@@ -68,7 +74,8 @@ function Overlay({
         ref={panelRef}
         role={role}
         aria-modal="true"
-        aria-labelledby={titleId}
+        aria-label={ariaLabel}
+        aria-labelledby={ariaLabel ? undefined : titleId}
         aria-describedby={description ? descriptionId : undefined}
         tabIndex={-1}
         className={cx(
@@ -85,7 +92,7 @@ function Overlay({
             {description && <p id={descriptionId} className="mt-1 text-ink-muted">{description}</p>}
           </div>
           {dismissible && (
-            <IconButton icon="close" label={t("close")} size="sm" onClick={onClose} data-overlay-close="" className="-me-2 -mt-1" />
+            <IconButton icon="close" label={t("close")} size={closeButtonSize} onClick={onClose} data-overlay-close="" className="-me-2 -mt-1" />
           )}
         </div>
         {children && <div ref={bodyRef} className="grow min-h-0 overflow-y-auto px-5 py-2">{children}</div>}

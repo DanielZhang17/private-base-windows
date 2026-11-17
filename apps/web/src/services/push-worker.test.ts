@@ -71,6 +71,22 @@ it("skips passkey handoff tabs, which cannot route push-open", async () => {
   await dispatch("notificationclick", { notification: { close: vi.fn(), data: { url: "/?push=message" } } });
   expect(worker.clients.openWindow).toHaveBeenCalledWith("/");
 });
+it.each(["/clients", "/clients/", "/clients/ios?platform=ios"])("skips download tabs at %s, which cannot route push-open", async (path) => {
+  const downloads = { url: `https://chat.example.com${path}`, focus: vi.fn(), postMessage: vi.fn() };
+  const app = { url: "https://chat.example.com/chat/c1", focus: vi.fn(), postMessage: vi.fn() };
+  worker.clients.matchAll.mockResolvedValue([downloads, app]);
+  await dispatch("notificationclick", { notification: { close: vi.fn(), data: { url: "/?push=message" } } });
+  expect(downloads.focus).not.toHaveBeenCalled();
+  expect(downloads.postMessage).not.toHaveBeenCalled();
+  expect(app.focus).toHaveBeenCalled();
+  expect(app.postMessage).toHaveBeenCalledWith({ type: "push-open", destination: "/?push=message" });
+  expect(worker.clients.openWindow).not.toHaveBeenCalled();
+  worker.clients.matchAll.mockResolvedValue([downloads]);
+  await dispatch("notificationclick", { notification: { close: vi.fn(), data: { url: "/?push=message" } } });
+  expect(downloads.focus).not.toHaveBeenCalled();
+  expect(downloads.postMessage).not.toHaveBeenCalled();
+  expect(worker.clients.openWindow).toHaveBeenCalledWith("/");
+});
 it("rejects external click targets and opens a fresh same-origin window", async () => {
   await dispatch("notificationclick", { notification: { close: vi.fn(), data: { url: "https://evil.example.com" } } });
   expect(worker.clients.openWindow).toHaveBeenCalledWith("/");

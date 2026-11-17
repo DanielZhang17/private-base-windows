@@ -301,6 +301,11 @@ pub(super) mod windows {
                     }
                 });
                 // Never replay get_current(): a cold-start callback is unsolicited.
+                // Remove decrypted Open copies before any frontend can run.
+                app.manage(
+                    crate::files::OpenCache::initialize(app.path().app_cache_dir()?)
+                        .map_err(|_| UNSUPPORTED)?,
+                );
                 // The Windows overlay defers creation so support is known before JS.
                 let capture_protection = crate::capture_protection::CaptureProtection::load(
                     app.path().app_config_dir()?.join("capture-protection.json"),

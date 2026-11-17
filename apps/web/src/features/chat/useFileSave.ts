@@ -5,14 +5,13 @@ import { saveFile, SaveUnsupportedError } from "../../platform/files.js";
 export function useFileSave() {
   const [saveError, setSaveError] = useState<SaveUnsupportedError | null>(null);
 
-  const handleSave = async (blob: Blob, filename: string): Promise<void> => {
+  const handleSave = async (blob: Blob, filename: string) => {
     setSaveError(null);
     try {
-      await saveFile(blob, filename);
+      return await saveFile(blob, filename);
     } catch (error) {
       if (error instanceof SaveUnsupportedError) {
         setSaveError(error);
-        return;
       }
       throw error;
     }

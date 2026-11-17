@@ -29,6 +29,11 @@ class FileUrlResolver {
     const batch = this.queue.splice(0, 100);
     if (batch.length === 0) return;
 
+    // If more items remain after this batch, schedule another pass immediately.
+    if (this.queue.length > 0 && !this.flushTimer) {
+      this.flushTimer = setTimeout(() => this.flush(), 0);
+    }
+
     try {
       const { urls } = await api.post<{ urls: Record<string, ResolvedFileUrl | null> }>("/api/files/batch-download-urls", {
         fileIds: batch.map(b => b.fileId)

@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-updater",
+  "description": "Local desktop main window: checked updates and download progress through native wrappers.",
+  "windows": ["main"],
+  "platforms": ["macOS", "windows", "linux"],
+  "permissions": [
+    "allow-update-check",
+    "allow-update-download",
+    "allow-update-install",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

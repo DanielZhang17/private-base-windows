@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
 import { afterAll, describe, expect, it } from "vitest";
 import { pnpmCommand } from "./pnpm.mjs";
 
@@ -160,6 +161,7 @@ describe("native workspace wiring", () => {
     expect(capability.remote).toBeUndefined();
     expect(capability.platforms).toBeUndefined();
     expect(capability.permissions).toEqual([
+      "core:app:allow-version",
       "notification:allow-is-permission-granted",
       "notification:allow-request-permission",
       "notification:allow-notify",
@@ -198,8 +200,61 @@ describe("native workspace wiring", () => {
     expect(permission).toContain('commands.allow = ["passkey_handoff_start"]');
   });
 
-  it("allows only the exact avatar image sources in the CSP", () => {
+  it("restricts updater wrappers and progress listeners to the local desktop main window", () => {
+    const capability = JSON.parse(read("../src-tauri/capabilities/updater.json"));
+    expect(capability.windows).toEqual(["main"]);
+    expect(capability.remote).toBeUndefined();
+    expect(capability.platforms).toEqual(["macOS", "windows", "linux"]);
+    expect(capability.permissions).toEqual([
+      "allow-update-check",
+      "allow-update-download",
+      "allow-update-install",
+      "core:event:allow-listen",
+      "core:event:allow-unlisten",
+    ]);
     const config = JSON.parse(read("../src-tauri/tauri.conf.json"));
+    expect(config.plugins.updater.endpoints).toBeUndefined();
+    expect(config.plugins.updater.windows.installMode).toBe("passive");
+    expect(config.plugins.updater.requireSignedVersion).toBe(true);
+    expect(config.bundle.createUpdaterArtifacts).toBe(true);
+  });
+
+  it("merges the desktop update capability before application JavaScript runs", () => {
+    const window = { __PRIVATEBASE_NATIVE_CAPABILITIES__: { passkeyHandoff: true } };
+    const script = read("../src-tauri/src/update-capability.js");
+    runInNewContext(script, { window });
+    expect(window.__PRIVATEBASE_NATIVE_CAPABILITIES__).toEqual({
+      passkeyHandoff: true, autoUpdate: "desktop",
+    });
+    const freshWindow = {};
+    runInNewContext(script, { window: freshWindow });
+    expect(freshWindow.__PRIVATEBASE_NATIVE_CAPABILITIES__).toEqual({ autoUpdate: "desktop" });
+  });
+
+  it("preserves native capabilities in either Windows/updater initialization order", () => {
+    const source = read("../src-tauri/src/lib.rs");
+    const template = source.match(/"(window\.__PRIVATEBASE_NATIVE_CAPABILITIES__ = Object\.assign[^\n]+)"/)[1];
+    const updateScript = read("../src-tauri/src/update-capability.js");
+    for (const passkeyHandoff of [false, true]) {
+      const capabilities = { captureProtection: "full", fileOpen: true, fileSave: "dialog" };
+      if (passkeyHandoff) capabilities.passkeyHandoff = true;
+      const windowsScript = template.replace("{{}}", "{}").replace("{capabilities}", JSON.stringify(capabilities));
+      for (const scripts of [[windowsScript, updateScript], [updateScript, windowsScript]]) {
+        const existing = { backgroundConnection: true, nativeCallNotifications: true, otherCapability: "kept" };
+        const window = { __PRIVATEBASE_NATIVE_CAPABILITIES__: { ...existing } };
+        for (const script of scripts) runInNewContext(script, { window });
+        expect(window.__PRIVATEBASE_NATIVE_CAPABILITIES__).toEqual({
+          ...existing, ...capabilities, autoUpdate: "desktop",
+        });
+      }
+    }
+  });
+
+  it("allows only the exact connection and avatar image sources in the CSP", () => {
+    const config = JSON.parse(read("../src-tauri/tauri.conf.json"));
+    expect(config.app.security.csp["connect-src"]).toBe(
+      "'self' ipc: http://ipc.localhost https://chat.718788.xyz wss://chat.718788.xyz https://chat-api.718788.xyz wss://chat-api.718788.xyz https://dist.718788.xyz http://localhost:8787 ws://localhost:8787",
+    );
     expect(config.app.security.csp["img-src"]).toBe(
       "'self' blob: data: https://chat.718788.xyz https://chat-api.718788.xyz https://genshin.jmp.blue https://api.dicebear.com",
     );
@@ -228,10 +283,11 @@ describe("native workspace wiring", () => {
     expect(rootPackage.scripts["native:dev"]).toBe("pnpm --filter @e2ee-chat/native dev:native");
   });
 
-  it("never caches the native build, orders it after the web build and forwards the API override", () => {
+  it("never caches the native build, preserves build order and passes signing env outside the hash", () => {
     expect(turbo.tasks["@e2ee-chat/native#build"]).toEqual({
       dependsOn: ["@e2ee-chat/web#build"],
       env: ["VITE_API_BASE_URL"],
+      passThroughEnv: ["TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"],
       cache: false,
     });
   });

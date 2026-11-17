@@ -31,10 +31,12 @@ self.addEventListener("notificationclick", (event) => {
     const safe = path === "/?push=message" || /^\/call\/[A-Za-z0-9_-]{1,128}\?push=call$/.test(path);
     const destination = safe ? path : "/";
     const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    // Passkey handoff pages mount without the app router, so they cannot take push-open.
+    // Passkey handoff and download pages mount without the app router, so they cannot take push-open.
     const existing = windows.find((client) => {
       const url = new URL(client.url);
-      return url.origin === self.location.origin && !url.pathname.startsWith("/native/passkey/");
+      return url.origin === self.location.origin
+        && !url.pathname.startsWith("/native/passkey/")
+        && url.pathname !== "/clients" && !url.pathname.startsWith("/clients/");
     });
     if (existing) {
       await existing.focus();

@@ -110,7 +110,7 @@ describe("saving files", () => {
     let downloaded: HTMLAnchorElement | undefined;
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) { downloaded = this; });
     const { saveFile } = await import("./index.js");
-    await saveFile(blob, "file.txt");
+    await expect(saveFile(blob, "file.txt")).resolves.toBeUndefined();
     expect(createObjectURL).toHaveBeenCalledExactlyOnceWith(blob);
     expect(downloaded?.download).toBe("file.txt");
     expect(downloaded?.href).toBe("blob:test");
@@ -127,7 +127,7 @@ describe("saving files", () => {
     const bytes = new Uint8Array([1, 2, 3]);
     const blob = { arrayBuffer: async () => bytes.buffer } as Blob;
     const { saveFile } = await import("./index.js");
-    await saveFile(blob, "file.bin");
+    await expect(saveFile(blob, "file.bin")).resolves.toBe("saved");
     expect(native.save).toHaveBeenCalledExactlyOnceWith({ defaultPath: "file.bin" });
     expect(native.writeFile).toHaveBeenCalledExactlyOnceWith("/chosen/file.bin", bytes);
     native.writeFile.mockRejectedValue(new Error("Disk full"));
@@ -139,7 +139,7 @@ describe("saving files", () => {
     native.save.mockResolvedValue(null);
     const arrayBuffer = vi.fn();
     const { saveFile } = await import("./files.js");
-    await saveFile({ arrayBuffer } as unknown as Blob, "file.bin");
+    await expect(saveFile({ arrayBuffer } as unknown as Blob, "file.bin")).resolves.toBe("cancelled");
     expect(arrayBuffer).not.toHaveBeenCalled();
     expect(native.writeFile).not.toHaveBeenCalled();
   });

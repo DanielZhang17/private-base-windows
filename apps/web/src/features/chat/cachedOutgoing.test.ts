@@ -36,9 +36,10 @@ it.each(["sending", "failed"] as const)("R3-F4: restores an overdue queued timed
 it("R3-F4: keeps the queued-expiry exception when loading older cached history", async () => {
   await queue("failed");
   const recent = { id: "recent", conversationId: "chat", senderId: "alice", type: "text" as const, content: "recent", timestamp: Date.now(), expiresAt: Date.now() + 60000, expiryKind: "timed" as const, status: "sent" as const };
-  await saveMessage(recent);
-  useChatStore.getState().setMessages("chat", [recent]);
+  const recentIds = Array.from({ length: 100 }, (_, index) => `recent-${String(index).padStart(3, "0")}`);
+  await Promise.all(recentIds.map((id, index) => saveMessage({ ...recent, id, timestamp: recent.timestamp + index })));
+  await loadPersistedConversationMessages("chat");
   const page = await loadOlderPersistedConversationMessages("chat");
   expect(page.loadedCount).toBe(1);
-  expect(useChatStore.getState().messages.get("chat")?.map((message) => message.id)).toEqual(["queued", "recent"]);
+  expect(useChatStore.getState().messages.get("chat")?.map((message) => message.id)).toEqual(["queued", ...recentIds]);
 });

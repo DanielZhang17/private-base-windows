@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "allow-open-file"
+description = "Opens supplied bytes through a document association using only the private Open cache."
+commands.allow = ["open_file"]
+
+[[permission]]
+identifier = "allow-save-file"
+description = "Saves supplied bytes only to the destination selected in the native save dialog."
+commands.allow = ["save_file"]
+
+[[permission]]
+identifier = "allow-clear-open-cache"
+description = "Deletes decrypted copies in the application's dedicated Open cache."
+commands.allow = ["clear_open_cache"]

@@ -23,6 +23,8 @@ export interface Message {
 }
 
 export interface DecryptedMessage {
+  deletedAt?: number | null;
+  deletedByUserId?: string | null;
   id: string;
   conversationId: string;
   senderId: string;

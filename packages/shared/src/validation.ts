@@ -143,8 +143,13 @@ export const enrollRecoveryKeySchema = z.object({
   recoveryKey,
 });
 
+// UUID producers use the same delimiter-free alphabet; retain legacy opaque tokens.
+// A colon is reserved exclusively for <family>:<recipient-device> fanout envelopes.
+const familyMessageId = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+const fanoutEnvelopeId = z.string().regex(/^[A-Za-z0-9_-]{1,128}(?::[A-Za-z0-9_-]{1,128})?$/);
+
 export const sendMessageSchema = z.object({
-  id: z.string(),
+  id: familyMessageId,
   conversationId: z.string(),
   type: z.enum(["text", "file", "key_exchange", "sender_key_distribution", "system"]),
   ciphertext: z.string(),
@@ -169,13 +174,24 @@ export const sendDirectBatchSchema = z.object({
   fileId: z.string().trim().min(1).nullable().optional(),
   messages: z.array(
     z.object({
-      id: z.string(),
+      id: fanoutEnvelopeId,
       ciphertext: z.string(),
       iv: base64url,
       header: z.string(),
     }),
   ).min(1).max(64),
 }).superRefine((value, ctx) => {
+  const root = value.messages[0].id;
+  for (const [index, message] of value.messages.entries()) {
+    let recipient: unknown;
+    try { recipient = JSON.parse(message.header).recipientDeviceId; } catch { /* Route rejects invalid headers. */ }
+    const valid = value.type === "sender_key_distribution"
+      ? familyMessageId.safeParse(message.id).success
+      : index === 0 ? familyMessageId.safeParse(root).success
+        : message.id === `${root}:${recipient}` && typeof recipient === "string";
+    if (!valid) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Invalid fanout message id", path: ["messages", index, "id"] });
+  }
+
   if (value.type !== "file" && value.fileId) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,

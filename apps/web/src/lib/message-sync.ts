@@ -3,6 +3,7 @@ import type {
   DecryptedMessage,
   SenderKeyHeader,
   WSMessageFrame,
+  MessageEventPayload,
 } from "@e2ee-chat/shared";
 import { CALL_KEY_RECOVERY_TTL_MS } from "@e2ee-chat/shared";
 import { api } from "../services/api.js";
@@ -12,6 +13,14 @@ import {
   cleanupExpiredPendingCalls,
   getLatestCachedMessageTimestamp,
   getMessageById,
+  guardMessageForPublish,
+  getMessageFamily,
+  beginMessageHide,
+  finishMessageHide,
+  isMessageHidden,
+  getMessageDeletion,
+  rememberMessageDeletion,
+  removeLocalMessageContent,
   getSyncState,
   saveMessage,
   getPendingCall,
@@ -22,7 +31,9 @@ import {
   getSenderKey,
   type ReceiveEffects,
   saveSyncState,
+  advanceMutationCursor,
   type LocalMessage,
+  type CachedMessageCursor,
 } from "../db/index.js";
 import { normalizeExpiryMetadata } from "./message-retention.js";
 import { useAuthStore } from "../stores/authStore.js";
@@ -37,6 +48,7 @@ import { decryptGroupText, decryptMessage, type IncomingMessage } from "./messag
 import { classifyReceiveError, ConversationMetadataError, MissingSenderKeyError, withSessionLock, type ReceiveContext, type ReceiveState } from "./receive.js";
 import { parseCallOffer, validateFilePayload } from "./receive-validation.js";
 import { consumeOneTimePreKey } from "./key-manager.js";
+import { connectLocalMessageChannel, getConversationHideGeneration } from "./local-message-changes.js";
 import { capabilities } from "../platform/capabilities.js";
 
 const conversationCache = new Map<string, ConversationWithMembers>();
@@ -57,6 +69,9 @@ interface SyncCursor {
 interface SyncResponse {
   messages: WSMessageFrame[];
   hasMore: boolean;
+  mutations?: (WSMessageFrame & { mutationSeq: number })[];
+  hasMoreMutations?: boolean;
+  mutationCursor?: number;
 }
 
 interface PersistedConversationLoadResult {
@@ -113,6 +128,8 @@ function toLocalMessage(message: DecryptedMessage): LocalMessage {
     expiresAt: message.expiresAt,
     expiryKind: message.expiryKind,
     status: message.status,
+    deletedAt: message.deletedAt,
+    deletedByUserId: message.deletedByUserId,
   };
 }
 
@@ -220,8 +237,11 @@ async function mergeExistingMessage(frame: WSMessageFrame, session: MessageSessi
     || merged.expiresAt !== existing.expiresAt
     || merged.expiryKind !== existing.expiryKind;
   // A message known only from IndexedDB is still shown; an identical one in the store is left alone.
-  if (changed || !inStore) useChatStore.getState().addMessage(frame.conversationId, merged);
-  return { message: merged, changed };
+  const visible = await guardMessageForPublish(merged);
+  if (!isCurrentSession(session)) return null;
+  if (!visible) { useChatStore.getState().removeMessages([frame.id]); return { message: merged, changed: false }; }
+  if (changed || !inStore || visible.deletedAt !== merged.deletedAt) useChatStore.getState().addMessage(frame.conversationId, visible);
+  return { message: visible, changed: changed || visible.deletedAt !== merged.deletedAt };
 }
 
 /** Re-read durable output when another tab wins either dedupe check or the commit. */
@@ -331,8 +351,30 @@ function terminalEffects(frame: WSMessageFrame): ReceiveEffects {
 
 async function ingestFrame(frame: WSMessageFrame, session: MessageSession, lockKey: string, drainOlder = true): Promise<void> {
   if (!isCurrentSession(session) || (frame.expiresAt !== null && frame.expiresAt <= Date.now())) return;
+  if (await isMessageHidden(frame.id)) {
+    if (frame.deletedAt) await applyMessageDeletion(receivedMessage(frame, ""), frame.deletedAt, frame.deletedByUserId ?? frame.senderId, session);
+    useChatStore.getState().removeMessages([frame.id]); return;
+  }
   const { user, device } = useAuthStore.getState();
   const isLocalEcho = frame.senderId === user?.id && frame.senderDeviceId === device?.id && frame.msgType !== "system";
+  const savedDeletion = await getMessageDeletion(frame.id);
+  const deletion = savedDeletion?.conversationId === frame.conversationId && (savedDeletion.senderId ?? savedDeletion.deletedByUserId) === frame.senderId ? savedDeletion : undefined;
+  if (frame.deletedAt || deletion) {
+    const conversation = await getConversation(frame.conversationId);
+    const rootId = conversation.type === "direct" ? frame.id.split(":")[0] : frame.id;
+    const family = await getMessageFamily(rootId, frame.conversationId, frame.senderId);
+    const exact = family.find((message) => message.id === rootId);
+    const candidate = exact ?? (conversation.type === "direct" ? family[0] : undefined);
+    const existing = candidate?.senderId === frame.senderId && candidate.conversationId === frame.conversationId ? candidate : undefined;
+    if (!isCurrentSession(session)) return;
+    // Dedupe is keyed by envelope ID even when the display uses the logical ID.
+    if (!await rememberMessageDeletion(frame.id, frame.conversationId, frame.deletedAt ?? deletion!.deletedAt, frame.deletedByUserId ?? deletion?.deletedByUserId ?? frame.senderId, frame.senderId, () => isCurrentSession(session))) return;
+    // Sender sync returns every fanout envelope. Unknown local echoes never create display rows.
+    if (!existing && isLocalEcho) return;
+    const display = existing ? normalizeStoredMessage(existing, Date.now()) : receivedMessage(frame, "");
+    if (display) await applyMessageDeletion(display, frame.deletedAt ?? deletion!.deletedAt, frame.deletedByUserId ?? deletion?.deletedByUserId ?? frame.senderId, session);
+    return;
+  }
   let staged: ReceiveState = {};
   try {
     if (await restoreCommittedFrame(frame, session, isLocalEcho) || !isCurrentSession(session)) return;
@@ -404,6 +446,8 @@ async function executeSync(session: MessageSession, options?: {
   if (!isCurrentSession(session)) return;
   const syncStateId = getSyncStateId();
   let cursor = await resolveSyncCursor(options?.since);
+  const mutationStateId = session.userId && session.deviceId ? `message-mutations:${session.userId}:${session.deviceId}` : null;
+  let mutationCursor = !options?.conversationId && mutationStateId ? (await getSyncState(mutationStateId))?.value ?? 0 : 0;
 
   while (isCurrentSession(session)) {
     const params = new URLSearchParams();
@@ -411,9 +455,20 @@ async function executeSync(session: MessageSession, options?: {
     params.set("since", String(cursor.ts));
     if (cursor.id !== undefined) params.set("sinceId", cursor.id);
     params.set("limit", String(SYNC_BATCH_SIZE));
+    params.set("mutationSince", String(mutationCursor));
 
     const response = await api.get<SyncResponse>(`/api/messages/sync?${params.toString()}`);
-    if (!isCurrentSession(session) || response.messages.length === 0) return;
+    if (!isCurrentSession(session)) return;
+    for (const mutation of response.mutations ?? []) {
+      if (!isCurrentSession(session)) return;
+      await ingestMessageFrame(mutation);
+      mutationCursor = mutation.mutationSeq;
+    }
+    if (!isCurrentSession(session)) return;
+    mutationCursor = Math.max(mutationCursor, response.mutationCursor ?? 0);
+    if (!options?.conversationId && mutationStateId && (response.mutations?.length || response.mutationCursor !== undefined)) {
+      await advanceMutationCursor(mutationStateId, mutationCursor);
+    }
 
     for (const frame of response.messages) {
       if (!isCurrentSession(session)) return;
@@ -422,14 +477,14 @@ async function executeSync(session: MessageSession, options?: {
     if (!isCurrentSession(session)) return;
 
     const lastFrame = response.messages[response.messages.length - 1];
-    cursor = { ts: getFrameTimestamp(lastFrame), id: lastFrame.id };
+    if (lastFrame) cursor = { ts: lastFrame.syncTimestamp ?? lastFrame.deletedAt ?? getFrameTimestamp(lastFrame), id: lastFrame.id };
 
     // Live frames and conversation-specific backfills never advance this cursor.
-    if (!options?.conversationId && syncStateId) {
+    if (lastFrame && !options?.conversationId && syncStateId) {
       await saveSyncState(syncStateId, cursor.ts, cursor.id);
     }
 
-    if (!response.hasMore) {
+    if ((!response.hasMore && !response.hasMoreMutations) || (!response.messages.length && !response.mutations?.length)) {
       return;
     }
   }
@@ -479,83 +534,39 @@ function normalizeStoredMessage(message: LocalMessage, now: number): DecryptedMe
     expiresAt,
     expiryKind,
     status: message.status as DecryptedMessage["status"],
+    deletedAt: message.deletedAt,
+    deletedByUserId: message.deletedByUserId,
   };
 }
 
-async function hasOlderCachedMessages(
-  conversationId: string,
-  oldestLoadedTimestamp: number | undefined,
-): Promise<boolean> {
-  if (!oldestLoadedTimestamp) return false;
-  const page = await getCachedConversationMessagesPage(conversationId, {
-    before: oldestLoadedTimestamp,
-    limit: 1,
-  });
-  return page.messages.length > 0;
-}
-
-export async function loadPersistedConversationMessages(
-  conversationId: string,
-): Promise<PersistedConversationLoadResult> {
-  const session = captureSession();
-  const existingBeforeLoad = useChatStore.getState().messages.get(conversationId);
-  if (existingBeforeLoad && existingBeforeLoad.length > 0) {
-    return {
-      loadedCount: 0,
-      hasOlder: await hasOlderCachedMessages(conversationId, existingBeforeLoad[0]?.timestamp),
-    };
-  }
-
-  const page = await getCachedConversationMessagesPage(conversationId, { limit: LOCAL_MESSAGES_PAGE_SIZE });
-  if (!isCurrentSession(session)) return { loadedCount: 0, hasOlder: false };
-  const existingAfterLoad = useChatStore.getState().messages.get(conversationId);
-  if (existingAfterLoad && existingAfterLoad.length > 0) {
-    return {
-      loadedCount: 0,
-      hasOlder: await hasOlderCachedMessages(conversationId, existingAfterLoad[0]?.timestamp),
-    };
-  }
-  const now = Date.now();
-  const messages = page.messages
-    .map((message) => normalizeStoredMessage(message, now))
-    .filter((message): message is DecryptedMessage => message !== null);
-
-  useChatStore.getState().setMessages(conversationId, messages);
-
-  return {
-    loadedCount: messages.length,
-    hasOlder: page.hasOlder,
-  };
-}
-
-export async function loadOlderPersistedConversationMessages(
-  conversationId: string,
-): Promise<PersistedConversationLoadResult> {
-  const session = captureSession();
-  const existing = useChatStore.getState().messages.get(conversationId) ?? [];
-  const oldestLoadedMessage = existing[0];
-  if (!oldestLoadedMessage) {
-    return { loadedCount: 0, hasOlder: false };
-  }
-
-  const page = await getCachedConversationMessagesPage(conversationId, {
-    before: oldestLoadedMessage.timestamp,
-    limit: LOCAL_MESSAGES_PAGE_SIZE,
-  });
-  if (!isCurrentSession(session)) return { loadedCount: 0, hasOlder: false };
-  const now = Date.now();
-  const messages = page.messages
-    .map((message) => normalizeStoredMessage(message, now))
-    .filter((message): message is DecryptedMessage => message !== null);
-
-  if (messages.length > 0) {
+// Only cached page reads extend this window. Mutation/live-injected entries do not.
+const historyWindows = new Map<string, { oldest?: CachedMessageCursor; hasOlder: boolean }>();
+async function publishCachedPage(conversationId: string, session: MessageSession, before?: CachedMessageCursor): Promise<PersistedConversationLoadResult> {
+  while (isCurrentSession(session)) {
+    const generation = getConversationHideGeneration(conversationId);
+    const page = await getCachedConversationMessagesPage(conversationId, { before, limit: LOCAL_MESSAGES_PAGE_SIZE });
+    if (!isCurrentSession(session)) return { loadedCount: 0, hasOlder: false };
+    // The page and all guards share one IDB snapshot. If a local/peer hide committed
+    // during that await, retry the snapshot; never publish its stale plaintext/keys.
+    if (generation !== getConversationHideGeneration(conversationId)) continue;
+    const now = Date.now();
+    const messages = page.messages.map((message) => normalizeStoredMessage(message, now))
+      .filter((message): message is DecryptedMessage => message !== null);
     useChatStore.getState().prependMessages(conversationId, messages);
+    historyWindows.set(conversationId, { oldest: page.oldestCursor ?? before, hasOlder: page.hasOlder });
+    return { loadedCount: messages.length, hasOlder: page.hasOlder };
   }
-
-  return {
-    loadedCount: messages.length,
-    hasOlder: page.hasOlder,
-  };
+  return { loadedCount: 0, hasOlder: false };
+}
+export async function loadPersistedConversationMessages(conversationId: string): Promise<PersistedConversationLoadResult> {
+  return publishCachedPage(conversationId, captureSession());
+}
+export async function loadOlderPersistedConversationMessages(conversationId: string): Promise<PersistedConversationLoadResult> {
+  const window = historyWindows.get(conversationId);
+  // A store populated only by mutations has no contiguous cache window yet.
+  if (!window) return loadPersistedConversationMessages(conversationId);
+  if (!window.hasOlder || !window.oldest) return { loadedCount: 0, hasOlder: false };
+  return publishCachedPage(conversationId, captureSession(), window.oldest);
 }
 
 export async function pruneExpiredPlaintext(now = Date.now()): Promise<void> {
@@ -580,4 +591,94 @@ export function resetMessageSyncState(): void {
   lastSyncStartedAt = 0;
   activeGlobalSync = null;
   conversationCache.clear();
+  historyWindows.clear();
+}
+
+async function applyMessageDeletion(message: DecryptedMessage, deletedAt: number, deletedByUserId: string, session: MessageSession) {
+  if (!isCurrentSession(session)) return;
+  const inStore = useChatStore.getState().messages.get(message.conversationId)?.find((row) => row.id === message.id);
+  if (inStore && (inStore.senderId !== message.senderId || inStore.conversationId !== message.conversationId)) return;
+  const tombstone: DecryptedMessage = { ...message, content: "", fileMetadata: undefined, deletedAt, deletedByUserId };
+  if (!await removeLocalMessageContent(message.id, toLocalMessage(tombstone), () => isCurrentSession(session))) return;
+  const visible = await guardMessageForPublish(tombstone);
+  if (visible && isCurrentSession(session)) useChatStore.getState().addMessage(message.conversationId, visible);
+}
+
+export async function handleMessageDeletion(payload: MessageEventPayload): Promise<void> {
+  const session = captureSession();
+  if (!payload.deletion) return;
+  const { ids, deletedAt, deletedByUserId } = payload.deletion;
+  for (const id of ids) {
+    // Finish any authenticated receive before clearing its output, preserving ratchet progress.
+    const previous = inFlightDecryptIds.get(id) ?? Promise.resolve();
+    const pending = previous.catch(() => undefined).then(async () => {
+      if (!isCurrentSession(session)) return;
+      const existing = await getMessageById(id);
+      if (!isCurrentSession(session)) return;
+      if (existing && (existing.conversationId !== payload.conversationId || existing.senderId !== deletedByUserId)) return;
+      if (!await rememberMessageDeletion(id, payload.conversationId, deletedAt, deletedByUserId, deletedByUserId, () => isCurrentSession(session))) return;
+      if (existing && existing.conversationId === payload.conversationId) {
+        await applyMessageDeletion({ ...existing, type: existing.type as DecryptedMessage["type"], status: existing.status as DecryptedMessage["status"], expiryKind: existing.expiryKind ?? "retention" }, deletedAt, deletedByUserId, session);
+      }
+    });
+    inFlightDecryptIds.set(id, pending);
+    try { await pending; } finally { if (inFlightDecryptIds.get(id) === pending) inFlightDecryptIds.delete(id); }
+  }
+}
+
+export async function deleteMessageForLocalUserOnly(conversationId: string, messageId: string, current: () => boolean = () => true): Promise<void> {
+  const session = captureSession();
+  await inFlightDecryptIds.get(messageId)?.catch(() => undefined);
+  if (!current() || !isCurrentSession(session)) return;
+  const existing = await getMessageById(messageId);
+  if (!current() || !isCurrentSession(session) || (existing && existing.conversationId !== conversationId)) return;
+  await removeLocalMessageContent(messageId, undefined, () => current() && isCurrentSession(session));
+  if (current() && isCurrentSession(session)) useChatStore.getState().removeMessages([messageId]);
+}
+
+/** The timer lives outside the bubble lifecycle: removing the bubble must not cancel commit. */
+export async function hideMessageWithUndo(conversationId: string, messageId: string, current: () => boolean = () => true): Promise<(() => Promise<boolean>) | null> {
+  const session = captureSession();
+  await inFlightDecryptIds.get(messageId)?.catch(() => undefined);
+  if (!current() || !isCurrentSession(session)) return null;
+  const pending = await beginMessageHide(messageId, () => current() && isCurrentSession(session));
+  if (!pending) return null;
+  const { token, deadline } = pending;
+  const commit = () => finishMessageHide(messageId, token, false);
+  const timer = setTimeout(() => { void commit().catch(() => undefined); }, Math.max(0, deadline - Date.now()));
+  if (!current() || !isCurrentSession(session)) return null;
+  useChatStore.getState().removeMessages([messageId]);
+  return async () => {
+    if (!current() || !isCurrentSession(session)) return false;
+    if (Date.now() >= deadline) { await commit(); return false; }
+    const record = await finishMessageHide(messageId, token, true, () => current() && isCurrentSession(session));
+    if (record) clearTimeout(timer);
+    const visible = record ? await guardMessageForPublish(record) : null;
+    if (!visible || !current() || !isCurrentSession(session)) return false;
+    const message = normalizeStoredMessage(visible, Date.now());
+    if (!message) return false;
+    useChatStore.getState().addMessage(conversationId, message);
+    return true;
+  };
+}
+
+/** Re-read shared state, never trust content carried by another tab. Removal unmounts
+ * FilePreview, whose cleanup aborts decryption and revokes attachment object URLs. */
+export async function reconcileLocalMessageChange(id: string, target: { addMessage: (conversationId: string, message: DecryptedMessage) => void; removeMessages: (ids: string[]) => void } = useChatStore.getState(), current: () => boolean = () => true): Promise<void> {
+  const record = await getMessageById(id);
+  const visible = record ? await guardMessageForPublish(record) : null;
+  if (!current()) return;
+  const message = visible ? normalizeStoredMessage(visible, Date.now()) : null;
+  if (message) target.addMessage(message.conversationId, message);
+  else target.removeMessages([id]);
+}
+export function startLocalHiddenMessageSync(): () => void {
+  const session = captureSession();
+  if (!session.userId || !session.deviceId) return () => {};
+  let stopped = false, pending = Promise.resolve();
+  const current = () => !stopped && isCurrentSession(session);
+  const close = connectLocalMessageChannel({ userId: session.userId, deviceId: session.deviceId }, ({ id }) => {
+    pending = pending.then(() => current() ? reconcileLocalMessageChange(id, useChatStore.getState(), current) : undefined).catch(() => undefined);
+  });
+  return () => { stopped = true; close(); };
 }

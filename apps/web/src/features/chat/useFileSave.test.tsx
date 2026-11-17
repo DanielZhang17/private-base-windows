@@ -29,7 +29,7 @@ it("exposes typed unsupported errors as state for the view", async () => {
   await act(async () => root.render(<Probe />));
   const error = new SaveUnsupportedError();
   vi.mocked(saveFile).mockRejectedValueOnce(error);
-  await act(async () => { await state.handleSave(new Blob(["file"]), "file.txt"); });
+  await act(async () => { await expect(state.handleSave(new Blob(["file"]), "file.txt")).rejects.toBe(error); });
   expect(state.saveUnsupported).toBe(true);
   expect(state.saveError).toBe(error);
 });
@@ -37,8 +37,12 @@ it("exposes typed unsupported errors as state for the view", async () => {
 it("keeps successful saves and ordinary save failures available to the caller", async () => {
   await act(async () => root.render(<Probe />));
   const blob = new Blob(["file"]);
-  await act(async () => { await state.handleSave(blob, "file.txt"); });
+  vi.mocked(saveFile).mockResolvedValueOnce("saved");
+  await act(async () => { await expect(state.handleSave(blob, "file.txt")).resolves.toBe("saved"); });
   expect(saveFile).toHaveBeenCalledExactlyOnceWith(blob, "file.txt");
+  expect(state.saveUnsupported).toBe(false);
+  vi.mocked(saveFile).mockResolvedValueOnce("cancelled");
+  await act(async () => { await expect(state.handleSave(blob, "file.txt")).resolves.toBe("cancelled"); });
   expect(state.saveUnsupported).toBe(false);
   vi.mocked(saveFile).mockRejectedValueOnce(new Error("Disk full"));
   await act(async () => { await expect(state.handleSave(blob, "file.txt")).rejects.toThrow("Disk full"); });

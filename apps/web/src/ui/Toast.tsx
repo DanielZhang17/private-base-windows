@@ -1,6 +1,6 @@
 import { isLocalizedMessage, renderMessage, type LocalizedMessage } from "../i18n/messages.js";
 import { t, useLocale } from "../i18n/index.js";
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
 import { createPortal } from "react-dom";
 import { IconButton } from "./Button.js";
 import { cx } from "./cx.js";
@@ -37,17 +37,19 @@ export interface NoticeProps {
   /** Button or link placed after the text, e.g. "Retry". */
   action?: ReactNode;
   onDismiss?: () => void;
+  dismissRef?: Ref<HTMLButtonElement>;
+  live?: boolean;
   icon?: IconName;
   className?: string;
 }
 
 /** Inline message that stays in the layout: form errors, connection state, security notes. */
-export function Notice({ tone = "info", title, children, action, onDismiss, icon, className }: NoticeProps) {
+export function Notice({ tone = "info", title, children, action, onDismiss, dismissRef, live = true, icon, className }: NoticeProps) {
   useLocale();
   const urgent = tone === "danger" || tone === "warning";
   return (
     <div
-      role={urgent ? "alert" : "status"}
+      role={live ? (urgent ? "alert" : "status") : "group"}
       className={cx("flex items-start gap-3 rounded-control px-3.5 py-3 text-[0.875rem]", TONE_SOFT[tone], className)}
     >
       <Icon name={icon ?? TONE_ICON[tone]} size={20} className={cx("mt-px", TONE_ICON_COLOR[tone])} />
@@ -56,9 +58,27 @@ export function Notice({ tone = "info", title, children, action, onDismiss, icon
         {children && <div className={title ? "mt-0.5" : undefined}>{children}</div>}
       </div>
       {action}
-      {onDismiss && <IconButton icon="close" label={t("dismiss")} size="sm" onClick={onDismiss} className="-my-1.5 -me-2" />}
+      {onDismiss && <IconButton ref={dismissRef} icon="close" label={t("dismiss")} size="sm" onClick={onDismiss} className="-my-1.5 -me-2" />}
     </div>
   );
+}
+
+interface Announcement {
+  id: number;
+  text: string;
+  assertive: boolean;
+}
+
+/** Keep both regions mounted so assistive technology can observe later text changes. */
+export function LiveAnnouncement({ message }: { message?: Announcement }) {
+  return <>
+    <div className="sr-only" aria-live="polite" aria-atomic="true">
+      {message && !message.assertive && <span key={message.id}>{message.text}</span>}
+    </div>
+    <div className="sr-only" aria-live="assertive" aria-atomic="true">
+      {message?.assertive && <span key={message.id}>{message.text}</span>}
+    </div>
+  </>;
 }
 
 export interface ToastOptions {
@@ -74,6 +94,34 @@ interface ToastEntry extends ToastOptions {
   id: number;
 }
 
+type ControlledToast = Omit<ToastOptions, "duration"> & { onDismiss: () => void; dismissRef?: Ref<HTMLButtonElement> };
+
+function ToastCard({ tone = "info", title, message, action, onDismiss, dismissRef, live = true }: ControlledToast & { live?: boolean }) {
+  const urgent = tone === "danger" || tone === "warning";
+  return (
+    <div
+      role={live ? (urgent ? "alert" : "status") : "group"}
+      data-toast-tone={tone}
+      className="pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-card bg-raised px-3.5 py-3 text-[0.875rem] text-ink shadow-overlay border border-line animate-ui-toast"
+    >
+      <Icon name={TONE_ICON[tone]} size={20} className={cx("mt-px", TONE_ICON_COLOR[tone])} />
+      <div className="grow min-w-0">
+        {title && <p className="font-semibold">{isLocalizedMessage(title) ? renderMessage(title) : title}</p>}
+        <div>{isLocalizedMessage(message) ? renderMessage(message) : message}</div>
+        {action && (
+          <button type="button" className="mt-1.5 font-semibold text-brand underline-offset-2 hover:underline cursor-pointer" onClick={() => {
+            action.onClick();
+            onDismiss();
+          }}>
+            {isLocalizedMessage(action.label) ? renderMessage(action.label) : action.label}
+          </button>
+        )}
+      </div>
+      <IconButton ref={dismissRef} icon="close" label={t("dismiss")} size="sm" onClick={onDismiss} className="-my-1.5 -me-2" />
+    </div>
+  );
+}
+
 interface ToastApi {
   /** Shows a toast and returns its id. */
   show: (options: ToastOptions) => number;
@@ -83,7 +131,7 @@ interface ToastApi {
 const ToastContext = createContext<ToastApi | null>(null);
 
 /** Replacement for window.alert. Mount once near the root; call useToast().show(...) anywhere below. */
-export function ToastProvider({ children }: { children: ReactNode }) {
+export function ToastProvider({ children, controlledToast, announcement }: { children: ReactNode; controlledToast?: ControlledToast; announcement?: Announcement }) {
   useLocale();
   const [toasts, setToasts] = useState<ToastEntry[]>([]);
   const nextId = useRef(1);
@@ -120,32 +168,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           role="region"
           className="pointer-events-none fixed inset-x-0 top-0 z-[60] flex flex-col items-center gap-2 px-4 pt-[calc(var(--safe-top)+var(--titlebar-height)+0.75rem)] sm:items-end"
         >
+          <LiveAnnouncement message={announcement} />
           {toasts.map((toast) => (
-            <div
-              key={toast.id}
-              role={toast.tone === "danger" || toast.tone === "warning" ? "alert" : "status"}
-              className="pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-card bg-raised px-3.5 py-3 text-[0.875rem] text-ink shadow-overlay border border-line animate-ui-toast"
-            >
-              <Icon name={TONE_ICON[toast.tone ?? "info"]} size={20} className={cx("mt-px", TONE_ICON_COLOR[toast.tone ?? "info"])} />
-              <div className="grow min-w-0">
-                {toast.title && <p className="font-semibold">{isLocalizedMessage(toast.title) ? renderMessage(toast.title) : toast.title}</p>}
-                <div>{isLocalizedMessage(toast.message) ? renderMessage(toast.message) : toast.message}</div>
-                {toast.action && (
-                  <button
-                    type="button"
-                    className="mt-1.5 font-semibold text-brand underline-offset-2 hover:underline cursor-pointer"
-                    onClick={() => {
-                      toast.action?.onClick();
-                      dismiss(toast.id);
-                    }}
-                  >
-                    {isLocalizedMessage(toast.action.label) ? renderMessage(toast.action.label) : toast.action.label}
-                  </button>
-                )}
-              </div>
-              <IconButton icon="close" label={t("dismiss")} size="sm" onClick={() => dismiss(toast.id)} className="-my-1.5 -me-2" />
-            </div>
+            <ToastCard key={toast.id} {...toast} onDismiss={() => dismiss(toast.id)} />
           ))}
+          {controlledToast && <ToastCard {...controlledToast} live={false} />}
         </div>,
         document.body,
       )}

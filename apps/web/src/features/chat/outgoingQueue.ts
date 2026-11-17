@@ -1,3 +1,4 @@
+import { captureMessageActionSession, isMessageActionSessionCurrent } from "./message-action-session.js";
 import { INTERRUPTED_FILE_ERROR, outgoingErrorKey } from "./outgoing-errors.js";
 import type {
   ConversationWithMembers,
@@ -10,11 +11,14 @@ import {
   discardQueuedMessage,
   getAllOutgoing,
   getMessageById,
+  guardMessageForPublish,
   getOutgoing,
   retireUnsendableOutgoing,
   updateOutgoingIfPresent,
   updateOutgoingErrorIfUnchanged,
   completeOutgoingIfPresent,
+  removeLocalMessageContent,
+  rememberMessageDeletion,
   type LocalOutgoing,
   type LocalMessage,
   type OutgoingStep,
@@ -31,8 +35,11 @@ export const RETRY_DELAYS = [2000, 5000, 15000, 60000];
 const listeners = new Set<() => void>();
 const inFlight = new Map<string, Promise<void>>();
 const preparingFiles = new Set<string>();
+const cancelledPreparations = new Set<string>();
+export const isFilePreparationCancelled = (id: string) => cancelledPreparations.has(id);
 export function setFilePreparing(id: string, preparing: boolean) {
-  if (preparing) preparingFiles.add(id); else preparingFiles.delete(id);
+  if (preparing) { preparingFiles.add(id); cancelledPreparations.delete(id); }
+  else { preparingFiles.delete(id); cancelledPreparations.delete(id); }
 }
 let preparation: Promise<unknown> = Promise.resolve();
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -85,8 +92,15 @@ export async function refreshOutgoingQueue() {
   if (due.length) timer = setTimeout(() => { void drain().catch(console.error); }, Math.max(0, Math.min(...due.map((row) => row.nextAttemptAt ?? 0)) - Date.now()));
 }
 
-function showMessage(message: LocalMessage) {
-  useChatStore.getState().addMessage(message.conversationId, message as DecryptedMessage);
+async function showMessage(message: LocalMessage) {
+  // Display durable output: another device/tab may have deleted it during this send.
+  const session = useAuthStore.getState();
+  const record = await getMessageById(message.id);
+  const persisted = record ? await guardMessageForPublish(record) : null;
+  const current = useAuthStore.getState();
+  if (session.user?.id !== current.user?.id || session.device?.id !== current.device?.id || session.sessionId !== current.sessionId) return;
+  if (persisted) useChatStore.getState().addMessage(persisted.conversationId, persisted as DecryptedMessage);
+  else useChatStore.getState().removeMessages([message.id]);
 }
 
 async function retireOrphan(row: LocalOutgoing) {
@@ -233,7 +247,7 @@ async function attempt(id: string) {
     const message = await getMessageById(id);
     const sending = message ? { ...message, status: "sending" } : undefined;
     if (!await updateOutgoingIfPresent(initial, sending, { ifUnchanged: true })) return;
-    if (sending && belongsToSession(initial)) showMessage(sending);
+    if (sending && belongsToSession(initial)) await showMessage(sending);
   }
   // Pending/auto-retrying envelopes must stay ordered, including sender-key distributions.
   for (const earlier of rows.filter((entry) => entry.id !== id && sameConversation(entry, initial) && compareRows(entry, initial) < 0)) {
@@ -260,8 +274,9 @@ async function attempt(id: string) {
     // A refresh must not normalize an old error and invalidate this attempt's revision.
     row.error = null;
     row.nextAttemptAt = null;
-    await persistOutgoing(row);
-    if (message) showMessage({ ...message, status: "sending" });
+    const sending = message ? { ...message, status: "sending" } : undefined;
+    if (!await updateOutgoingIfPresent(row, sending, { ifUnchanged: true })) return;
+    if (sending) await showMessage(sending);
     await refreshOutgoingQueue();
     await prepare(row, message, current);
     if (!current()) return;
@@ -294,9 +309,14 @@ async function attempt(id: string) {
       }
     }
     if (!result || !current()) return;
-    const sent = message ? { ...message, content: contentToSend(row, message), timestamp: result.serverTimestamp, expiresAt: result.expiresAt, expiryKind: result.expiryKind, status: "sent" } : undefined;
+    const sent = message ? { ...message, content: result.deleted ? "" : contentToSend(row, message), timestamp: result.serverTimestamp, expiresAt: result.expiresAt, expiryKind: result.expiryKind, status: "sent",
+      ...(result.deleted ? { deletedAt: result.deletedAt ?? Date.now(), deletedByUserId: result.deletedByUserId ?? row.userId } : {}) } : undefined;
+    if (result.deleted) {
+      if (sent) await removeLocalMessageContent(row.id, sent);
+      else await rememberMessageDeletion(row.id, row.conversationId, result.deletedAt ?? Date.now(), result.deletedByUserId ?? row.userId);
+    }
     if (!await completeOutgoingIfPresent(row, sent, { ifUnchanged: true })) return;
-    if (sent) showMessage(sent);
+    if (sent) await showMessage(sent);
     touchConversationInCache(row.conversationId, result.serverTimestamp);
   } catch (error) {
     if (!current() || error instanceof DiscardedSend) return;
@@ -310,7 +330,7 @@ async function attempt(id: string) {
     const failed = message ? { ...message, status: "failed" } : undefined;
     if (!await updateOutgoingIfPresent(row, failed, { ifUnchanged: true })) return;
     if (!retryable && await retireOrphan(row)) return;
-    if (failed) showMessage(failed);
+    if (failed) await showMessage(failed);
   }
 }
 
@@ -332,15 +352,20 @@ export function retryOutgoing(id: string): Promise<void> {
   return task;
 }
 export async function discardOutgoing(id: string) {
+  const session = captureMessageActionSession();
+  const active = () => isMessageActionSessionCurrent(session);
+  // Preparation is outside the network attempt; cancel its continuations immediately.
+  if (preparingFiles.has(id)) cancelledPreparations.add(id);
   // An already submitted request cannot be unsent; only discard after its attempt settles.
   await inFlight.get(id);
+  if (!active()) return;
   const row = await getOutgoing(id);
-  if (!row) return;
+  if (!row || !active()) return;
   await withConversationLock(row, async () => {
     const current = await getOutgoing(id);
-    if (!current || !belongsToSession(current)) return;
-    await discardQueuedMessage(id);
-    useChatStore.getState().removeMessages([id]);
+    if (!active() || !current || !belongsToSession(current)) return;
+    await discardQueuedMessage(id, active);
+    if (active()) useChatStore.getState().removeMessages([id]);
   });
   await drain();
 }
@@ -368,7 +393,7 @@ async function drain(online = false) {
             const failed = message ? { ...message, status: "failed" } : undefined;
             // The lock does not cover another tab's initial file encryption. Compare
             // the revision and write both records in one transaction after the await.
-            if (await updateOutgoingIfPresent(row, failed, { ifUnchanged: true }) && failed) showMessage(failed);
+            if (await updateOutgoingIfPresent(row, failed, { ifUnchanged: true }) && failed) await showMessage(failed);
           }
         });
       }

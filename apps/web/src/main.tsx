@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import { QueryClientProvider } from "@tanstack/react-query";
 import NativePasskeyPage from "./pages/NativePasskeyPage.js";
+import { isClientsPath } from "./features/clients/routes.js";
 import { queryClient } from "./lib/query-client.js";
 import { RouterNavigation } from "./platform/RouterNavigation.js";
 import "./index.css";
@@ -11,7 +12,10 @@ import "./index.css";
 void bootstrap(async () => {
   // Handoff pages never mount authentication, session repair, or local-key effects.
   const nativeHandoff = ["/native/passkey/sign-in", "/native/passkey/add"].includes(location.pathname);
-  const App = nativeHandoff ? NativePasskeyPage : (await import("./App.js")).default;
+  // The public download page likewise never mounts the session app (auth phase, keys, sync, push).
+  const App = nativeHandoff ? NativePasskeyPage
+    : isClientsPath(location.pathname) ? (await import("./ClientsApp.js")).default
+    : (await import("./App.js")).default;
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <QueryClientProvider client={queryClient}>

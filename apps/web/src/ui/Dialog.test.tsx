@@ -255,5 +255,5 @@ it("Toast announces, auto-dismisses timed toasts and keeps errors until dismisse
   expect(region.querySelector('[role="status"]')).toBeNull();
   expect(region.querySelector('[role="alert"]')).not.toBeNull();
   await click(region.querySelector('[aria-label="Dismiss"]')!);
-  expect(region.children).toHaveLength(0);
+  expect(region.querySelector('[role="status"], [role="alert"]')).toBeNull();
 });

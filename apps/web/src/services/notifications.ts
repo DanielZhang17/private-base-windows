@@ -89,11 +89,15 @@ export function createNotificationWebSocket(options: NotificationSocketOptions):
       }
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (heartbeat !== null) window.clearInterval(heartbeat);
       if (disposed) return;
       if (!opened) closesWithoutOpen++;
       options.onClose?.();
+      if (event.code === 4403) {
+        disposed = true;
+        return;
+      }
       const delay = Math.min(1_000 * 2 ** reconnectAttempt, 30_000);
       reconnectAttempt = Math.min(reconnectAttempt + 1, 5);
       reconnectTimer = window.setTimeout(async () => {

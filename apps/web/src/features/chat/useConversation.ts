@@ -23,11 +23,12 @@ import { useChatStore } from "../../stores/chatStore.js";
 import { useConnectionStore } from "../../stores/connectionStore.js";
 import { usePresenceStore } from "../../stores/presenceStore.js";
 
-import { deletePendingCall, getPendingCall, saveMessage, savePendingCall } from "../../db/index.js";
+import { guardMessageForPublish, deletePendingCall, getPendingCall, saveMessage, savePendingCall } from "../../db/index.js";
 import { sendDirectPayloadFanout } from "../../lib/direct-messages.js";
 import { upsertConversationInCache, refreshConversationList } from "../../lib/conversation-cache.js";
 import {
   ingestMessageFrame,
+  handleMessageDeletion,
   loadOlderPersistedConversationMessages,
   loadPersistedConversationMessages,
   syncConversationMessages,
@@ -47,6 +48,8 @@ function persistMessage(message: DecryptedMessage): Promise<void> {
     expiresAt: message.expiresAt,
     expiryKind: message.expiryKind,
     status: message.status,
+    deletedAt: message.deletedAt,
+    deletedByUserId: message.deletedByUserId,
   });
 }
 
@@ -201,10 +204,16 @@ export function useConversation() {
     if (!conversationId) return;
 
     let ws: WebSocket;
+    let disposed = false;
+    const session = useAuthStore.getState();
     try {
       ws = createChatWebSocket(conversationId, (frame) => {
         if (frame.type === "message") {
           void ingestMessageFrame({ ...frame, conversationId });
+          return;
+        }
+        if (frame.type === "message_event") {
+          void handleMessageDeletion(frame.payload);
           return;
         }
         if (frame.type === "typing") {
@@ -220,8 +229,12 @@ export function useConversation() {
               timestamp: frame.serverTimestamp,
               status: "sent",
             };
-            addMessage(conversationId, normalizedMessage);
-            void persistMessage(normalizedMessage);
+            void guardMessageForPublish(normalizedMessage).then((visible) => {
+              const current = useAuthStore.getState();
+              if (disposed || current.user?.id !== session.user?.id || current.device?.id !== session.device?.id || current.sessionId !== session.sessionId) return;
+              if (visible) { addMessage(conversationId, visible); void persistMessage(visible); }
+              else useChatStore.getState().removeMessages([frame.messageId]);
+            }).catch(() => undefined);
           } else {
             updateMessageStatus(frame.messageId, "sent");
           }
@@ -237,6 +250,7 @@ export function useConversation() {
     setConnection(conversationId, ws);
     return () => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "typing", isTyping: false }));
+      disposed = true;
       ws.close();
       if (useConnectionStore.getState().wsConnections.get(conversationId) === ws) removeConnection(conversationId);
     };

@@ -3,8 +3,8 @@ import { useEffect } from "react";
 import type { CallEventPayload, ConversationWithMembers } from "@e2ee-chat/shared";
 import { api } from "../../services/api.js";
 import { createNotificationWebSocket } from "../../services/notifications.js";
-import { cleanupExpiredFileCache, cleanupExpiredPendingCalls, deletePendingCall, getPendingCall } from "../../db/index.js";
-import { pruneExpiredPlaintext, resetMessageSyncState, syncMessages, runUnlockSync } from "../../lib/message-sync.js";
+import { commitAbandonedMessageHides, getAppDB, cleanupExpiredFileCache, cleanupExpiredPendingCalls, deletePendingCall, getPendingCall } from "../../db/index.js";
+import { startLocalHiddenMessageSync, handleMessageDeletion, pruneExpiredPlaintext, resetMessageSyncState, syncMessages, runUnlockSync } from "../../lib/message-sync.js";
 import { requestNotificationPermission } from "../../lib/browser-notifications.js";
 import { isNative } from "../../platform/environment.js";
 import { refreshConversationList } from "../../lib/conversation-cache.js";
@@ -53,7 +53,10 @@ export default function UnlockedAppEffects() {
       return !disposed && !!auth.accessToken && auth.user?.id === userId && auth.device?.id === deviceId && auth.sessionId === sessionId;
     };
     const stopBackground = startBackgroundSession(userId, current);
-    const unregister = registerUnlockedSessionCleanup(() => { disposed = true; });
+    const sweepMessageHides = () => { void getAppDB().then(commitAbandonedMessageHides).catch(() => undefined); };
+    const stopLocalMessageSync = startLocalHiddenMessageSync();
+    const unregister = registerUnlockedSessionCleanup(() => { disposed = true; stopLocalMessageSync(); sweepMessageHides(); });
+    sweepMessageHides();
     const retiredCallIds = new Set<string>();
     let socketDispose: (() => void) | null = null;
     let messageSyncTimer: number | null = null;
@@ -64,6 +67,8 @@ export default function UnlockedAppEffects() {
     }, 5_000);
 
     const syncPollTimer = window.setInterval(() => {
+      if (disposed) return;
+      sweepMessageHides();
       if (document.visibilityState === "visible") {
         void syncMessages().catch(() => undefined);
       }
@@ -149,6 +154,7 @@ export default function UnlockedAppEffects() {
           void refreshConversationList().catch(() => undefined);
         },
         onMessageEvent: (payload) => {
+          if (payload.deletion) void handleMessageDeletion(payload).catch(scheduleMessageSync);
           const activeConversationId = useChatStore.getState().activeConversationId;
           const isVisibleActiveConversation =
             document.visibilityState === "visible" &&
@@ -184,6 +190,7 @@ export default function UnlockedAppEffects() {
     const handleOffline = () => setOnline(false);
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
+        sweepMessageHides();
         void pruneExpiredPlaintext();
         void syncMessages().catch(() => undefined);
       }
@@ -205,6 +212,8 @@ export default function UnlockedAppEffects() {
 
     return () => {
       disposed = true;
+      stopLocalMessageSync();
+      sweepMessageHides();
       unregister();
       stopBackground();
       window.clearInterval(cleanupTimer);

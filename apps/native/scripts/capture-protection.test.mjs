@@ -10,7 +10,7 @@ describe("Windows capture protection", () => {
     const source = read("../src-tauri/src/lib.rs");
     const template = source.match(/"(window\.__PRIVATEBASE_NATIVE_CAPABILITIES__ = Object\.assign[^\n]+)"/)[1];
     for (const passkeyHandoff of [false, true]) {
-      const capabilities = { captureProtection: "full" };
+      const capabilities = { captureProtection: "full", fileOpen: true, fileSave: "dialog" };
       if (passkeyHandoff) capabilities.passkeyHandoff = true;
       const script = template.replace("{{}}", "{}").replace("{capabilities}", JSON.stringify(capabilities));
       for (const existing of [undefined, { otherCapability: "kept" }]) {

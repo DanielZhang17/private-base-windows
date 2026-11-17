@@ -20,6 +20,7 @@ import { clearAccountScopedState } from "../../platform/session.js";
 import { registerNavigate } from "../../platform/navigation.js";
 import { invoke } from "@tauri-apps/api/core";
 import { getPendingCall } from "../../db/index.js";
+import { getByRole, queryByRole } from "@testing-library/dom";
 
 vi.mock("../chat/useOutgoingQueue.js", () => ({ useOutgoingQueue: () => ({}) }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => []) }));
@@ -41,7 +42,7 @@ let state: ReturnType<typeof useCall>;
 let stream: MediaStream;
 let stop: ReturnType<typeof vi.fn>;
 let close: ReturnType<typeof vi.fn>;
-const sockets: Array<{ close: ReturnType<typeof vi.fn>; onmessage?: (event: { data: string }) => Promise<void>; onopen?: () => Promise<void> }> = [];
+const sockets: Array<{ close: ReturnType<typeof vi.fn>; onmessage?: (event: { data: string }) => Promise<void>; onopen?: () => Promise<void>; onclose?: (event: { code: number }) => void }> = [];
 let mediaPlay: ReturnType<typeof vi.spyOn>;
 let onRemote: (stream: MediaStream) => void;
 function Harness({ children }: { children: ReactNode }) {
@@ -397,10 +398,16 @@ it.each(["audio", "video"])("keeps %s media, signaling, transforms and audio mou
   await act(async () => onRemote(stream));
   const audio = container.querySelector("audio")!;
   expect(audio.srcObject).toBe(stream);
+  expect(container.querySelectorAll("audio")).toHaveLength(1);
+  expect(mediaPlay.mock.contexts.filter((element) => element === audio)).toHaveLength(1);
+  expect([...container.querySelectorAll("video")].every((element) => element.muted)).toBe(true);
   await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Minimise call"]')!.click());
   expect(container.querySelector("output")!.textContent).toBe("/chat/chat");
   expect(container.querySelector(".call-bubble")).not.toBeNull();
   expect(useCallStore.getState().isMinimized).toBe(true);
+  expect(container.querySelectorAll("audio")).toHaveLength(1);
+  expect(container.querySelector("audio")).toBe(audio);
+  expect([...container.querySelectorAll("video")].every((element) => element.muted)).toBe(true);
   const draft = container.querySelector("input")!;
   await act(async () => container.querySelector<HTMLButtonElement>("output + button")!.click());
   expect(container.querySelector("output")!.textContent).toBe("/chat/other");
@@ -414,6 +421,8 @@ it.each(["audio", "video"])("keeps %s media, signaling, transforms and audio mou
   expect(container.querySelector(".call-bubble")).toBeNull();
   expect(useCallStore.getState().isMinimized).toBe(false);
   expect(container.querySelector("audio")).toBe(audio);
+  expect(container.querySelectorAll("audio")).toHaveLength(1);
+  expect(mediaPlay.mock.contexts.filter((element) => element === audio)).toHaveLength(1);
   expect(audio.srcObject).toBe(stream);
   expect(close).not.toHaveBeenCalled();
   expect(microphone.stop).not.toHaveBeenCalled();
@@ -423,6 +432,127 @@ it.each(["audio", "video"])("keeps %s media, signaling, transforms and audio mou
   expect(attachLocalTracks).toHaveBeenCalledOnce();
   expect(createPeerConnection).toHaveBeenCalledOnce();
   expect(sender.transform).toBe(transform);
+});
+
+it("keeps accessible audio recovery and its single owner through full view and bubble switches", async () => {
+  mediaPlay.mockRejectedValueOnce(new DOMException("Gesture required", "NotAllowedError"));
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => onRemote(stream));
+  const audio = container.querySelector("audio")!;
+  const recovery = getByRole(container, "button", { name: "Tap to turn on sound" });
+  expect(recovery.tabIndex).toBe(0);
+  expect(recovery.querySelector('[data-icon="speaker"]')).not.toBeNull();
+  await act(async () => audio.dispatchEvent(new Event("loadedmetadata")));
+  expect(mediaPlay).toHaveBeenCalledOnce();
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Minimise call"]')!.click());
+  const bubbleRecovery = getByRole(container, "button", { name: "Tap to turn on sound" });
+  expect(bubbleRecovery.closest(".call-bubble")).not.toBeNull();
+  expect(bubbleRecovery.querySelector('[data-icon="speaker"]')).not.toBeNull();
+  expect(bubbleRecovery.textContent).toBe("");
+  expect(container.querySelectorAll("[data-call-playback-recovery]")).toHaveLength(1);
+  expect(container.querySelectorAll("audio")).toHaveLength(1);
+  expect(container.querySelector("audio")).toBe(audio);
+  await act(async () => bubbleRecovery.click());
+  expect(mediaPlay).toHaveBeenCalledTimes(2);
+  expect(mediaPlay.mock.contexts[1]).toBe(audio);
+  expect(queryByRole(container, "button", { name: "Tap to turn on sound" })).toBeNull();
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label^="Ongoing call"]')!.click());
+  expect(container.querySelectorAll("audio")).toHaveLength(1);
+  expect(container.querySelector("audio")).toBe(audio);
+  expect(mediaPlay).toHaveBeenCalledTimes(2);
+});
+
+it.each(["full", "bubble"])("recovers blocked video and persistent audio synchronously with one %s surface control", async (surface) => {
+  configureVideoCall();
+  let gesture = false;
+  mediaPlay.mockImplementation(() => gesture ? Promise.resolve() : Promise.reject(new DOMException("Gesture required", "NotAllowedError")));
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => onRemote(stream));
+  if (surface === "bubble") {
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Minimise call"]')!.click());
+  }
+  const audio = container.querySelector("audio")!;
+  const video = surface === "bubble"
+    ? container.querySelector<HTMLVideoElement>(".call-bubble video")!
+    : container.querySelector<HTMLVideoElement>('video[aria-label="Contact\'s video"]')!;
+  const recovery = getByRole(container, "button", { name: "Tap to play" });
+  expect(container.querySelectorAll("[data-call-playback-recovery]")).toHaveLength(1);
+  expect(queryByRole(container, "button", { name: "Tap to turn on sound" })).toBeNull();
+  if (surface === "full") {
+    const accessories = container.querySelector("[data-call-accessories]")!;
+    const placement = recovery.closest("[data-call-playback-recovery]")!;
+    expect(placement.parentElement).toBe(accessories);
+    expect(placement.previousElementSibling).toBe(container.querySelector("[data-call-self-preview]"));
+    expect(accessories.parentElement!.nextElementSibling).toBe(container.querySelector("[data-call-controls]"));
+    expect(placement.classList.contains("justify-center")).toBe(true);
+    expect(getByRole(container, "heading", { level: 1 }).parentElement!.contains(recovery)).toBe(false);
+  } else {
+    expect(recovery.closest(".call-bubble")).not.toBeNull();
+    expect(recovery.textContent).toBe("");
+  }
+  const before = mediaPlay.mock.calls.length;
+  await act(async () => {
+    gesture = true;
+    recovery.click();
+    gesture = false;
+    // Both calls must occur before the gesture handler returns/microtasks run.
+    expect(mediaPlay.mock.contexts.slice(before)).toHaveLength(2);
+    expect(new Set(mediaPlay.mock.contexts.slice(before))).toEqual(new Set([audio, video]));
+  });
+  expect(container.querySelector("[data-call-playback-recovery]")).toBeNull();
+  expect(container.querySelectorAll("audio")).toHaveLength(1);
+});
+
+it("keeps status and recovery in one scroll region above the wrapping call controls", async () => {
+  configureVideoCall();
+  vi.useFakeTimers();
+  vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(max-width: 639px) and (pointer: coarse)" }));
+  mediaPlay.mockRejectedValue(new DOMException("Gesture required", "NotAllowedError"));
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => onRemote(stream));
+  await act(async () => vi.advanceTimersByTime(4000));
+
+  const controls = container.querySelector<HTMLElement>("[data-call-controls]")!;
+  const body = controls.previousElementSibling!;
+  const preview = body.querySelector("[data-call-self-preview]")!;
+  const recovery = getByRole(container, "button", { name: "Tap to play" });
+  const short = "[@media(max-height:400px)]:";
+  const tiny = "[@media(max-width:319px),(max-height:319px)]:";
+  expect([...body.classList]).toEqual(expect.arrayContaining(["min-h-0", "flex-1", "overflow-y-auto"]));
+  const status = getByRole(container, "heading", { level: 1 }).parentElement!;
+  expect(status.textContent).toContain("00:04");
+  expect(status.textContent).toContain("End-to-end encrypted");
+  expect(status.closest(".overflow-y-auto")).toBe(body);
+  expect(status.parentElement!.classList.contains("shrink-0")).toBe(true);
+  expect(recovery.closest(".overflow-y-auto")).toBe(body);
+  expect(body.querySelector(".overflow-y-auto")).toBeNull();
+  expect([...body.classList]).toEqual(expect.arrayContaining([tiny + "flex-none", tiny + "overflow-visible"]));
+  expect(controls.parentElement?.classList.contains(tiny + "overflow-auto")).toBe(true);
+  expect(preview.classList.contains(short + "hidden")).toBe(true);
+  expect(body.contains(recovery)).toBe(true);
+  expect([...recovery.classList]).toEqual(expect.arrayContaining(["max-w-full", short + "px-3", short + "text-sm"]));
+  expect(recovery.querySelector(".truncate")?.textContent).toBe("Tap to play");
+  expect([...controls.classList]).toEqual(expect.arrayContaining([
+    "shrink-0", short + "py-2", "opacity-0", short + "opacity-100", short + "pointer-events-auto",
+  ]));
+  expect(controls.parentElement?.classList.contains("pb-safe")).toBe(true);
+  expect([...controls.firstElementChild!.classList]).toEqual(expect.arrayContaining([
+    "flex-wrap", short + "gap-2", short + "[&>button]:size-11",
+  ]));
+  for (const name of ["Mute microphone", "Turn off camera", "End call"]) {
+    expect(getByRole(controls, "button", { name })).toBeDefined();
+  }
+});
+
+it("clears audio recovery on playing without requiring another recovery click", async () => {
+  mediaPlay.mockRejectedValueOnce(new DOMException("Gesture required", "NotAllowedError"));
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => onRemote(stream));
+  const audio = container.querySelector("audio")!;
+  expect(getByRole(container, "button", { name: "Tap to turn on sound" })).toBeDefined();
+  await act(async () => audio.dispatchEvent(new Event("playing")));
+  expect(container.querySelector("[data-call-playback-recovery]")).toBeNull();
+  expect(mediaPlay).toHaveBeenCalledOnce();
 });
 
 it("ends from the bubble immediately and keeps the current chat and draft", async () => {
@@ -1047,4 +1177,15 @@ it("defers native media acquisition if the app hides while encrypted peer creati
     await accept.visibility(false);
     expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledOnce();
   } finally { accept.restore(); }
+});
+
+it("ends a call on 4403 without reopening signaling", async () => {
+  vi.useFakeTimers();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  expect(sockets).toHaveLength(1);
+  await act(async () => sockets[0].onclose?.({ code: 4403 }));
+  expect(state.stage).toBe("ended");
+  expect(state.error).toBeTruthy();
+  await act(async () => vi.advanceTimersByTimeAsync(120_000));
+  expect(sockets).toHaveLength(1);
 });

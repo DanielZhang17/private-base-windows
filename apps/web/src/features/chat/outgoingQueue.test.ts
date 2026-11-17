@@ -798,3 +798,71 @@ it("normalizes a legacy error without overwriting newer queue progress", async (
   await updateOutgoingErrorIfUnchanged("message", "old diagnostic", "fileExpired");
   expect((await getOutgoing("message"))!.error).toBe("messageNotSent");
 });
+
+it("persists and displays Sending while a retry of a transient failure is in flight", async () => {
+  await seed();
+  vi.mocked(api.post).mockRejectedValueOnce(networkError());
+  await retryOutgoing("message");
+  expect(await getMessageById("message")).toMatchObject({ status: "failed" });
+  let finish!: (value: unknown) => void;
+  let dispatched!: () => void;
+  const started = new Promise<void>((resolve) => { dispatched = resolve; });
+  vi.mocked(api.post).mockImplementationOnce(() => {
+    dispatched(); return new Promise((resolve) => { finish = resolve; });
+  });
+  const retry = retryOutgoing("message");
+  await started;
+  try {
+    expect(await getMessageById("message")).toMatchObject({ status: "sending" });
+    expect(useChatStore.getState().messages.get("chat")?.[0]).toMatchObject({ status: "sending" });
+  } finally { finish(response); await retry; }
+  expect(await getMessageById("message")).toMatchObject({ status: "sent" });
+});
+
+it.each(["direct", "group"] as const)("completes a deleted %s replay and unblocks the next message without restoring plaintext", async (conversationType) => {
+  vi.mocked(api.get).mockResolvedValue({ id: "chat", type: conversationType, members: [] });
+  await seed({ conversationType });
+  await queueText("later", 2);
+  // A possibly submitted group envelope blocks its successor until its replay receipt arrives.
+  vi.mocked(api.post).mockRejectedValueOnce(networkError());
+  await retryOutgoing("message");
+  expect(await getOutgoing("message")).toMatchObject({ status: "failed" });
+  vi.mocked(api.post).mockResolvedValueOnce({ ...response, deleted: true, deletedAt: 500, deletedByUserId: "alice" });
+  await retryOutgoing("message");
+  expect(await getOutgoing("message")).toBeUndefined();
+  expect(await getMessageById("message")).toMatchObject({ content: "", deletedAt: 500 });
+  expect(useChatStore.getState().messages.get("chat")?.find((message) => message.id === "message")).toMatchObject({ content: "", deletedAt: 500 });
+  await retryOutgoing("later");
+  expect(await getOutgoing("later")).toBeUndefined();
+  expect(await getMessageById("later")).toMatchObject({ status: "sent" });
+});
+
+it.each(["hide", "delete"])("guards the persisted send receipt when another tab races its publication with %s", async (kind) => {
+  const { openDB } = await import("idb");
+  await seed();
+  const db = await getAppDB(), tabB = await openDB(db.name);
+  const original = db.get.bind(db);
+  let raced = false;
+  const read = vi.spyOn(db, "get").mockImplementation(async (...args) => {
+    const snapshot = await original(...args);
+    if (!raced && args[0] === "messages" && args[1] === "message" && snapshot?.status === "sent") {
+      raced = true;
+      const tx = tabB.transaction("syncState", "readwrite");
+      await tx.store.put(kind === "hide"
+        ? { id: "hidden-message:message", undoToken: "other-tab-undo", undoDeadline: Date.now() + 5000 }
+        : { id: "deleted-message:message", deletedAt: 500, deletedByUserId: "alice", conversationId: "chat" });
+      await tx.done;
+    }
+    return snapshot;
+  });
+  try {
+    await retryOutgoing("message");
+    expect(raced).toBe(true);
+    const displayed = useChatStore.getState().messages.get("chat")?.find((message) => message.id === "message");
+    if (kind === "hide") {
+      expect(displayed).toBeUndefined();
+      // Pending Undo deliberately retains the record. Its presence must not imply visibility.
+      expect((await getMessageById("message"))?.content).toBe("private text");
+    } else expect(displayed).toMatchObject({ content: "", deletedAt: 500 });
+  } finally { read.mockRestore(); tabB.close(); }
+});

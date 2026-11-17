@@ -60,19 +60,20 @@ File encryption and upload live here and in the queue controller. Upload PUT res
 ## `chat/useFileSave.ts` — `useFileSave()`
 
 Returns `capabilities` from `platform/capabilities.ts`, `saveUnsupported` (boolean),
-`saveError` (`SaveUnsupportedError | null`), and `handleSave(blob, filename): Promise<void>`.
-No router or query provider is required. `capabilities.saveFile` is true on web
-and native desktop, and false on native iOS/Android until native share-sheet saving
-is available. Hide or disable Save when `saveUnsupported` is true; it includes both
+`saveError` (`SaveUnsupportedError | null`), and
+`handleSave(blob, filename): Promise<"saved" | "cancelled" | undefined>`.
+No router or query provider is required. `capabilities.saveFile` is true on web and native desktop, and on native iOS/Android
+when the pre-JS `fileSave` capability is advertised. Hide or disable Save when `saveUnsupported` is true; it includes both
 the capability flag and typed failures from the adapter.
 
 `handleSave` delegates to the platform adapter. Unsupported saves become
-`saveError`/`saveUnsupported` state; other save failures reject for the caller's
-existing error handling. Desktop dialog cancellation resolves without writing.
+`saveError`/`saveUnsupported` state and reject so callers can show a toast.
+Other save failures also reject. Native cancellation resolves as `"cancelled"` without writing.
 FilePreview uses this hook, disables its attachment save action when unsupported,
 and keeps decrypted image/video object-URL previews
 visible. Saving support does not gate loading or decrypting inline previews.
-The platform adapter rejects mobile saves before importing dialog/fs plugins.
+The platform adapter rejects unadvertised mobile saves before importing dialog/fs plugins;
+advertised mobile saves invoke the scoped native command.
 
 ## `chat/useOutgoingQueue.ts` — `useOutgoingQueue()`
 
@@ -238,7 +239,8 @@ message's duration; individual messages expose their existing expiry countdown.
 and delete/leave endpoints with busy/error state retained inside ConfirmDialog until
 success or cancellation. Other conversation behavior remains in `useConversation`.
 The message Retry/Discard callbacks still come directly from `useConversation`'s outgoing
-queue. Its automatic retry policy is unchanged. `chat/message-actions` exposes platform
+queue. Queue display updates read the committed message record so delayed receipts cannot
+restore content that another device or tab deleted. Its automatic retry policy is unchanged. `chat/message-actions` exposes platform
 clipboard copying without data-layer imports in the bubble. Failed-bubble Retry names
 include the message text or attachment filename, keeping failed messages distinguishable
 to screen readers without exposing file keys.
@@ -290,3 +292,142 @@ provider keeps shared incoming controls on the native call route while accepting
 or displaying a response failure. UnlockedAppEffects owns the service session and
 retains the shared presence socket; key lock/account cleanup invalidate both
 native lifecycles before asynchronous continuations can act.
+
+## `updates/useUpdates.ts` — native app-wide updates
+
+Mounted once by `UpdateProvider` beneath CallProvider, independent of auth/unlock.
+The `/clients` route is outside this provider; in-app navigation tears down its
+timer/listener and ignores pending check results. The non-mandatory `UpdateBanner`
+shares ChatListPage’s column visibility: immediately below the phone list header
+and at the desktop sidebar bottom, including while a conversation is open. On a
+phone the whole list column, including its banner, hides when detail is open. It
+never enters the conversation pane, settings, About or calls. Available updates
+show one ellipsized size/network line; only Android without a known-unmetered
+connection gets the metered hint. Banner actions are right-aligned. About uses full-size actions and the
+shared Disclosure for release notes; the provider still owns the mandatory dialog.
+Capability-gated startup and six-hour checks drive idle/checking/available/
+downloading/ready/error state. Native download resolution means verified; progress
+listeners and timers are cleaned up on teardown. Android auto-download requires a
+known unmetered connection, otherwise Download is an explicit action. The channel
+is stored per device as `private-base:update-channel`, independent of account data;
+it is locked while preparing or holding a verified update because native retains
+one candidate. Requested installation waits for CallProvider/live call state, and
+Later cancels that request. Mandatory update dismissal signs out; About retains
+status, retry, channel, current native version and release notes. See
+[releasing.md](../../../../docs/releasing.md) for native prerequisites and acceptance.
+
+## `clients/useClientsPage.ts` — `useClientsPage()`
+
+Logic for the public download page `/clients` (`pages/ClientsPage.tsx` is a pure view). It needs no router, query client or session; it only needs a `ToastProvider` above it.
+
+- Platform detection (`clients/platform.ts`) runs once on mount: `?platform=macos|windows|android|ios`, then Android, iOS (including iPadOS desktop mode: `MacIntel` with more than one touch point), Windows, macOS, else `other`. `featured` is the detected platform, or `"web"` for `other`; `others` is every remaining platform in the fixed order macOS, Windows, Android, iPhone and iPad, never repeating the featured one.
+- The manifest (`clients/manifest.ts`) is `https://dist.718788.xyz/private-base/releases/latest.json`, fetched with `cache: "no-store"`, `credentials: "omit"`, no referrer and an 8 s timeout. Validation rejects the whole manifest for any malformed entry or any download URL whose origin is not exactly `https://dist.718788.xyz`; `null`/missing platforms are "Coming soon".
+- `status` is `loading`, `ready` or `error`; `retry()` refetches while the error stays shown with `retrying` true. `cards[platform]` holds formatted values (decimal MB, processor label key or raw value, `{{minOs}}`, checksum groups, verify command). `footer` holds the version and the long publish date.
+- `copyChecksum(platform)` uses the platform clipboard adapter and shows a success or failure toast. `onDownloadClick` hands download links to the system browser in the native shells.
+- `main.tsx` mounts `ClientsApp` (page + toasts only) for a direct visit to `/clients`, so no auth phase, key, sync, push or call effects start. `App.tsx` also routes `/clients` without a guard for in-app navigation.
+
+
+## Message actions
+
+`chat/useMessageActions(message)` owns menu position, touch long-press timing (500 ms,
+8 px movement tolerance), scroll cancellation, click suppression, and delete busy/error
+state. `triggers` bind only to the bubble surface; `openFromButton` binds the accessible
+More button. While the menu is mounted, document capture consumes the opening touch's
+release and compatibility mouse/contextmenu events across the Sheet portal. The guard
+lasts through the hold and 400 ms after release; a fresh pointer/touch/keyboard action
+clears it so intentional menu actions and dismissal still work. Sent-message
+`requestDeleteForMe` hides durably via `hideMessageWithUndo` and offers a five-second
+Undo toast. The hidden record/file cache survive until commit; history and sync never
+re-publish them. Undo restores the record unless a deletion arrived, in which case it
+restores only the tombstone. The hidden marker stores the Undo deadline; a new DB
+connection commits expired entries and schedules active ones for their remaining time,
+preserving another tab’s Undo window. An unlocked sweep runs every 30 seconds and
+on visibility return, lock and sign-out teardown, retrying failed deadline writes.
+The owning tab commits at that same deadline; hidden markers prevent reload/sync
+from resurrecting content throughout. Queued/failed messages confirm before
+`deleteForMe` discards pending outbox work; `deleteForEveryone` calls DELETE `/api/messages/:id` after the view's ConfirmDialog. File deletions include
+the opaque `fileId` query parameter to disambiguate older rows without a stored file reference;
+no filename, plaintext, or file key enters this request.
+The presentational `ui/ActionMenu` handles desktop pointer placement and keyboard
+navigation, or the existing bottom Sheet on phones. Failed messages retain one-tap
+Retry and also offer Retry/Discard inside the common menu.
+
+`message-sync` handles deletion events and sync tombstones before decryption/dedupe.
+A separate `mutationSince` / `mutationSeq` cursor consumes commit-ordered deletion
+log pages, even when the message page is empty. It persists under
+`message-mutations:<account>:<device>` after application; conversation backfills
+never advance this global cursor. Legacy sync omits the mutation stream and preserves
+original server-timestamp/id ordering. Guarded cached history is merged into the
+current store atomically, with local/live entries winning id collisions. Durable hidden/deleted markers prevent delayed ACKs, frames and persistence
+from restoring content. Deletion clears legacy decrypted `fileCache` entries and local
+file keys; unmount clears active preview blobs/URLs. Conversation previews derive from
+the updated store. `useFilePreview` exposes `handleOpen`/`handleDownload`, plus action
+errors for toasts. FilePreview shares those actions with the message menu through its
+ref, and keeps images/video in the existing viewer. PDFs on web reserve a tab synchronously on every tap, including cached opens, and
+navigate it to a forced-`application/pdf` blob with no opener. A blocked reservation
+shows the existing localized file-open error instead of silently accepting null.
+Text/Markdown/CSV use `textPreview` / `closeTextPreview` and render a literal `<pre>`
+text node in Dialog with Copy text and Save/Share footer actions; advertised and
+actual sizes above 2 MiB offer Save. Save closes the text dialog and returns focus
+to the attachment row before preparing the file. Preparation errors show inline
+with Retry. Blocked types omit Open and show a five-second warning toast on a row
+tap with an explicit Save/Share action. Desktop saves from Save or legacy Open
+show a localized “Saved” confirmation with the attachment name.
+Saves started while the session profile is missing show a name-free confirmation.
+Android Downloads mode uses native confirmation, and iOS Share mode uses the share
+sheet. Failed saves still show a localized error. An unlocked-session store receives
+results even after the preview unmounts. The topmost overlay by
+visual layer controls feedback. The most recent registration wins ties within
+the same layer. A media viewer shows the notice below its toolbar.
+Dialogs, sheets and incoming-call prompts hold the queue and pause its timers.
+An empty stack uses the global toast. Each result is announced once when its
+notice mounts.
+Success expires after four seconds and errors after eight seconds, with dismissal
+available on either surface. Lock and session changes clear notices and suppress
+pending results. Cancellations are silent. Web downloads use browser feedback.
+Preview and tab routing use an explicit MIME allow-list; SVG/HTML/XML/JavaScript and
+unknown types are download-only. Direct fanout tombstones resolve to the existing
+logical display row, while unknown local echoes remain ignored. Retry atomically
+persists the Sending display status with the outbox before reading the display back.
+
+
+Deleted send receipts complete the outbox while persisting a blank tombstone, clearing
+legacy decrypted attachment caches and unblocking later Sender Key messages. File
+preparation participates in a cancellation registry; both its success and error paths
+check cancellation plus durable hidden/deleted markers before publishing. Initial
+outbox writes also respect those markers. Native file IPC uses the binary v2 contract
+in platform/README.md. A blocked Open displays localized safety feedback with an
+explicit Save action; no automatic saving occurs.
+
+
+`startLocalHiddenMessageSync` connects `local-message-changes` while unlocked. DB
+hide/commit/Undo writes publish opaque IDs only, scoped to account + device, over
+BroadcastChannel plus a storage-event fallback. Peers re-read shared IndexedDB via
+`reconcileLocalMessageChange`; hidden/missing records leave the store, unmounting
+FilePreview and revoking its object URLs, while Undo restores the durable record.
+Teardown closes transports and session-guards pending reads.
+
+
+Conversation opening always merges the latest cached page, including when startup
+mutation sync has already populated the store with tombstones. Deletion markers,
+first record redaction and decrypted-file cache eviction share one IDB transaction;
+guarded receives/outbox writes evict attachment references before redacting too.
+Mutation pages return a safe `mutationCursor` high-water checkpoint: it is persisted
+per account/device after applying the page, even when all scanned rows were filtered
+out. Partial pages never advance past their last returned mutation.
+
+History pages read messages, queue annotations and all hidden/deleted barriers in a
+single IndexedDB snapshot. Local writes and scoped cross-tab hints bump a conversation
+hide generation synchronously; an invalidated snapshot is retried before publication.
+Older peers without a conversation ID conservatively invalidate all pending pages.
+The contiguous cache window keeps its own timestamp/id cursor, reset with the sync
+session; injected mutation/live entries never move it. Older loads use that cursor,
+including across equal timestamps, rather than the oldest entry in the display store.
+
+
+Tombstone family resolution requires matching sender + conversation; unverified
+roots are never materialized. Exact-ID deletion guards reject mismatched owners too.
+`message-action-session` captures primitive user/device/session IDs for delete/hide/
+Undo continuations. IDB mutations can receive that current-session guard and roll
+back stale continuations. Five-second Undo toast subscriptions survive bubble removal
+but clear on identity change or unlocked-session teardown.

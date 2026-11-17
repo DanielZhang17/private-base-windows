@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode, Ref } from "react";
+import type { AnchorHTMLAttributes, ButtonHTMLAttributes, ReactNode, Ref } from "react";
 import { cx } from "./cx.js";
 import { Icon } from "./Icon.js";
 import type { IconName } from "./icons/paths.js";
@@ -27,7 +27,7 @@ const SIZES: Record<ButtonSize, string> = {
   lg: "min-h-12 px-5 text-base",
 };
 
-export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+interface ButtonOwnProps {
   variant?: ButtonVariant;
   size?: ButtonSize;
   /** Shows a spinner, sets aria-busy and blocks clicks. The label stays for screen readers. */
@@ -35,23 +35,64 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   leadingIcon?: IconName;
   trailingIcon?: IconName;
   fullWidth?: boolean;
-  ref?: Ref<HTMLButtonElement>;
   children: ReactNode;
 }
 
-export function Button({
-  variant = "primary",
-  size = "md",
-  loading = false,
-  leadingIcon,
-  trailingIcon,
-  fullWidth = false,
-  className,
-  disabled,
-  type = "button",
-  children,
-  ...rest
-}: ButtonProps) {
+export interface ButtonAsButtonProps extends ButtonOwnProps, Omit<ButtonHTMLAttributes<HTMLButtonElement>, "children"> {
+  href?: undefined;
+  ref?: Ref<HTMLButtonElement>;
+}
+
+/** With href the button renders a real link (<a>) with the same look. */
+export interface ButtonAsLinkProps extends ButtonOwnProps, Omit<AnchorHTMLAttributes<HTMLAnchorElement>, "children"> {
+  href: string;
+  download?: AnchorHTMLAttributes<HTMLAnchorElement>["download"];
+  target?: string;
+  /** Defaults to "noopener noreferrer" when target is "_blank". */
+  rel?: string;
+  ref?: Ref<HTMLAnchorElement>;
+}
+
+export type ButtonProps = ButtonAsButtonProps | ButtonAsLinkProps;
+
+function ButtonContent({ loading, leadingIcon, trailingIcon, children }: Pick<ButtonOwnProps, "loading" | "leadingIcon" | "trailingIcon" | "children">) {
+  return (
+    <>
+      {loading ? <Spinner size={18} label={null} /> : leadingIcon && <Icon name={leadingIcon} size={18} />}
+      <span className="truncate">{children}</span>
+      {trailingIcon && !loading && <Icon name={trailingIcon} size={18} />}
+    </>
+  );
+}
+
+export function Button(props: ButtonProps) {
+  if (props.href !== undefined) {
+    const {
+      variant = "primary", size = "md", loading = false, leadingIcon, trailingIcon, fullWidth = false,
+      className, children, href, target, rel, onClick, ...rest
+    } = props;
+    return (
+      <a
+        href={href}
+        target={target}
+        rel={rel ?? (target === "_blank" ? "noopener noreferrer" : undefined)}
+        className={cx(BASE, "no-underline", BUTTON_VARIANTS[variant], SIZES[size], fullWidth && "w-full", loading && "pointer-events-none", className)}
+        aria-busy={loading || undefined}
+        aria-disabled={loading || undefined}
+        onClick={(event) => {
+          if (loading) { event.preventDefault(); return; }
+          onClick?.(event);
+        }}
+        {...rest}
+      >
+        <ButtonContent loading={loading} leadingIcon={leadingIcon} trailingIcon={trailingIcon}>{children}</ButtonContent>
+      </a>
+    );
+  }
+  const {
+    variant = "primary", size = "md", loading = false, leadingIcon, trailingIcon, fullWidth = false,
+    className, disabled, type = "button", children, href: _href, ...rest
+  } = props;
   return (
     <button
       type={type}
@@ -60,9 +101,7 @@ export function Button({
       aria-busy={loading || undefined}
       {...rest}
     >
-      {loading ? <Spinner size={18} label={null} /> : leadingIcon && <Icon name={leadingIcon} size={18} />}
-      <span className="truncate">{children}</span>
-      {trailingIcon && !loading && <Icon name={trailingIcon} size={18} />}
+      <ButtonContent loading={loading} leadingIcon={leadingIcon} trailingIcon={trailingIcon}>{children}</ButtonContent>
     </button>
   );
 }

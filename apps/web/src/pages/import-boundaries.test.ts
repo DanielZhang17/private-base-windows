@@ -4,7 +4,7 @@ import ts from "typescript";
 // Each workstream appends its own globs. UiPreferencesEffects keeps its existing
 // data access: W3a owns it only for theme-color syncing, not the preference logic.
 const views = import.meta.glob([
-  "../App.tsx", "./ChatListPage.tsx", "./ChatPage.tsx", "./CallPage.tsx",
+  "../App.tsx", "../ClientsApp.tsx", "./ChatListPage.tsx", "./ChatPage.tsx", "./CallPage.tsx", "./ClientsPage.tsx",
   "../components/layout/**/*.tsx", "../components/chat/**/*.tsx",
   "../components/calls/**/*.tsx", "../components/user-picker/**/*.tsx",
   "../components/avatar/UserAvatar.tsx", "!../components/**/*.test.tsx",

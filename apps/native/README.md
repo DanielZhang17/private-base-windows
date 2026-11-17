@@ -3,9 +3,11 @@
 Shared Tauri 2 shell for the existing React app in `apps/web`. The Rust library
 exposes `run()` with `tauri::mobile_entry_point` on mobile, and the desktop binary
 calls that same entry point. It registers notification, opener, clipboard-manager,
-dialog and fs plugins matching the versions used by the web platform adapters.
-This branch contains no Android/iOS projects, entitlements, installer settings,
-signing configuration, or platform-specific Tauri configuration files.
+dialog and fs plugins matching the versions used by the web platform adapters,
+plus updater and process plugins on desktop.
+This branch contains no Android/iOS projects, entitlements, OS code-signing
+configuration, or platform-specific Tauri configuration files. Desktop updater
+signing and the shared Windows passive update mode are configured here.
 The shared application identifier is `xyz.chat718788.e2eechat`; each component
 starts with a letter so Android and iOS project initialization accepts it.
 
@@ -60,6 +62,11 @@ incremental work) and runs after `@e2ee-chat/web#build`, so a root `pnpm build`
 never builds the shared packages concurrently with this hook. Its `env` declares
 `VITE_API_BASE_URL`, preserving an explicit API override through Turbo's strict
 environment filtering. Verify with `pnpm exec turbo build --dry=json`.
+The native task's `passThroughEnv` forwards `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` through strict filtering without including
+their values in Turbo's cache hash. They must remain outside `env`/`globalEnv`;
+the native build remains uncached. The hooks inherit the environment without
+printing it, and the signing helper disables shell tracing.
 
 The host debug executable is `apps/native/src-tauri/target/debug/e2ee-chat-native`
 (`.exe` on Windows). Release artifacts are under `target/release` and bundles
@@ -67,6 +74,148 @@ under `target/release/bundle`. `Cargo.lock` and the pnpm lockfile are checked in
 the Tauri CLI and Rust plugin dependencies are pinned to exact v2 releases.
 The direct `serde_json` dependency is required by Tauri's generated context when
 the configuration contains plugin settings.
+
+## Desktop auto-update
+
+The first updatable release is **0.1.0**, synchronized in `package.json`,
+`src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`. The bundled version is
+available to the web layer through `@tauri-apps/api/app`'s `getVersion()`; the
+local main window has only `core:app:allow-version` for that API.
+Tauri derives Android's `versionCode` as
+`major * 1_000_000 + minor * 1_000 + patch`, so 0.1.0 is **1000**. Keep minor and
+patch below 1000 and increase semver for every published Android build; never
+reuse a version or override this code with a lower value. See the
+[Tauri Android version rule](https://v2.tauri.app/distribute/google-play/).
+
+The updater/process Rust plugins and JS packages are exactly pinned to
+2.14.1 (2026-10-28) and 2.4.0 (2026-09-26), respectively. All newly introduced
+locked Rust packages must also be at least two weeks old at integration.
+The wrappers use the Rust APIs and do not import the raw JS updater bindings.
+
+Desktop registration is guarded by `cfg(desktop)`. A plugin initialization
+script merges `autoUpdate: "desktop"` into
+`window.__PRIVATEBASE_NATIVE_CAPABILITIES__` before application JS runs, preserving
+other capability keys. Update distribution supports macOS aarch64/x86_64 and
+Windows x86_64. Other desktop targets return `"unsupported"`; this module grants
+no updater capability or commands on Android/iOS. Android's native updater and
+`update_open_permission_settings` belong to `native/android`.
+
+The local desktop main window can invoke only these wrappers:
+
+| Command | Behavior |
+| --- | --- |
+| `update_check`, `{ channel: "stable" \| "beta" }` | Returns `{ available: false }` or `{ available: true, version, notes?, mandatory }`. `sizeBytes` is omitted because the static desktop manifest does not specify a size. Unsupported target/channel rejects `"unsupported"`; request, manifest, or native install-ID storage failures reject `"network"`. |
+| `update_download` | Downloads and verifies the Tauri signature, retaining the bytes in memory. Emits `update-progress` to `main` with `{ downloaded, total }`; total is 0 when unknown and becomes the verified byte count at completion. Resolve means verified/ready. Rejects `"not_ready"` without an eligible check, `"network"` for transport failures/timeouts, or `"download_failed"` for signature/verification failures. |
+| `update_install` | Installs only retained verified bytes. Rejects `"not_ready"` before download and `"install_failed"` on installation errors. macOS replaces the bundle and requests a restart; Windows launches NSIS in passive mode, exits, and the installer relaunches the app. |
+
+Register `listen("update-progress", ...)` before downloading and retain its
+unlisten function. Only event listen/unlisten permissions accompany the wrapper
+grants; there are no raw `updater:*` or `process:*` permissions. The process plugin
+is registered on desktop, but has no public Rust restart function: the wrapper
+uses `AppHandle::request_restart()`, the same implementation as its JS `relaunch`.
+App command permissions are generated from the explicit list in `build.rs`, so
+they are enforced by Tauri's ACL rather than globally accessible app commands.
+
+Rust constructs the sole manifest endpoint with
+`app.updater_builder().endpoints(...)`:
+
+```text
+https://dist.718788.xyz/private-base/releases/{stable|beta}/updater/{{target}}-{{arch}}.json
+```
+
+There are no configured fallback endpoints and no JS URL/key arguments. Both
+manifest and artifact requests require HTTPS and disable redirects. Artifact
+URLs must stay in the announced version's immutable folder on that same host.
+The shared HTTP client permits at most 60 seconds without a successful read;
+progressing artifact downloads have no overall time limit. A stalled download
+rejects `"network"`, releases the session mutex, and retains the eligible update
+without partial bytes so the next `update_download` can retry from the start.
+Static JSON uses Tauri's `version`, `notes`, `pub_date`, and `platforms` with each
+target's `signature`/`url`, plus `rolloutPercent` (required integer 0–100), optional
+`minimumVersion`, and `blocked` (defaults to an empty list). Missing or malformed
+rollout/version policy fails the check. The stable download-page `latest.json`
+and the Android manifests are separate and are not consumed by this updater.
+
+Eligibility requires a strictly newer semver, an unblocked candidate, and a
+rollout bucket below `rolloutPercent`. Build metadata cannot bypass the version
+or blocked checks. The bucket is SHA-256 of a random native 32-byte install ID,
+using its first eight bytes as a big-endian integer modulo 10,000. The ID lives
+in `app_config_dir()/updater-install-id` (0600 on Unix), never in JS, and persists
+across launches/channels/releases. `mandatory` means the current semver is below
+`minimumVersion`; it does not bypass rollout, blocking, or downgrade refusal.
+Publish mandatory releases at 100% rollout when every old client needs them.
+
+Checks/download/install are serialized. A successful check clears an ineligible
+or blocked pending update and preserves a ready download only for the same
+version, URL, and signature. A failed check preserves the previous successful
+selection. Install uses that selection without a new network request; the web
+layer should keep its periodic checks running. Downloads are not persisted
+across process exit. The web layer owns startup/6-hour checks, beta opt-in, banners,
+and deferring installation throughout an active call; native obeys install calls.
+
+### Signing and builds
+
+`bundle.createUpdaterArtifacts` is true and the supplied minisign public key is
+configured in `plugins.updater.pubkey`. `requireSignedVersion` is also true:
+the signed trusted comment must bind the artifact to the announced version,
+preventing an old signed binary from masquerading as a newer release. The pinned
+Tauri CLI embeds that version during builds. For manually signed Windows
+artifacts use `tauri signer sign --app-version X.Y.Z`.
+
+Set `TAURI_SIGNING_PRIVATE_KEY` to the path
+`~/.private-base-release/updater.key` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to
+the password from Keychain service `private-base-updater-key` at build time only.
+On macOS the helper supplies both and executes its arguments without printing
+either value:
+
+```sh
+cd apps/native
+./scripts/with-signing-env.sh npx -y pnpm@10.33.0 tauri build --debug --bundles app
+```
+
+Use a shell with tracing disabled. Never run environment-dumping commands through
+this helper. Keys/passwords stay outside the repository; do not put them in
+`.env` files or pass passwords as CLI arguments. If the key/Keychain password is
+unavailable, the helper fails without running the build. Without signing env,
+`createUpdaterArtifacts` cannot produce the signed update artifacts. This is
+separate from Apple bundle signing/notarization and Windows Authenticode signing.
+Platform branches own those OS signing settings. Release artifacts belong under
+`private-base/releases/<version>/` and must never be overwritten; channel
+manifests may subsequently point at them. Nothing here publishes or uploads.
+
+Validate without launching the app:
+
+```sh
+cd apps/native/src-tauri
+cargo test --locked
+# On a host permitting loopback TCP sockets, also run the download regressions:
+cargo test --locked -- --ignored
+cargo clippy --locked -- -D warnings
+cargo fmt --check
+cd ..
+pnpm test
+sh -n scripts/with-signing-env.sh
+./scripts/with-signing-env.sh pnpm tauri build --debug --bundles app
+```
+
+Rust tests cover static-manifest parsing, malformed policy, rollout boundaries
+and stability, blocked versions, minimumVersion, downgrade/build-metadata refusal,
+fixed URLs, and native install-ID persistence. JS regressions cover permission
+boundaries and capability merging. A bundle build does not exercise installation.
+Headless download tests check transport errors, mutex release and retryable state.
+Two explicitly ignored loopback tests additionally verify timeout cancellation,
+a signature-verified retry, and slow downloads that exceed the read timeout while
+continuing to make progress. Run them with the command above outside restricted
+sandboxes that prohibit binding TCP listeners.
+Round-one verification passed: 10 Rust tests (2 loopback tests explicitly ignored
+in this sandbox), 25 native JS tests, Clippy with warnings denied, and Rust
+formatting. The initial signed macOS debug `.app`, `.app.tar.gz`, and `.sig` were
+built with the helper; the app was not launched.
+Manually verify 0.1.0 → 0.1.1 on beta on both macOS architectures and Windows
+NSIS: real progress, verified readiness, replacement/relaunch, tampered-signature
+and wrong-version signature rejection, blocked/rollout/minimum/downgrade behavior,
+and the web layer's active-call deferral. Verify updater IPC is denied to other
+windows/remote pages, and confirm `getVersion()` returns the new embedded version.
 
 ## Environment
 
@@ -112,17 +261,19 @@ Tauri's normal nonce/hash and IPC-source injection remains enabled. The dev CLI
 also handles the dev server's connection requirements; `devCsp` is not disabled.
 See Tauri's [CSP reference](https://v2.tauri.app/security/csp/).
 
-Both capability files apply only to the local `main` window.
+All capability files apply only to the local `main` window.
 `capabilities/default.json` grants the shared notification, clipboard-copy and
 HTTP(S)-opener permissions on every platform, with no filesystem or dialog grants.
 `capabilities/desktop.json` grants only save-dialog and file-write permissions,
 restricted to `"platforms": ["macOS", "windows", "linux"]`. No remote origins
 receive native permissions, and no broad `core:default` or plugin default
-permission sets are granted. These permissions support the adapters in
+permission sets are granted. `capabilities/updater.json` adds only the desktop
+update wrappers and progress listeners described above. These permissions support the adapters in
 `apps/web/src/platform/{clipboard,files,notifications,external}.ts`:
 
 | Permission | Adapter call and purpose |
 | --- | --- |
+| `core:app:allow-version` | `getVersion()` reads the version embedded in the native build. |
 | `notification:allow-is-permission-granted` | `isPermissionGranted()` checks the existing OS notification permission. |
 | `notification:allow-request-permission` | `requestPermission()` asks the user to grant notifications. |
 | `notification:allow-notify` | `sendNotification()` sends the notification after permission is granted. |
@@ -256,6 +407,161 @@ The debug executable is `apps/native/src-tauri/target/debug/e2ee-chat-native.exe
 the NSIS installer is `apps/native/src-tauri/target/debug/bundle/nsis/*-setup.exe`.
 These are unsigned test builds. Do not use the shared release-build example for
 this branch's validation.
+
+### Open and save decrypted attachments
+
+Windows merges `fileOpen: true` and `fileSave: "dialog"` into the existing
+pre-JS native capabilities. The local `main` window alone can invoke
+the v2 binary commands and `clear_open_cache()` through the
+[file permissions](src-tauri/permissions/files.toml) and
+[Windows capability](src-tauri/capabilities/windows-files.json):
+
+```ts
+const options = {
+  headers: { "x-file-name": encodeURIComponent(name), "x-mime-type": mimeType },
+};
+await invoke("open_file", bytes /* Uint8Array */, options); // Promise<void>
+await invoke("save_file", bytes /* Uint8Array */, options); // "saved" | "cancelled"
+await invoke("clear_open_cache");
+```
+
+Rust accepts `tauri::ipc::Request<'_>` and only `InvokeBody::Raw`; JSON number
+arrays and objects reject with `"unsupported"`. Both metadata headers are required,
+percent-decoded once with strict UTF-8/escape validation, then sanitized. Literal
+`+` stays `+`. The borrowed raw buffer's 100 MiB limit and the Open type policy are
+checked before the single copy needed by the blocking file worker.
+
+Both file commands reject payloads above 100 MiB, strip separators, controls and
+Windows-invalid filename characters, protect reserved device names and cap names
+at 180 UTF-8 bytes while preserving the final extension. Cached names are further
+budgeted from the full destination directory, including the random subfolder and
+separator, so the complete path is at most 218 UTF-16 code units (Excel's limit).
+Only the stem is shortened; if the extension plus a stem cannot fit, Open rejects
+with `"unsupported"`. An extension too large to preserve is rejected. MIME types
+accept a simple `type/subtype` value and otherwise become `application/octet-stream`; Windows selects the handler by
+extension. Names, bytes and path-bearing errors are never logged by these commands.
+
+`save_file` presents the existing native save dialog, parented to the main window,
+and writes only its selected destination. It resolves to `"saved"` after marking
+and writing or `"cancelled"` without writing or marking when dismissed.
+Validation/marking/write failures reject with `"unsupported"`. Existing desktop dialog/fs grants remain for legacy clients.
+
+`open_file` writes only to `app_cache_dir()/open/s<session>-e<epoch>-<random>/<sanitized-name>`
+and calls [`ShellExecuteW` with the `open` verb](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutew).
+Open requires a case-insensitive match of the final sanitized extension against
+the explicit desktop allowlist:
+
+- Documents: pdf, txt, md, csv, tsv, rtf, doc, docx, xls, xlsx, ppt, pptx, odt, ods,
+  odp, pages, numbers, key, epub.
+- Images: png, jpg, jpeg, gif, webp, heic, heif, avif, bmp, tiff, tif.
+- Audio: mp3, m4a, aac, wav, flac, ogg, opus.
+- Video: mp4, mov, m4v, webm, mkv, avi.
+- Archives: zip.
+
+Every other extension (including no extension) rejects with `"blocked"`.
+Macro-enabled Office formats, SVG/HTML/XML/JS, executables and double extensions
+such as `report.pdf.pyzw` are blocked. The existing Windows extension denylist and
+executable/script MIME denylist remain additional checks, even for an allowlisted
+extension. MIME parameters cannot disguise a blocked type. The policy runs before
+copying the binary payload and again on the final cache filename before writing
+or launching. The web client can offer Save with a toast; Save still accepts
+blocked Open types and marks them as downloaded from the internet.
+Missing/incomplete associations reject with `"no_app"`, OS
+cancellation with `"cancelled"`, and other failures with `"unsupported"`.
+Failed handoffs remove their copies immediately. Successful handoffs retain the
+copy for asynchronous reads by the selected app. **Open hands decrypted contents
+to that app**, which may make its own copies outside Private Base's control.
+
+Both Open copies and selected Save destinations receive a
+[`Zone.Identifier` alternate data stream](https://learn.microsoft.com/en-us/windows/win32/fileio/file-streams)
+containing exactly `[ZoneTransfer]\r\nZoneId=3\r\n` before decrypted bytes are
+written. This marks the attachment as downloaded from the internet for Windows
+and Office protections. A marking failure rejects with `"unsupported"`; it never
+launches an unmarked copy or reports a successful Save. On overwrite, marking
+precedes truncation so a failed marker preserves the previous contents. Save to
+a filesystem without ADS support also fails; cancellation performs no file I/O.
+Host tests inject the stream writer and assert its exact path/content and ordering
+for Open and Save. Real ADS behavior still needs an NTFS runtime check.
+
+The dedicated Open folder is cleared before the frontend starts, on
+`clear_open_cache()` (for the web lock/sign-out hook), and pruned for entries at
+least one hour old before each Open. Cleanup stays inside that folder and does
+not follow symlinks or Windows reparse points. The three file commands route
+through a synchronous raw IPC dispatcher after Tauri's normal capability check.
+They do not use Tauri's async command macro, which would defer the command call
+itself until the response task was polled. Open and Save capture their admission
+epoch during synchronous dispatch, before validation/copying, constructing the
+response future, or scheduling workers. A request left completely unpolled before
+Clear therefore keeps its original ticket and is cancelled on its first poll.
+A queued revoked Save resolves `"cancelled"`; Save also rechecks after the dialog,
+before writing its selected destination.
+
+Open rechecks before copying, before/after staging, before dispatch, and at the
+actual `ShellExecuteW` call. A short handoff guard makes the final check plus OS
+call indivisible with revocation and never spans file I/O. `clear_open_cache`
+bumps the epoch in its synchronous handler, before constructing its cleanup future
+or taking the cache mutex. Stale Open work rejects with `"cancelled"`, discards
+its staged directory and cannot launch.
+
+Each staged directory records a 128-bit random process session ID and its epoch.
+The session ID is generated once per process using `BCryptGenRandom` on Windows
+(`/dev/urandom` in host tests). Startup tries to delete every cached copy. Clear
+keeps its original cutoff, deletes all other-session and legacy copies regardless
+of their epoch, and deletes this session's copies only below that cutoff. Newly
+admitted opens survive delayed/retried clears. A failed deletion never adopts an
+old copy into the current session or resets its eligibility: the next clear or
+startup retries it even if its old epoch is higher than the current cutoff.
+Reinitializing the cache within the same process also starts above any existing
+owned epoch before attempting deletion, so a failed startup cleanup cannot make
+an owned copy exempt by resetting the counter.
+The cache mutex remains held until handoff/discard finishes, so a resolved clear
+cannot be followed by an old worker leaving a decrypted copy. Cleanup failure does
+not restore revoked tickets. Windows may refuse deletion while another app holds
+a file open; cleanup tries every eligible entry, clear rejects on failure, and
+later cleanup retries.
+The existing exact-pinned [`tempfile = "=3.27.0"`](https://docs.rs/crate/tempfile/3.27.0)
+development dependency is also used on Windows for random scoped directories;
+that release dates to March 11, 2026. No lockfile or dependency versions changed.
+
+Round-5 verification on the macOS host (Rust 1.99.1), from `apps/native/src-tauri`
+unless noted:
+
+```text
+cargo test --locked --offline
+# 51 passed; 0 failed
+cargo clippy -- -D warnings
+cargo clippy --all-targets --locked --offline -- -D warnings
+cargo build --locked --offline
+cargo fmt --all --check
+# all pass
+# From apps/native:
+./node_modules/.bin/vitest run
+# 28 passed
+```
+
+The actual Windows modules and command wiring also pass Windows-target Clippy
+with warnings denied in the isolated harness under `target/windows-files-check`.
+Use a writable `CARGO_HOME` in this sandbox. Validate the shared/merged Windows
+config and all capabilities against the pinned CLI/generated JSON schemas.
+The full `cargo build --target x86_64-pc-windows-msvc --locked --offline` exits 101
+in `tauri-winres` with `NotAttempted("llvm-rc")`: the Windows resource compiler/SDK
+is absent on this host. A full target `cargo check` has the same prerequisite.
+The isolated Windows-target harness compiles the actual file module, commands
+and deferred-window wiring without that resource step.
+
+Manual Windows checks after integrating the web branch: open PDF, Office, text,
+Markdown and CSV attachments in their default apps; confirm unknown associations
+produce the toast; save, overwrite and cancel without a write on cancellation;
+confirm blocked Open types offer Save; exercise Unicode/long/hostile names and
+the 100 MiB limit. Confirm Excel can open a long-name cached spreadsheet and that
+its complete path stays within 218 UTF-16 units. Inspect `Zone.Identifier` on both
+cached and saved files on NTFS (`Get-Content -LiteralPath <path> -Stream Zone.Identifier`),
+and confirm Office protected view/macro blocking and normal Windows protections
+apply. Check an ADS-unsupported destination rejects instead of reporting success.
+Inspect the dedicated cache after startup, lock/sign-out and an hour-old copy
+followed by Open, including a file held open by another app. Confirm the flags coexist with capture/passkey
+flags and other windows/remote origins cannot invoke the commands. Run the debug
+Windows build above; no GUI is launched by the automated checks.
 
 ### Passkey browser handoff (phase 2)
 

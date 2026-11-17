@@ -23,6 +23,7 @@ export function parseFilePayload(content: string): FilePayload | null {
 
 import type { ConversationWithMembers, DecryptedMessage } from "@e2ee-chat/shared";
 export function chatPreview(message: DecryptedMessage, conversation: ConversationWithMembers, userId?: string) {
+  if (message.deletedAt) return t("messageDeleted");
   let preview = message.content;
   if (message.type === "file") {
     const file = parseFilePayload(message.content);
@@ -44,4 +45,17 @@ export function timedDuration(messages: DecryptedMessage[]) {
 export function attachmentName(content: string) {
   try { const file = JSON.parse(content); return typeof file.fileName === "string" ? file.fileName : t("fileTypeLabel"); }
   catch { return t("fileTypeLabel"); }
+}
+
+export function fileTypeLabel(name: string): string {
+  const dot = name.lastIndexOf(".");
+  const extension = dot > 0 ? name.slice(dot + 1) : "";
+  return /^[a-z0-9]+$/i.test(extension) ? extension.slice(0, 5).toUpperCase() : t("fileTypeLabel");
+}
+function sameMessageRun(left: DecryptedMessage | undefined, right: DecryptedMessage | undefined): boolean {
+  return !!left && !!right && left.senderId === right.senderId && Math.abs(right.timestamp - left.timestamp) < 60_000
+    && new Date(left.timestamp).toDateString() === new Date(right.timestamp).toDateString();
+}
+export function messageRun(messages: DecryptedMessage[], index: number) {
+  return { first: !sameMessageRun(messages[index - 1], messages[index]), last: !sameMessageRun(messages[index], messages[index + 1]) };
 }

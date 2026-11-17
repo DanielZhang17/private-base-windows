@@ -12,6 +12,8 @@ export default function VideoGrid({ streams }: Props) {
 }
 function RemoteVideoTile({ stream }: { stream: MediaStream }) {
   useLocale();
-  const ref = useMediaElement<HTMLVideoElement>(stream);
-  return <video ref={ref} autoPlay muted playsInline aria-label={t("contactSVideo")} className="h-full w-full bg-sunken object-cover sm:object-contain" />;
+  const { ref } = useMediaElement<HTMLVideoElement>(stream, true);
+  return <div className="relative h-full w-full">
+    <video ref={ref} autoPlay muted playsInline aria-label={t("contactSVideo")} className="h-full w-full bg-sunken object-cover sm:object-contain" />
+  </div>;
 }

@@ -9,6 +9,9 @@ declare global {
   interface Window {
     __PRIVATEBASE_NATIVE_CAPABILITIES__?: {
       passkeyHandoff?: boolean;
+      autoUpdate?: "desktop" | "android";
+      fileOpen?: boolean;
+      fileSave?: "dialog" | "downloads" | "share";
       backgroundConnection?: boolean;
       nativeCallNotifications?: boolean;
       captureProtection?: "full" | "recording" | "best-effort";

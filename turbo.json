@@ -8,6 +8,7 @@
     "@e2ee-chat/native#build": {
       "dependsOn": ["@e2ee-chat/web#build"],
       "env": ["VITE_API_BASE_URL"],
+      "passThroughEnv": ["TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"],
       "cache": false
     },
     "dev": {

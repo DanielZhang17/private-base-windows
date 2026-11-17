@@ -135,6 +135,11 @@ async function main() {
     },
   });
 
+  await request(`/api/conversations/${encodeURIComponent(conversation.id)}/accept`, {
+    method: "POST",
+    token: bob.accessToken,
+  });
+
   const initiate = await request("/api/calls/initiate", {
     method: "POST",
     token: alice.accessToken,

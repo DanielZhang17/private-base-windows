@@ -8,6 +8,7 @@ import { StrictMode, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import "../index.css";
 import {
+  Disclosure,
   AppShell, Avatar, Badge, BottomBar, Button, ConfirmDialog, CountBadge, Dialog, EmptyState, Field, Icon,
   ICON_NAMES, IconButton, Input, ListItem, NavItem, NavRail, Notice, Sheet, Skeleton, Spinner, Textarea,
   ToastProvider, TopBar, useToast,
@@ -135,6 +136,10 @@ function Gallery() {
           <Button variant="danger">{t("galleryDangerButton")}</Button><Button variant="danger-ghost">{t("galleryDangerGhostButton")}</Button>
           <Button loading>{t("saving")}</Button><Button disabled>{t("disabled")}</Button><Button size="sm" leadingIcon="copy">{t("gallerySmallButton")}</Button><Button size="lg" trailingIcon="chevron-right">{t("galleryLargeButton")}</Button>
           <IconButton icon="attach" label={t("attachFile")} /><IconButton icon="send" label={t("sendMessageAction")} variant="primary" /><IconButton icon="phone-off" label={t("endCall")} variant="danger" size="lg" />
+          <Button href="/clients" variant="secondary" leadingIcon="download">{t("clients.documentTitle")}</Button>
+          <Disclosure summary={t("clients.verifyDownload")} className="w-full border-t border-line">
+            <p className="pb-4 text-[0.8125rem] text-ink-muted">{t("clients.verifyResult")}</p>
+          </Disclosure>
         </Section>
         <Section title={t("fields")}>
           <div className="grid w-full gap-4 sm:grid-cols-2">

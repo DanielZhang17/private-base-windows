@@ -83,7 +83,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     }),
   prependMessages: (conversationId, incomingMessages) =>
     set((state) => {
-      if (incomingMessages.length === 0) {
+      if (incomingMessages.length === 0 && state.messages.has(conversationId)) {
         return { messages: state.messages };
       }
 
@@ -93,7 +93,8 @@ export const useChatStore = create<ChatState>()((set, get) => ({
 
       for (const message of incomingMessages) {
         const existingMessage = byId.get(message.id);
-        byId.set(message.id, existingMessage ? { ...existingMessage, ...message } : message);
+        // Cached history fills gaps; current local/live entries win conflicts.
+        byId.set(message.id, existingMessage ? { ...message, ...existingMessage } : message);
       }
 
       msgs.set(conversationId, sortMessages([...byId.values()]));

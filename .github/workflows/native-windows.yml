@@ -1,7 +1,13 @@
-name: Native Windows (debug, unsigned)
+name: Native Windows
 
 on:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: Build profile (debug = unsigned dev build, release = release NSIS installer; updater signing happens offline)
+        type: choice
+        options: [debug, release]
+        default: debug
   push:
     branches:
       - native/windows
@@ -12,7 +18,10 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      PROFILE: ${{ inputs.profile || 'debug' }}
+      VITE_API_BASE_URL: https://chat.718788.xyz
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -37,25 +46,23 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/native/src-tauri -> target
+          key: ${{ env.PROFILE }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Build unsigned debug executable and NSIS installer
-        run: pnpm native:build --debug
+        if: env.PROFILE == 'debug'
+        run: pnpm native:build --debug --config src-tauri/ci-no-updater.conf.json
+
+      - name: Build release NSIS installer (updater signature is added offline)
+        if: env.PROFILE == 'release'
+        run: pnpm native:build --config src-tauri/ci-no-updater.conf.json
 
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v7
         with:
-          name: private-base-windows-x64-debug-nsis
-          path: apps/native/src-tauri/target/debug/bundle/nsis/*-setup.exe
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload raw executable
-        uses: actions/upload-artifact@v7
-        with:
-          name: private-base-windows-x64-debug-exe
-          path: apps/native/src-tauri/target/debug/e2ee-chat-native.exe
+          name: private-base-windows-x64-${{ env.PROFILE }}-nsis
+          path: apps/native/src-tauri/target/${{ env.PROFILE }}/bundle/nsis/*-setup.exe
           if-no-files-found: error
           retention-days: 14

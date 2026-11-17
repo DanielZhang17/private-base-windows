@@ -36,6 +36,50 @@ it("Button forwards its ref", async () => {
   expect(node).toBe($("button"));
 });
 
+it("Button with href renders a styled link instead of a button", async () => {
+  const onClick = vi.fn((event: { preventDefault: () => void }) => event.preventDefault());
+  await render(<Button href="/login" variant="secondary" leadingIcon="download" onClick={onClick}>Sign in</Button>);
+  expect($("button")).toBeNull();
+  const link = $<HTMLAnchorElement>("a");
+  expect(link.getAttribute("href")).toBe("/login");
+  expect(link.textContent).toBe("Sign in");
+  expect(link.className).toContain("border-line-strong");
+  expect(link.className).toContain("min-h-11");
+  expect(link.querySelector("svg[data-icon='download']")).not.toBeNull();
+  expect(link.hasAttribute("type")).toBe(false);
+  expect(link.hasAttribute("target")).toBe(false);
+  expect(link.hasAttribute("rel")).toBe(false);
+  await click(link);
+  expect(onClick).toHaveBeenCalledTimes(1);
+});
+
+it("Button link passes download/target and defaults rel for new tabs", async () => {
+  let node: HTMLAnchorElement | null = null;
+  await render(<>
+    <Button href="https://example.com/a.zip" target="_blank" download="a.zip" size="lg" ref={(element) => { node = element; }}>Get</Button>
+    <Button href="https://example.com/b" target="_blank" rel="noopener">Other</Button>
+  </>);
+  const [first, second] = Array.from(container().querySelectorAll("a"));
+  expect(node).toBe(first);
+  expect(first.getAttribute("target")).toBe("_blank");
+  expect(first.getAttribute("rel")).toBe("noopener noreferrer");
+  expect(first.getAttribute("download")).toBe("a.zip");
+  expect(first.className).toContain("min-h-12");
+  expect(second.getAttribute("rel")).toBe("noopener");
+});
+
+it("Button link in loading state is busy and does not navigate", async () => {
+  const onClick = vi.fn();
+  await render(<Button href="/x" loading onClick={onClick}>Wait</Button>);
+  const link = $<HTMLAnchorElement>("a");
+  expect(link.getAttribute("aria-busy")).toBe("true");
+  expect(link.getAttribute("aria-disabled")).toBe("true");
+  const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+  link.dispatchEvent(event);
+  expect(event.defaultPrevented).toBe(true);
+  expect(onClick).not.toHaveBeenCalled();
+});
+
 it("IconButton exposes its label as the accessible name and hides the glyph", async () => {
   await render(<IconButton icon="attach" label="Attach file" />);
   const button = $("button");

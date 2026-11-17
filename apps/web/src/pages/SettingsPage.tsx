@@ -1,3 +1,4 @@
+import { AboutUpdates } from "../features/updates/AboutUpdates.js";
 import { localized, type LocalizedMessage } from "../i18n/messages.js";
 import { LOCALES, type LocalePreference } from "../i18n/index.js";
 import { formatDate } from "../i18n/format.js";
@@ -78,6 +79,8 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
             </Button>
           </>}
         </>}
+
+        {s.section === "about" && <AboutUpdates />}
 
         {s.section === "profile" && <>
 

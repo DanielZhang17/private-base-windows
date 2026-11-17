@@ -2,6 +2,7 @@ import { t, useLocale } from "../i18n/index.js";
 import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useChatList } from "../features/chat/useChatList.js";
+import { UpdateBanner } from "../features/updates/UpdateBanner.js";
 import { chatPreview } from "../features/chat/presentation.js";
 import { Button, CountBadge, Dialog, EmptyState, Field, Icon, IconButton, Input, ListItem, Notice, Skeleton, TopBar } from "../ui/index.js";
 import UserAvatar from "../components/avatar/UserAvatar.js";
@@ -39,6 +40,7 @@ export default function ChatListPage() {
       <IconButton icon="search" label={t("searchConversations")} onClick={() => { setSearchOpen(true); requestAnimationFrame(() => searchRef.current?.focus()); }} />
       <IconButton icon="edit" label={t("newChat")} onClick={() => flow.setShowNewChat(true)} />
     </>} />
+    <UpdateBanner />
     <div className={`${searchOpen ? "block" : "hidden lg:block"} px-3 pt-3 pb-1`}>
       <Input ref={searchRef} aria-label={t("searchConversations")} placeholder={t("searchAction")} leading={<Icon name="search" size={18} />} value={search} onChange={(event) => setSearch(event.target.value)} />
     </div>

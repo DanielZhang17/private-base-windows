@@ -6,8 +6,15 @@ import { decryptFile } from "@e2ee-chat/crypto";
 import type { FileEncryptionKey } from "@e2ee-chat/crypto";
 import { ApiError, api, resolveApiUrl } from "../../services/api.js";
 import { useAuthStore } from "../../stores/authStore.js";
+import { openFile, prepareFileOpen, filePreviewKind, isFileOpenBlocked, canOpenFile, SaveUnsupportedError } from "../../platform/files.js";
+import { capabilities } from "../../platform/capabilities.js";
+import { isNative } from "../../platform/environment.js";
+import { t } from "../../i18n/index.js";
 import { fileUrlResolver } from "../../lib/file-url-resolver.js";
 import { useFileSave } from "../../features/chat/useFileSave.js";
+import { captureSaveFeedback } from "./save-feedback.js";
+
+export const MAX_TEXT_PREVIEW_BYTES = 2 * 1024 * 1024;
 
 const ATTACHMENT_RETRY_DELAYS_MS = [200, 500, 1000, 1500];
 
@@ -38,23 +45,39 @@ async function createResponseError(response: Response): Promise<ApiError> {
   return new ApiError(message, response.status, code);
 }
 
-export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: FilePreviewOptions) {
+export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv, sizeBytes }: FilePreviewOptions) {
   useLocale();
   const { saveUnsupported, handleSave } = useFileSave();
+  const active = useRef(false);
+  const currentFileId = useRef(fileId);
+  currentFileId.current = fileId;
+  const isActive = () => active.current && currentFileId.current === fileId;
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [textPreview, setTextPreview] = useState<{ content: string; tooLarge: boolean } | null>(null);
+  const closeTextPreview = () => setTextPreview(null);
   const loadedBlob = useRef<Blob | null>(null);
   const urlRef = useRef<string | null>(null);
   const requestRef = useRef<AbortController | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<LocalizedMessage | null>(null);
   const [expired, setExpired] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [openBlocked, setOpenBlocked] = useState(false);
+  const [actionWarning, setActionWarning] = useState(false);
+  const blocked = openBlocked || isFileOpenBlocked(fileName, mimeType);
+  const canOpen = !blocked && canOpenFile(fileName, mimeType);
+
+  useEffect(() => setOpenBlocked(false), [fileId, fileName, mimeType, fileKey, fileIv]);
 
   const type = mimeType.trim().toLowerCase();
-  const isImage = type.startsWith("image/");
-  const isVideo = type.startsWith("video/");
-  const isInline = isImage || (isVideo && document.createElement("video").canPlayType(type) !== "");
+  const kind = filePreviewKind(type);
+  const isText = kind === "text" && !isNative();
+  const isImage = kind === "image";
+  const isVideo = kind === "video";
+  const isInline = !blocked && (isImage || (isVideo && document.createElement("video").canPlayType(type) !== ""));
 
   const load = useCallback(async (): Promise<Blob | null> => {
+    if (!isActive()) return null;
     requestRef.current?.abort();
     const request = new AbortController();
     requestRef.current = request;
@@ -138,10 +161,13 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
   }, [fileId, fileKey, fileIv, mimeType, isInline]);
 
   useEffect(() => {
+    active.current = true;
     setObjectUrl(null);
+    closeTextPreview();
     loadedBlob.current = null;
     if (isInline) void load();
     return () => {
+      active.current = false;
       requestRef.current?.abort();
       requestRef.current = null;
       loadedBlob.current = null;
@@ -150,18 +176,58 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv }: 
     };
   }, [load, isInline]);
 
-  async function handleDownload() {
-    if (saveUnsupported) return;
+  async function handleDownload(): Promise<void> {
+    if (!isActive()) return;
+    const feedback = captureSaveFeedback(isNative() ? fileName : undefined);
+    if (saveUnsupported) {
+      feedback.publish("danger", "savingFilesIsUnavailableOnThisDeviceImages");
+      return;
+    }
     const blob = loadedBlob.current ?? (await load());
-    if (!blob) return;
+    if (!blob || !isActive() || !feedback.isSaveSessionCurrent()) return;
+    const mode = capabilities.fileSave;
     try {
-      await handleSave(blob, fileName);
-    } catch (err: any) {
-      setError(toErrorMessage(err, "failedToSaveFile"));
+      const result = await handleSave(blob, fileName);
+      if (result !== "saved" || mode === "downloads" || mode === "share") return;
+      feedback.publish("success", "fileSaved");
+    } catch {
+      feedback.publish("danger", "failedToSaveFile");
     }
   }
 
-  return { objectUrl, loading, error: error ? renderMessage(error) : null, expired, isImage, isVideo, saveUnsupported, load, handleDownload };
+  async function handleOpen() {
+    if (!isActive()) return;
+    setActionError(null);
+    setActionWarning(false);
+    if (blocked) { setActionWarning(true); setActionError(t("fileSafetyWarning")); return; }
+    if (!canOpen || (isNative() && !capabilities.fileOpen && capabilities.saveFile)) return handleDownload();
+    let prepared: ReturnType<typeof prepareFileOpen> = null;
+    try {
+      if (isText && sizeBytes > MAX_TEXT_PREVIEW_BYTES) {
+        setTextPreview({ content: "", tooLarge: true });
+        return;
+      }
+      // Reserve on every tap, including cached PDFs. noopener's null result cannot
+      // distinguish a successful direct open from a blocked popup after the fact.
+      if (!isText) prepared = prepareFileOpen(mimeType);
+      const blob = loadedBlob.current ?? (await load());
+      if (!blob) { prepared?.cancel(); return; }
+      if (isText) {
+        if (blob.size > MAX_TEXT_PREVIEW_BYTES) { setTextPreview({ content: "", tooLarge: true }); return; }
+        const content = await blob.text();
+        if (isActive()) setTextPreview({ content, tooLarge: false });
+      } else if (prepared) prepared.open(blob);
+      else await openFile(blob, fileName, mimeType);
+    } catch (err) {
+      prepared?.cancel();
+      const code = typeof err === "string" ? err : err instanceof Error ? err.message : "";
+      if (code === "blocked") setOpenBlocked(true);
+      setActionWarning(code === "blocked");
+      setActionError(t(code === "blocked" ? "fileSafetyWarning" : err instanceof SaveUnsupportedError || code === "unsupported" ? "fileOpenUnsupported" : code === "no_app" ? "fileOpenNoApp" : code === "cancelled" ? "fileOpenCancelled" : "fileOpenFailed"));
+    }
+  }
+
+  return { blocked, canOpen, actionWarning, fileSaveMode: capabilities.fileSave, openBlocked, textPreview, closeTextPreview, canPreview: isInline, actionError, clearActionError: () => setActionError(null), handleOpen, objectUrl, loading, error: error ? renderMessage(error) : null, expired, isImage, isVideo, saveUnsupported, load, handleDownload };
 }
 
 export function formatBytes(bytes: number): string {

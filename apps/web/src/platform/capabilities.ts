@@ -4,6 +4,11 @@ import { supportsE2EECalling } from "./calls.js";
 
 // Getters keep feature detection current, including after browser API initialization.
 export const capabilities = {
+  get autoUpdate(): "desktop" | "android" | undefined {
+    if (!isNative()) return undefined;
+    const value = window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.autoUpdate;
+    return value === "desktop" || value === "android" ? value : undefined;
+  },
   get captureProtection(): "full" | "recording" | "best-effort" | undefined {
     if (!isNative()) return undefined;
     const value = window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.captureProtection;
@@ -17,7 +22,16 @@ export const capabilities = {
     return isNative() && platformName() === "android" &&
       window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.nativeCallNotifications === true;
   },
+  get fileOpen(): boolean {
+    return isNative() && window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.fileOpen === true;
+  },
+  get fileSave(): "dialog" | "downloads" | "share" | undefined {
+    if (!isNative()) return undefined;
+    const value = window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.fileSave;
+    return value === "dialog" || value === "downloads" || value === "share" ? value : undefined;
+  },
   get saveFile(): boolean {
+    if (this.fileSave) return true;
     const platform = platformName();
     return platform !== "ios" && platform !== "android";
   },

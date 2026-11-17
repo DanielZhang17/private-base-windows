@@ -479,6 +479,20 @@
   right: 0;
   top: 0;
 }
+.call-bubble-actions {
+  /* Keep room for Return to call when possible and show the End call row first. */
+  max-height: min(100%, max(3.5rem, 100% - var(--tap-target)));
+  scrollbar-width: none;
+  /* The cover follows the content and hides the edge shadow at the end of the strip. */
+  background-image:
+    linear-gradient(var(--surface-raised), var(--surface-raised)),
+    linear-gradient(to top, color-mix(in srgb, var(--text) 35%, transparent), transparent);
+  background-attachment: local, scroll;
+  background-position: bottom;
+  background-repeat: no-repeat;
+  background-size: 100% 0.5rem;
+}
+.call-bubble-actions::-webkit-scrollbar { display: none; }
 .call-bubble-snapping {
   transition: left var(--duration-base) var(--ease-standard), top var(--duration-base) var(--ease-standard);
 }
@@ -487,4 +501,17 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .call-bubble { transition: none; }
+}
+
+/* Only message surfaces suppress the WebView selection/context callout. */
+@media (pointer: coarse) {
+  .message-action-surface { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+}
+.message-menu-target { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.bubble.bubble-deleted { background: transparent; border: 1px solid var(--line); color: var(--text-muted); font-style: italic; }
+.message-action-popover, .message-action-sheet { animation: ui-fade var(--duration-fast) var(--ease-enter) both; }
+.file-text-dialog { min-width: min(36rem, 100%); }
+@media (hover: hover) and (pointer: fine) {
+  .message-more { opacity: 0; }
+  .message-row:hover .message-more, .message-row:focus-within .message-more, .message-row[data-menu-open] .message-more { opacity: 1; }
 }

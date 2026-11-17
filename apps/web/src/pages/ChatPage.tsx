@@ -2,7 +2,7 @@ import { t, useLocale } from "../i18n/index.js";
 import { useEffect, useRef, useState } from "react";
 import { useConversationMutations } from "../features/chat/useConversationMutations.js";
 import { useConversation } from "../features/chat/useConversation.js";
-import { timedDuration } from "../features/chat/presentation.js";
+import { messageRun, timedDuration } from "../features/chat/presentation.js";
 import { Badge, Button, ConfirmDialog, CountBadge, Dialog, EmptyState, Field, Icon, IconButton, Input, ListItem, Notice, Sheet, Spinner, TopBar, useToast } from "../ui/index.js";
 import MessageBubble from "../components/chat/MessageBubble.js";
 import MessageInput from "../components/chat/MessageInput.js";
@@ -52,9 +52,10 @@ export default function ChatPage() {
         const member = flow.conversation?.members.find((entry) => entry.userId === message.senderId);
         const queueEntry = flow.outgoing.find((row) => row.id === message.id);
         const divider = !index || new Date(messages[index - 1].timestamp).toDateString() !== new Date(message.timestamp).toDateString();
-        return <div key={message.id}>
+        const run = messageRun(messages, index);
+        return <div key={message.id} className={run.first ? "mt-3" : "mt-0.5"}>
           {divider && <DateDivider date={new Date(message.timestamp)} />}
-          <MessageBubble message={message} isOwn={message.senderId === flow.user?.id} isGroup={group} senderAvatarUrl={member?.user.avatarUrl} senderName={member?.user.displayName}
+          <MessageBubble showMeta={run.last} firstInRun={run.first} message={message} isOwn={message.senderId === flow.user?.id} isGroup={group} senderAvatarUrl={member?.user.avatarUrl} senderName={member?.user.displayName}
             failure={queueEntry?.error} onRetry={queueEntry ? () => void flow.retry(message.id) : undefined} onDiscard={queueEntry ? () => void flow.discard(message.id) : undefined} />
         </div>;
       })}

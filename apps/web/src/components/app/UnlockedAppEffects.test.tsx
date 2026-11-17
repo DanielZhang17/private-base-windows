@@ -5,10 +5,10 @@ import type { CallEventPayload, Device, User } from "@e2ee-chat/shared";
 import UnlockedAppEffects from "./UnlockedAppEffects.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { createNotificationWebSocket } from "../../services/notifications.js";
-import { resetMessageSyncState, runUnlockSync } from "../../lib/message-sync.js";
+import { handleMessageDeletion, resetMessageSyncState, runUnlockSync, syncMessages } from "../../lib/message-sync.js";
 import { requestNotificationPermission } from "../../lib/browser-notifications.js";
 import { api } from "../../services/api.js";
-import { deletePendingCall, getPendingCall } from "../../db/index.js";
+import { commitAbandonedMessageHides, getAppDB, deletePendingCall, getPendingCall } from "../../db/index.js";
 import { useCallStore } from "../../stores/callStore.js";
 import { clearRegisteredLocalCallState } from "../../platform/session-cleanup.js";
 
@@ -18,8 +18,8 @@ vi.mock("../../stores/authStore.js", async () => {
 });
 vi.mock("../../services/notifications.js", () => ({ createNotificationWebSocket: vi.fn() }));
 vi.mock("../../services/api.js", () => ({ api: { get: vi.fn() } }));
-vi.mock("../../db/index.js", () => ({ cleanupExpiredFileCache: vi.fn(), cleanupExpiredPendingCalls: vi.fn(), deletePendingCall: vi.fn(), getPendingCall: vi.fn() }));
-vi.mock("../../lib/message-sync.js", () => ({ pruneExpiredPlaintext: vi.fn(), resetMessageSyncState: vi.fn(), syncMessages: vi.fn(), runUnlockSync: vi.fn() }));
+vi.mock("../../db/index.js", () => ({ commitAbandonedMessageHides: vi.fn(), getAppDB: vi.fn(async () => ({})), cleanupExpiredFileCache: vi.fn(), cleanupExpiredPendingCalls: vi.fn(), deletePendingCall: vi.fn(), getPendingCall: vi.fn() }));
+vi.mock("../../lib/message-sync.js", () => ({ startLocalHiddenMessageSync: vi.fn(() => vi.fn()), handleMessageDeletion: vi.fn(), pruneExpiredPlaintext: vi.fn(), resetMessageSyncState: vi.fn(), syncMessages: vi.fn(), runUnlockSync: vi.fn() }));
 vi.mock("../../lib/conversation-cache.js", () => ({ refreshConversationList: vi.fn() }));
 vi.mock("../../lib/browser-notifications.js", () => ({ requestNotificationPermission: vi.fn() }));
 
@@ -29,8 +29,11 @@ const dispose = vi.fn();
 
 beforeEach(() => {
   vi.resetAllMocks();
+  vi.mocked(getAppDB).mockResolvedValue({} as Awaited<ReturnType<typeof getAppDB>>);
+  vi.mocked(syncMessages).mockResolvedValue(undefined);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.useFakeTimers();
+  vi.mocked(handleMessageDeletion).mockResolvedValue(undefined);
   vi.mocked(requestNotificationPermission).mockResolvedValue(true);
   vi.mocked(deletePendingCall).mockResolvedValue(undefined);
   useCallStore.getState().clearAllCalls();
@@ -121,4 +124,26 @@ it("ignores duplicate incoming events without resetting an existing secure invit
   await act(async () => emit(incoming));
   expect(api.get).not.toHaveBeenCalled();
   expect(useCallStore.getState().keyReady).toBe(true);
+});
+
+it("applies presence deletion events immediately on this device", async () => {
+  await act(async () => root.render(<UnlockedAppEffects />));
+  const payload = { conversationId: "chat-1", deletion: { ids: ["message"], deletedAt: 100, deletedByUserId: "alice" } };
+  await act(async () => vi.mocked(createNotificationWebSocket).mock.calls.at(-1)![0].onMessageEvent(payload));
+  expect(handleMessageDeletion).toHaveBeenCalledWith(payload);
+});
+
+it("sweeps pending hides on unlock, every 30 seconds, lock, and sign-out teardown", async () => {
+  await act(async () => root.render(<UnlockedAppEffects />));
+  expect(commitAbandonedMessageHides).toHaveBeenCalledTimes(1);
+  await act(async () => vi.advanceTimersByTimeAsync(29_999));
+  expect(commitAbandonedMessageHides).toHaveBeenCalledTimes(1);
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  expect(commitAbandonedMessageHides).toHaveBeenCalledTimes(2);
+  await act(async () => clearRegisteredLocalCallState());
+  expect(commitAbandonedMessageHides).toHaveBeenCalledTimes(3);
+  await act(async () => vi.advanceTimersByTimeAsync(30_000));
+  expect(commitAbandonedMessageHides).toHaveBeenCalledTimes(3);
+  await act(async () => { useAuthStore.setState({ user: null, accessToken: null }); });
+  expect(commitAbandonedMessageHides).toHaveBeenCalledTimes(4);
 });

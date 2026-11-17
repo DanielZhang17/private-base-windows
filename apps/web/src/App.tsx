@@ -1,7 +1,7 @@
-import { Spinner, ToastProvider } from "./ui/index.js";
+import { Spinner } from "./ui/index.js";
 import { useAuthPhase, useAppLifecycle, type AuthPhase } from "./features/chat/useAppPhase.js";
 import { useRef } from "react";
-import { Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { Routes, Route, Navigate, Outlet, useLocation } from "react-router-dom";
 import LoginPage from "./pages/LoginPage.js";
 import RegisterPage from "./pages/RegisterPage.js";
 import UnlockPage from "./pages/UnlockPage.js";
@@ -11,12 +11,15 @@ import { CallProvider } from "./features/calls/CallProvider.js";
 import CallPage from "./pages/CallPage.js";
 import VerifyPage from "./pages/VerifyPage.js";
 import DeviceLinkPage from "./pages/DeviceLinkPage.js";
+import ClientsPage from "./pages/ClientsPage.js";
 import Layout from "./components/layout/Layout.js";
 import SettingsLayout from "./components/layout/SettingsLayout.js";
 import UnlockedAppEffects from "./components/app/UnlockedAppEffects.js";
 import UiPreferencesEffects from "./components/app/UiPreferencesEffects.js";
 import SessionRepairEffects from "./components/app/SessionRepairEffects.js";
+import { UpdateProvider } from "./features/updates/UpdateProvider.js";
 import WebPushEffects from "./components/app/WebPushEffects.js";
+import SaveFeedbackToastProvider from "./components/app/SaveFeedbackToastProvider.js";
 
 function FullScreenLoader() {
   return (
@@ -87,7 +90,7 @@ export default function App() {
   useAppLifecycle(phase);
 
   return (
-    <ToastProvider>
+    <SaveFeedbackToastProvider>
       <SessionRepairEffects />
       <WebPushEffects unlocked={phase === "unlocked"} />
       <UiPreferencesEffects />
@@ -95,6 +98,9 @@ export default function App() {
 
       <CallProvider enabled={phase === "unlocked"}>
       <Routes>
+        {/* The public download route never mounts the updater, including after in-app navigation. */}
+        <Route path="/clients" element={<ClientsPage />} />
+        <Route element={<UpdateProvider><Outlet /></UpdateProvider>}>
         <Route
           path="/login"
           element={(
@@ -142,8 +148,9 @@ export default function App() {
           <Route path="devices" element={<DeviceLinkPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
       </Routes>
       </CallProvider>
-    </ToastProvider>
+    </SaveFeedbackToastProvider>
   );
 }

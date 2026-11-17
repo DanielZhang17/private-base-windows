@@ -159,6 +159,10 @@ async function main() {
   const conversationId = conversation.id;
   if (!conversationId) throw new Error("Conversation creation did not return an id");
   console.log(`Created direct conversation ${conversationId}`);
+  await request(`/api/conversations/${encodeURIComponent(conversationId)}/accept`, {
+    method: "POST",
+    token: bob.accessToken,
+  });
 
   const pngBytes = Uint8Array.from(Buffer.from(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0jQAAAAASUVORK5CYII=",

@@ -11,6 +11,14 @@ const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
 const themeBlocks = Array.from(css.matchAll(/@plugin "daisyui\/theme"\s*\{([^}]+)\}/g), ([, block]) => block);
 const rawTokens = css.replace(/@plugin "daisyui\/theme"\s*\{[^}]+\}/g, "");
 
+it("uses a background edge cue for overflowing bubble actions without reserving scrollbar width", () => {
+  const strip = css.match(/\.call-bubble-actions\s*\{([^}]+)\}/)?.[1] ?? "";
+  expect(strip).toMatch(/scrollbar-width:\s*none/);
+  expect(strip.match(/linear-gradient\(/g)).toHaveLength(2);
+  expect(strip).toMatch(/background-attachment:\s*local,\s*scroll/);
+  expect(strip).toMatch(/background-position:\s*bottom/);
+});
+
 it("raw design tokens do not collide with DaisyUI dimension or number variables", () => {
   const daisyVariables = new Set(themeBlocks.flatMap((block) =>
     Array.from(block.matchAll(/(--(?:border|radius-[\w-]+|size-[\w-]+|depth|noise))\s*:/g), ([, name]) => name),

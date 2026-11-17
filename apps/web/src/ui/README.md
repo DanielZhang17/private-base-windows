@@ -32,6 +32,7 @@ See everything rendered: run `npx vite` in `apps/web` and open `/ui-gallery.html
 - `size`: `md` is 44px. `sm` is 36px and grows to 44px on touch devices. `lg` is 48px (56px for `IconButton`, used for call controls).
 - `loading` shows a spinner, sets `aria-busy` and disables the button; the label stays.
 - `type` defaults to `"button"`. Pass `type="submit"` in forms.
+- `href` renders a real link (`<a>`) with the identical look, for navigation such as "Sign in" or a download URL: `<Button href="/login" variant="ghost">Sign in</Button>`. It also takes `download`, `target` and `rel`; `target="_blank"` defaults `rel` to `noopener noreferrer`. `loading` on a link sets `aria-busy`/`aria-disabled` and blocks the click.
 
 ### Field, Input, Textarea
 
@@ -88,7 +89,7 @@ toast.show({ tone: "danger", title: "Could not remove member", message: err.mess
   action: { label: "Retry", onClick: retry } });
 ```
 
-Toasts replace `window.alert`. They auto-dismiss after 5s, except `danger`, which stays until dismissed. At most three show at once. Use a toast for the result of an action; use `Notice` for something that belongs to a place on the screen or lasts (form error summary, offline banner, "safety number changed").
+Toasts replace `window.alert`. They auto-dismiss after 5s, except `danger`, which stays until dismissed. Up to three queued toasts can appear alongside a separate, externally timed save notice. Use a toast for the result of an action; use `Notice` for something that belongs to a place on the screen or lasts (form error summary, offline banner, "safety number changed").
 
 ```tsx
 <Notice tone="warning" title="Reconnecting">Messages will send when you are back online.</Notice>
@@ -155,6 +156,16 @@ Toasts replace `window.alert`. They auto-dismiss after 5s, except `danger`, whic
 
 `Spinner` is a labelled `role="status"`; pass `label={null}` when the parent is already `aria-busy`. `Skeleton` is decorative; set `aria-busy="true"` on the region it stands in for.
 
+### Disclosure
+
+```tsx
+<Disclosure summary="Verify download" className="border-t border-line">
+  <p>…checksum and instructions…</p>
+</Disclosure>
+```
+
+Show/hide section on native `<details>`/`<summary>`, so keyboard, screen-reader state and find-in-page come from the browser. The summary row is 44px tall, Small 600 in `brand`, with a `chevron-down` that turns 180° in 120ms when open. Closed by default; `defaultOpen` opens it initially and `onToggle(open)` reports changes. Use it for optional detail that most people skip, not for primary content.
+
 ### Icon
 
 `<Icon name="shield-check" size={20} />`. Names are typed (`IconName`); the full list is `ICON_NAMES` and is shown in the gallery. Decorative by default; pass `label` only when the icon alone carries meaning. Add new icons to `icons/paths.tsx` in the same style (24 grid, 1.75 stroke, round caps, no fill).
@@ -170,3 +181,16 @@ Toasts replace `window.alert`. They auto-dismiss after 5s, except `danger`, whic
 | `pt-safe` `pb-safe` `px-safe` `pl-safe` `pr-safe` | Safe-area padding |
 | `tap-target` | Minimum 44×44 |
 | `drag-region` / `no-drag` | Native window dragging |
+
+
+### ActionMenu
+
+`<ActionMenu open position={{ x, y }} title={label} items={items} onClose={close} />`
+uses a z-40 popover on desktop and the modal bottom Sheet below 640px. Items have
+stable `id`, `label`, `onSelect`, and optional `icon`, `hint`, `separatorBefore`,
+`danger`/`disabled`. Supply `position.source`, `align`, `top` and `keyboard` for
+button alignment/flipping and keyboard-first focus. Pointer openings focus the menu
+container; keyboard openings focus the first item. Phone `preview` replaces the title
+visually while retaining its accessible label. Arrow keys, Home/End and typeahead navigate;
+Escape, outside press and Tab close; focus returns to the opener. Trigger buttons
+should set `aria-haspopup="menu"` and `aria-expanded`. Keep gesture/data logic in features.

@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "windows-files",
+  "description": "Local Windows main window: open supplied files, save to a selected destination and clear Open copies.",
+  "windows": ["main"],
+  "platforms": ["windows"],
+  "permissions": ["allow-open-file", "allow-save-file", "allow-clear-open-cache"]
+}

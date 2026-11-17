@@ -7,5 +7,5 @@ export { notify, requestNotificationPermission } from "./notifications.js";
 export type { NotificationOptions } from "./notifications.js";
 export { copyText } from "./clipboard.js";
 export { openExternal } from "./external.js";
-export { saveFile, SaveUnsupportedError } from "./files.js";
+export { openFile, saveFile, SaveUnsupportedError } from "./files.js";
 export { E2EECallUnsupportedError } from "./calls.js";

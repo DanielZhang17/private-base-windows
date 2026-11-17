@@ -22,3 +22,9 @@ export function formatDuration(seconds: number): string {
   const [unit, divisor] = seconds >= 86400 ? ["day", 86400] as const : seconds >= 3600 ? ["hour", 3600] as const : ["minute", 60] as const;
   return new Intl.NumberFormat(getLocale(), { style: "unit", unit, unitDisplay: "short" }).format(Math.round(seconds / divisor));
 }
+/** Decimal megabytes with one decimal in the app language, e.g. 4764074 → "4.8 MB". */
+export function formatMegabytes(bytes: number): string {
+  return new Intl.NumberFormat(getLocale(), {
+    style: "unit", unit: "megabyte", unitDisplay: "short", minimumFractionDigits: 1, maximumFractionDigits: 1,
+  }).format(bytes / 1_000_000);
+}

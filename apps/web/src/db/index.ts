@@ -1,6 +1,8 @@
-import { openDB, type IDBPDatabase } from "idb";
+import { openDB, type IDBPDatabase, type IDBPTransaction } from "idb";
 import type { SendMessageRequest, SendDirectBatchRequest, InitialMessageHeader, ExpiryKind, WSMessageFrame } from "@e2ee-chat/shared";
 import { normalizeExpiryMetadata } from "../lib/message-retention.js";
+
+import { publishLocalMessageChange } from "../lib/local-message-changes.js";
 
 const DB_NAME = "e2ee-chat";
 const DB_VERSION = 5;
@@ -24,6 +26,8 @@ async function queuedMessageIds(store: { getAllKeys(range: IDBKeyRange): Promise
 }
 
 export interface LocalMessage {
+  deletedAt?: number | null;
+  deletedByUserId?: string | null;
   id: string;
   conversationId: string;
   senderId: string;
@@ -136,41 +140,94 @@ export function getAppDB() {
       }
       return db;
     });
+    // Cache only connection setup. Maintenance failure must never poison DB access;
+    // the unlocked sweep retries it independently.
+    void dbPromise.then(commitAbandonedMessageHides).catch(() => undefined);
   }
   return dbPromise;
 }
 
-export async function saveMessage(message: LocalMessage) {
-  const db = await getAppDB();
-  await db.put("messages", message);
+function deletionMatches(message: LocalMessage, deletion: { conversationId?: string; senderId?: string; deletedByUserId: string }): boolean {
+  return deletion.conversationId === message.conversationId && (deletion.senderId ?? deletion.deletedByUserId) === message.senderId;
 }
+
+function redactMessage(message: LocalMessage, deletion: { deletedAt: number; deletedByUserId: string }): LocalMessage {
+  return {
+    id: message.id, conversationId: message.conversationId, senderId: message.senderId,
+    type: message.type, content: "", timestamp: message.timestamp, status: message.status,
+    expiresAt: message.expiresAt, expiryKind: message.expiryKind,
+    deletedAt: deletion.deletedAt, deletedByUserId: deletion.deletedByUserId,
+  };
+}
+
+/** Clear attachment bytes before the first redaction can erase their reference. */
+async function putMessageWithDeletion(
+  tx: Pick<IDBPTransaction<unknown, string[], "readwrite">, "objectStore">,
+  message: LocalMessage,
+  deletion?: { conversationId?: string; senderId?: string; deletedAt: number; deletedByUserId: string },
+): Promise<LocalMessage> {
+  const messages = tx.objectStore("messages");
+  const barrier = (deletion && deletionMatches(message, deletion) ? deletion : undefined) ?? (message.deletedAt != null
+    ? { deletedAt: message.deletedAt, deletedByUserId: message.deletedByUserId ?? message.senderId } : undefined);
+  if (!barrier) { await messages.put(message); return message; }
+  const existing = await messages.get(message.id) as LocalMessage | undefined;
+  for (const fileId of new Set([extractFileIdFromMessage(message), existing && extractFileIdFromMessage(existing)])) {
+    if (fileId) await tx.objectStore("fileCache").delete(fileId);
+  }
+  const redacted = redactMessage(message, barrier);
+  await messages.put(redacted);
+  return redacted;
+}
+
+export async function saveMessage(message: LocalMessage, current: () => boolean = () => true) {
+  const db = await getAppDB();
+  if (!current()) return;
+  const tx = db.transaction(["messages", "syncState", "fileCache"], "readwrite");
+  const state = tx.objectStore("syncState");
+  if (!await state.get("hidden-message:" + message.id)) {
+    const deletion = await state.get("deleted-message:" + message.id);
+    if (current()) await putMessageWithDeletion(tx, message, deletion);
+  }
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return; }
+  await tx.done;
+}
+
+export interface CachedMessageCursor { timestamp: number; id: string }
+export interface CachedMessagePage { messages: LocalMessage[]; hasOlder: boolean; oldestCursor?: CachedMessageCursor }
 
 async function readConversationMessagePage(
   conversationId: string,
   limit: number,
-  before?: number,
-): Promise<{ messages: LocalMessage[]; hasOlder: boolean }> {
+  before?: number | CachedMessageCursor,
+): Promise<CachedMessagePage> {
   const db = await getAppDB();
   const tx = db.transaction(["messages", "syncState"], "readonly");
   const index = tx.objectStore("messages").index("byConversation");
   const queuedIds = await queuedMessageIds(tx.objectStore("syncState"));
   const upperBound = before === undefined
     ? [conversationId, Number.MAX_SAFE_INTEGER]
-    : [conversationId, Math.max(0, before - 1)];
+    : [conversationId, typeof before === "number" ? Math.max(0, before - 1) : before.timestamp];
   const range = IDBKeyRange.bound([conversationId, 0], upperBound);
   const page: LocalMessage[] = [];
 
   let cursor = await index.openCursor(range, "prev");
   while (cursor && page.length < limit + 1) {
-    page.push({ ...cursor.value as LocalMessage, hasOutgoingEntry: queuedIds.has(cursor.value.id) });
+    const row = cursor.value as LocalMessage;
+    const atOrAfterCursor = typeof before === "object" && row.timestamp === before.timestamp && row.id >= before.id;
+    if (!atOrAfterCursor && !await tx.objectStore("syncState").get("hidden-message:" + row.id)) {
+      const deletion = await tx.objectStore("syncState").get("deleted-message:" + row.id);
+      page.push({ ...(deletion && deletionMatches(row, deletion) ? redactMessage(row, deletion) : row), hasOutgoingEntry: queuedIds.has(row.id) });
+    }
     cursor = await cursor.continue();
   }
 
   await tx.done;
 
+  const messages = page.slice(0, limit).reverse();
   return {
-    messages: page.slice(0, limit).reverse(),
+    messages,
     hasOlder: page.length > limit,
+    oldestCursor: messages[0] ? { timestamp: messages[0].timestamp, id: messages[0].id } : undefined,
   };
 }
 
@@ -181,8 +238,8 @@ export async function getMessages(conversationId: string, limit = 100): Promise<
 
 export async function getCachedConversationMessagesPage(
   conversationId: string,
-  options?: { before?: number; limit?: number },
-): Promise<{ messages: LocalMessage[]; hasOlder: boolean }> {
+  options?: { before?: number | CachedMessageCursor; limit?: number },
+): Promise<CachedMessagePage> {
   return readConversationMessagePage(conversationId, options?.limit ?? 100, options?.before);
 }
 
@@ -203,6 +260,14 @@ export async function saveSyncState(id: string, value: number, cursorId?: string
     cursorId,
     updatedAt: Date.now(),
   } satisfies LocalSyncState);
+}
+
+/** Multiple tabs may finish sync concurrently; an older result cannot regress this cursor. */
+export async function advanceMutationCursor(id: string, value: number): Promise<void> {
+  const tx = (await getAppDB()).transaction("syncState", "readwrite");
+  const previous = await tx.store.get(id);
+  if (!previous || previous.value < value) await tx.store.put({ id, value, updatedAt: Date.now() });
+  await tx.done;
 }
 
 export async function getSyncState(id: string): Promise<LocalSyncState | undefined> {
@@ -291,7 +356,7 @@ export async function commitReceivedMessage(
   state: { session?: LocalSession; senderKey?: LocalSenderKey } = {},
 ): Promise<boolean> {
   const db = await getAppDB();
-  const tx = db.transaction(["messages", "sessions", "senderKeys", "pendingCalls", "syncState"], "readwrite");
+  const tx = db.transaction(["messages", "sessions", "senderKeys", "pendingCalls", "syncState", "fileCache"], "readwrite");
   // Observe aborts even when an individual request rejects first.
   const done = tx.done;
   void done.catch(() => undefined);
@@ -310,7 +375,10 @@ export async function commitReceivedMessage(
     }
     if (effects.pendingCall) await tx.objectStore("pendingCalls").put(effects.pendingCall);
     if (effects.message) {
-      await tx.objectStore("messages").put(effects.message);
+      const deletion = await tx.objectStore("syncState").get("deleted-message:" + id);
+      if (!await tx.objectStore("syncState").get("hidden-message:" + id)) {
+        await putMessageWithDeletion(tx, effects.message, deletion);
+      }
     } else {
       // Control frames need durable dedupe without retaining their decrypted keys/payloads.
       await tx.objectStore("syncState").put({
@@ -538,6 +606,7 @@ export async function saveQueuedMessage(message: LocalMessage, outgoing: LocalOu
   const db = await getAppDB();
   const tx = db.transaction(["messages", "syncState"], "readwrite");
   const queue = tx.objectStore("syncState");
+  if (await queue.get("hidden-message:" + message.id) || await queue.get("deleted-message:" + message.id)) { await tx.done; return; }
   const existing = (await queue.get(OUTGOING_PREFIX + outgoing.id))?.outgoing as LocalOutgoing | undefined;
   if (existing) {
     outgoing.queuedAt = existing.queuedAt;
@@ -547,32 +616,47 @@ export async function saveQueuedMessage(message: LocalMessage, outgoing: LocalOu
   }
   await Promise.all([tx.objectStore("messages").put(message), queue.put(outgoingRecord(outgoing)), tx.done]);
 }
-export async function discardQueuedMessage(id: string): Promise<void> {
+export async function discardQueuedMessage(id: string, current: () => boolean = () => true): Promise<void> {
   const db = await getAppDB();
-  const tx = db.transaction(["messages", "syncState"], "readwrite");
-  await Promise.all([tx.objectStore("messages").delete(id), tx.objectStore("syncState").delete(OUTGOING_PREFIX + id), tx.done]);
+  if (!current()) return;
+  const tx = db.transaction(["messages", "syncState", "fileCache"], "readwrite");
+  const message = await tx.objectStore("messages").get(id) as LocalMessage | undefined;
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return; }
+  const fileId = message && extractFileIdFromMessage(message);
+  if (fileId) await tx.objectStore("fileCache").delete(fileId);
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return; }
+  await tx.objectStore("messages").delete(id);
+  await tx.objectStore("syncState").delete(OUTGOING_PREFIX + id);
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return; }
+  await tx.done;
 }
 
 
 /** Update an existing outbox entry atomically, without resurrecting another tab's discard. */
 export async function updateOutgoingIfPresent(outgoing: LocalOutgoing, message?: LocalMessage, options: { ifUnchanged?: boolean } = {}): Promise<boolean> {
   const db = await getAppDB();
-  const tx = db.transaction(["messages", "syncState"], "readwrite");
+  const tx = db.transaction(["messages", "syncState", "fileCache"], "readwrite");
   const queue = tx.objectStore("syncState");
   const current = (await queue.get(OUTGOING_PREFIX + outgoing.id))?.outgoing as LocalOutgoing | undefined;
   if (!current || (options.ifUnchanged && current.revision !== outgoing.revision)) { await tx.done; return false; }
   await queue.put(outgoingRecord(outgoing));
-  if (message) await tx.objectStore("messages").put(message);
+  if (message && !await queue.get("hidden-message:" + message.id)) {
+    const deletion = await queue.get("deleted-message:" + message.id);
+    await putMessageWithDeletion(tx, message, deletion);
+  }
   await tx.done;
   return true;
 }
 export async function completeOutgoingIfPresent(outgoing: LocalOutgoing, message?: LocalMessage, options: { ifUnchanged?: boolean } = {}): Promise<boolean> {
   const db = await getAppDB();
-  const tx = db.transaction(["messages", "syncState"], "readwrite");
+  const tx = db.transaction(["messages", "syncState", "fileCache"], "readwrite");
   const queue = tx.objectStore("syncState");
   const current = (await queue.get(OUTGOING_PREFIX + outgoing.id))?.outgoing as LocalOutgoing | undefined;
   if (!current || (options.ifUnchanged && current.revision !== outgoing.revision)) { await tx.done; return false; }
-  if (message) await tx.objectStore("messages").put(message);
+  if (message && !await queue.get("hidden-message:" + message.id)) {
+    const deletion = await queue.get("deleted-message:" + message.id);
+    await putMessageWithDeletion(tx, message, deletion);
+  }
   await queue.delete(OUTGOING_PREFIX + outgoing.id);
   await tx.done;
   return true;
@@ -585,4 +669,140 @@ export async function updateOutgoingErrorIfUnchanged(id: string, previous: strin
   const row = (await tx.store.get(OUTGOING_PREFIX + id))?.outgoing as LocalOutgoing | undefined;
   if (row?.error === previous) await tx.store.put(outgoingRecord({ ...row, error: next }));
   await tx.done;
+}
+
+/** Durable barriers prevent delayed sync/ack writes from restoring removed plaintext. */
+/** Last check before publishing any snapshot: pending hides retain their records,
+ * and a deletion marker may have arrived since the snapshot was read. */
+export async function guardMessageForPublish<T extends LocalMessage>(message: T): Promise<T | null> {
+  const tx = (await getAppDB()).transaction("syncState", "readonly");
+  const hidden = await tx.store.get("hidden-message:" + message.id);
+  const deletion = await tx.store.get("deleted-message:" + message.id);
+  await tx.done;
+  if (hidden) return null;
+  return deletion && deletionMatches(message, deletion) ? { ...message, ...redactMessage(message, deletion), fileMetadata: undefined } : message;
+}
+
+export async function isMessageHidden(id: string): Promise<boolean> {
+  return !!await (await getAppDB()).get("syncState", "hidden-message:" + id);
+}
+
+export async function removeLocalMessageContent(id: string, tombstone?: LocalMessage, current: () => boolean = () => true): Promise<boolean> {
+  const db = await getAppDB();
+  if (!current()) return false;
+  const tx = db.transaction(["messages", "syncState", "fileCache"], "readwrite");
+  const messages = tx.objectStore("messages"), state = tx.objectStore("syncState");
+  const existing = await messages.get(id) as LocalMessage | undefined;
+  if (tombstone && existing && (existing.senderId !== tombstone.senderId || existing.conversationId !== tombstone.conversationId)) { await tx.done; return false; }
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
+  const fileId = existing && extractFileIdFromMessage(existing);
+  if (fileId) await tx.objectStore("fileCache").delete(fileId);
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
+  await state.delete(PENDING_RECEIVE_PREFIX + id);
+  if (tombstone) {
+    await state.put({ id: "deleted-message:" + id, conversationId: tombstone.conversationId, senderId: tombstone.senderId, deletedAt: tombstone.deletedAt, deletedByUserId: tombstone.deletedByUserId });
+    const hidden = await state.get("hidden-message:" + id);
+    if (!hidden || hidden.undoToken) await messages.put(tombstone);
+  } else {
+    await state.put({ id: "hidden-message:" + id });
+    await messages.delete(id);
+    // Suppress replay without retaining any content or file key.
+    await state.put({ id: RECEIVED_PREFIX + id, expiresAt: existing?.expiresAt ?? null });
+    await state.delete("deleted-message:" + id);
+  }
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
+  await tx.done;
+  publishLocalMessageChange(id, tombstone ? "commit" : "hide", tombstone?.conversationId ?? existing?.conversationId);
+  return true;
+}
+
+export async function getMessageDeletion(id: string): Promise<{ conversationId: string; senderId?: string; deletedAt: number; deletedByUserId: string } | undefined> {
+  return (await getAppDB()).get("syncState", "deleted-message:" + id);
+}
+export async function rememberMessageDeletion(id: string, conversationId: string, deletedAt: number, deletedByUserId: string, senderId = deletedByUserId, current: () => boolean = () => true): Promise<boolean> {
+  const tx = (await getAppDB()).transaction(["messages", "syncState", "fileCache"], "readwrite");
+  const message = await tx.objectStore("messages").get(id) as LocalMessage | undefined;
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
+  if (message && (message.conversationId !== conversationId || message.senderId !== senderId)) { await tx.done; return false; }
+  if (message) await putMessageWithDeletion(tx, message, { conversationId, senderId, deletedAt, deletedByUserId });
+  await tx.objectStore("syncState").put({ id: "deleted-message:" + id, conversationId, senderId, deletedAt, deletedByUserId });
+  await tx.objectStore("syncState").delete(PENDING_RECEIVE_PREFIX + id);
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
+  await tx.done;
+  if (message) publishLocalMessageChange(id, "commit", conversationId);
+  return true;
+}
+
+/** Fanout envelopes share a logical prefix, but each device has one display record. */
+export async function getMessageFamily(rootId: string, conversationId: string, senderId: string): Promise<LocalMessage[]> {
+  const rows = await (await getAppDB()).getAll("messages", IDBKeyRange.bound(rootId, rootId + ":\uffff")) as LocalMessage[];
+  return rows.filter((row) => (row.id === rootId || row.id.startsWith(rootId + ":"))
+    && row.conversationId === conversationId && row.senderId === senderId);
+}
+
+/** Hide durably before showing Undo. The retained record is never returned by history reads. */
+export async function beginMessageHide(id: string, current: () => boolean = () => true): Promise<{ token: string; deadline: number } | null> {
+  const tx = (await getAppDB()).transaction(["messages", "syncState"], "readwrite");
+  const state = tx.objectStore("syncState");
+  const message = await tx.objectStore("messages").get(id) as LocalMessage | undefined;
+  if (!message || await state.get(OUTGOING_PREFIX + id) || await state.get("hidden-message:" + id)) { await tx.done; return null; }
+  if (!current()) { await tx.done; return null; }
+  const undoToken = crypto.randomUUID(), undoDeadline = Date.now() + 5000;
+  await state.put({ id: "hidden-message:" + id, undoToken, undoDeadline });
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return null; }
+  await tx.done;
+  publishLocalMessageChange(id, "hide", message.conversationId);
+  return { token: undoToken, deadline: undoDeadline };
+}
+
+const pendingHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+async function finishMessageHideInDB(db: IDBPDatabase, id: string, token: string, undo: boolean, current: () => boolean = () => true): Promise<LocalMessage | undefined> {
+  const cancelTimer = () => { clearTimeout(pendingHideTimers.get(token)); pendingHideTimers.delete(token); };
+  const tx = db.transaction(["messages", "syncState", "fileCache"], "readwrite");
+  const state = tx.objectStore("syncState"), messages = tx.objectStore("messages");
+  const hidden = await state.get("hidden-message:" + id);
+  if (hidden?.undoToken !== token) { await tx.done; cancelTimer(); return; }
+  const message = await messages.get(id) as LocalMessage | undefined;
+  const deletion = await state.get("deleted-message:" + id);
+  const expired = message && normalizeExpiryMetadata(message).expiresAt <= Date.now();
+  if (undo && !current()) { await tx.done; return; }
+  if (undo && message && !expired && Date.now() < (hidden.undoDeadline ?? 0)) {
+    const restored = await putMessageWithDeletion(tx, message, deletion);
+    if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return; }
+    await state.delete("hidden-message:" + id);
+    if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return; }
+    await tx.done;
+    cancelTimer();
+    publishLocalMessageChange(id, "undo", restored.conversationId);
+    return restored;
+  }
+  const fileId = message && extractFileIdFromMessage(message);
+  if (fileId) await tx.objectStore("fileCache").delete(fileId);
+  await messages.delete(id);
+  await state.put({ id: "hidden-message:" + id });
+  await state.put({ id: RECEIVED_PREFIX + id, expiresAt: message?.expiresAt ?? null });
+  await state.delete(PENDING_RECEIVE_PREFIX + id);
+  await tx.done;
+  cancelTimer();
+  publishLocalMessageChange(id, "commit", message?.conversationId);
+}
+export async function finishMessageHide(id: string, token: string, undo: boolean, current: () => boolean = () => true): Promise<LocalMessage | undefined> {
+  return finishMessageHideInDB(await getAppDB(), id, token, undo, current);
+}
+/** Preserve active Undo windows and ensure reopened pages still commit at the deadline. */
+export async function commitAbandonedMessageHides(db: IDBPDatabase): Promise<void> {
+  const pending = await db.getAll("syncState", IDBKeyRange.bound("hidden-message:", "hidden-message:\uffff"));
+  for (const record of pending) {
+    if (!record.undoToken || !Number.isFinite(record.undoDeadline)) continue;
+    const id = record.id.slice("hidden-message:".length), token = record.undoToken;
+    const remaining = record.undoDeadline - Date.now();
+    if (remaining <= 0) await finishMessageHideInDB(db, id, token, false);
+    else if (!pendingHideTimers.has(token)) {
+      pendingHideTimers.set(token, setTimeout(() => {
+        // A failed write is retried by the unlocked periodic/teardown sweep.
+        void finishMessageHideInDB(db, id, token, false).catch(() => undefined);
+      }, remaining));
+    }
+  }
 }

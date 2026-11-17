@@ -492,9 +492,13 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
           console.error("Call signaling WebSocket error");
         };
 
-        ws.onclose = () => {
+        ws.onclose = (event) => {
           if (!isCurrent()) return;
           wsOpen = false;
+          if (event.code === 4403) {
+            setError(localized("callSignalingFailed"));
+            setStage("ended");
+          }
         };
 
         // --- Connecting timeout: give up after 30s if still not connected ---

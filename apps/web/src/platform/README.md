@@ -1,7 +1,7 @@
 # Platform integration
 
 Import `isNative`, `platformName`, `capabilities`, `navigate`, `notify`,
-`copyText`, `openExternal`, and `saveFile` from `platform/index.ts`.
+`copyText`, `openExternal`, `openFile`, and `saveFile` from `platform/index.ts`.
 Capabilities use getters; read them when rendering or starting an operation.
 
 - `notify({ title, body?, onClick?, tag?, icon? }): Promise<boolean>` requests
@@ -12,11 +12,12 @@ Capabilities use getters; read them when rendering or starting an operation.
   clipboard, with a selection fallback for older browsers.
 - `openExternal(url): Promise<void>` accepts absolute HTTP/HTTPS URLs and opens
   the system browser on native, or a browser tab without an opener on web.
-- `capabilities.saveFile` is true on web (including mobile browsers) and native
-  desktop, and false on native iOS/Android until a native share-sheet save is added.
-- `saveFile(blob, filename): Promise<void>` uses a native desktop save dialog
-  followed by a write to the selected path; cancellation does not write a file.
-  Web uses a temporary object URL and download link. When `capabilities.saveFile`
+- `capabilities.saveFile` is true on web and native desktop. On native iOS/Android
+  it becomes true when the shell advertises `fileSave` (see the command contract below).
+- `saveFile(blob, filename): Promise<"saved" | "cancelled" | undefined>` returns the
+  native command result, or reports the outcome of the legacy desktop save dialog
+  and file write. Web uses a temporary object URL and download link and resolves
+  to `undefined`. When `capabilities.saveFile`
   is false, it rejects with `SaveUnsupportedError` (`code: "SAVE_UNSUPPORTED"`,
   exported from `platform/index.ts`) before importing either dialog or fs.
   Image/video previews do not depend on save support.
@@ -68,8 +69,8 @@ opener, dialog, and fs. Grant these permissions to the app webview:
   adds the chosen destination to the filesystem scope. Do not grant unrestricted
   filesystem access. Native mobile receives no fs write grant: fs plugin 2.7.1
   does not enforce selected-path scopes for mobile `file://` URLs. The frontend
-  therefore rejects mobile saves without loading dialog/fs. Native/core will add
-  a share-sheet save path later.
+  therefore rejects mobile saves without loading dialog/fs unless the shell advertises
+  the scoped `save_file` command below.
 
 Supply `VITE_API_BASE_URL=https://chat-api.718788.xyz` when building the frontend
 (example: `apps/web/.env.native.example`). Native startup rejects a missing or
@@ -108,3 +109,106 @@ Hidden native wakeups may decline; Accept and conversation navigation wait for a
 visible unlocked session. Accept validates the current secure invite and server
 state before using the existing local-consent invitation owner. No native event
 payload or notification alone grants call ownership.
+
+## Native auto-update
+
+`capabilities.autoUpdate` reads the native pre-JS `autoUpdate: "desktop" | "android"`
+flag without altering other capability keys. Browsers, iOS and older shells do not
+check for updates or display update controls. `updates.ts` wraps the fixed native
+commands and progress event; it passes only the selected channel to a check, never
+a URL. Native owns rollout, blocking, downgrade protection and verification.
+`getVersion()` uses Tauri's embedded app version. `features/updates` owns a single
+auth-independent lifecycle beneath CallProvider, including call-aware install
+deferral. Native integration, manifest layout and acceptance are in
+[releasing.md](../../../../docs/releasing.md).
+
+
+## Native file command contract v2 (binary IPC)
+
+Before JavaScript starts, advertise supported commands on
+`window.__PRIVATEBASE_NATIVE_CAPABILITIES__`:
+
+```ts
+{ fileOpen: true, fileSave: "dialog" | "downloads" | "share" }
+```
+
+Only advertise each flag once its command is implemented and permitted. The frontend
+passes a **raw `Uint8Array` body**, never a JSON object or number array:
+
+```ts
+invoke("open_file", bytes /* Uint8Array */, {
+  headers: { "x-file-name": encodeURIComponent(name), "x-mime-type": mimeType }
+}) // Promise<void>; rejects "unsupported" | "no_app" | "cancelled" | "blocked"
+invoke("save_file", bytes /* Uint8Array */, {
+  headers: { "x-file-name": encodeURIComponent(name), "x-mime-type": mimeType }
+}) // Promise<"saved" | "cancelled">
+```
+
+Rust commands take `request: tauri::ipc::Request<'_>`, read `InvokeBody::Raw(bytes)`,
+and reject `InvokeBody::Json` with `"unsupported"`. Read and percent-decode the name
+header, validate the MIME form and sanitize the final name. Enforce the 100 MiB cap
+before any copy where possible. Binary IPC avoids the ~30x memory overhead of JSON
+number arrays. `clear_open_cache` and the pre-JS capability flags are unchanged.
+
+A `"blocked"` Open rejection shows the translated safety message and an explicit
+Save action. It never automatically saves or retries Open. Save remains the user's
+choice and can save types refused for Open.
+
+### Native enforcement policy
+
+Native branches enforce the following **before OS handoff**, using case-insensitive
+extension and MIME checks on the final sanitized name. Dangerous last extensions in
+double-extension names are also blocked. These restrictions are native responsibilities;
+web IPC tests assert the binary transport and blocked-to-Save UI behavior.
+
+- Windows Open blocks: exe com scr pif cpl msi msp mst bat cmd ps1 psm1 psd1 ps1xml
+  vbs vbe js jse wsf wsh wsc hta lnk url reg inf scf jar py pyw pyc pyo pyz rb pl php
+  sh bash appref-ms application gadget msc msh* vb chm settingcontent-ms library-ms
+  appx appxbundle msix msixbundle.
+- macOS Open blocks: app command tool sh bash zsh csh ksh terminal workflow action
+  scpt scptd applescript pkg mpkg jar py pl rb php osx dylib bundle plugin kext prefPane.
+- Executable/script MIME types (including application/x-msdownload, application/x-sh,
+  application/x-executable, application/java-archive and text/x-python) are blocked.
+- Android Open also blocks APK (`application/vnd.android.package-archive`). Mobile
+  viewers retain OS sandboxing. Blocked files can still be saved explicitly.
+Before handing a file to the OS, check both the case-insensitive extension and MIME
+against the Open policy on the final sanitized name, including double extensions
+whose last component is dangerous. Rejections use `"blocked"`; Save stays allowed.
+
+- Before opening **and when saving**, Windows marks received copies with the
+  `Zone.Identifier` ADS (`[ZoneTransfer]\r\nZoneId=3\r\n`) or IAttachmentExecute.
+  macOS sets `com.apple.quarantine` to `0081;<hex unix time>;Private Base;<UUID>`.
+  This preserves SmartScreen/Gatekeeper and Office downloaded-file protections.
+
+`openFile(blob, filename, mimeType)` uses `open_file` when `fileOpen` is true.
+Without that flag, native shells retain the legacy save behavior: a selected-path
+save dialog on desktop, or a visible unsupported notice on mobile. With `fileSave`,
+`saveFile` uses `save_file`; mobile never imports the desktop dialog/fs plugins.
+The `share` mode labels the message-menu action Share file. Android confirms
+`downloads` saves with a native notification or an Open action in a Snackbar.
+The web UI shows success notices for desktop dialog saves and localized errors
+for failed native saves. Native implementations
+must sanitize names, scope any temporary files, clean them up, and never log names
+or bytes. Native Open necessarily hands decrypted bytes to the selected application.
+Cancellation from Save resolves without writing; Open rejections display a toast.
+
+On web, PDFs open in a new tab using a newly created blob whose MIME type is forced
+unconditionally to `application/pdf`, regardless of the input blob's declared type.
+The direct tab path uses `noopener`. For asynchronous fetching/decryption, the hook
+reserves a trusted blank tab during every tap (including cached PDFs), detects blocked
+reservations before loading, immediately sets its `opener` to null,
+and navigates it only after the forced-PDF blob is ready. The browser PDF viewer
+handles PDF bytes in its plugin context; HTML/script bytes mislabeled as PDF are
+never parsed into an app-origin document. PDF blob URLs are revoked after 60 seconds.
+PDFs never use an iframe, since Chromium can show a blank viewer in sandboxed frames.
+
+Plain text/Markdown/CSV render inside the app Dialog as a React `<pre>` text node
+(`textContent`), with no HTML parsing. Preview decoding/rendering is capped at 2 MiB,
+checking both advertised and actual decrypted size. Larger text offers Download;
+there is no automatic download. Native text/PDF Open still uses `open_file` unchanged.
+
+Known raster images and videos keep the existing `<img>` / `<video>` viewer; their
+adapter tab fallback retains its sandboxed wrapper. SVG, HTML/XHTML, XML, JavaScript
+and unknown types remain download-only, regardless of a `.pdf` filename. No attachment
+content or filename enters generated wrapper HTML. Decrypted bytes remain in memory;
+only user-initiated downloads write them. No decrypted attachment enters IndexedDB.

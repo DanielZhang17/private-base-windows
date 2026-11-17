@@ -1,6 +1,6 @@
 import ts from "typescript";
 import { expect, it } from "vitest";
-const views = import.meta.glob<string>(["../pages/**/*.tsx", "../components/**/*.tsx", "../ui/**/*.tsx", "!../**/*.test.tsx"], { eager: true, query: "?raw", import: "default" });
+const views = import.meta.glob<string>(["../pages/**/*.tsx", "../components/**/*.tsx", "../ui/**/*.tsx", "../features/updates/**/*.tsx", "!../**/*.test.tsx"], { eager: true, query: "?raw", import: "default" });
 // Proper names and the literal confirmation token are intentionally unchanged.
 const allowed = new Set(["Private Base", "Genshin", "#14586e"]);
 const props = new Set(["placeholder", "aria-label", "title", "label", "description", "subtitle", "help", "confirmLabel", "cancelLabel", "acknowledgeLabel", "alt"]);

@@ -1,6 +1,6 @@
 import { act } from "react";
 import { getByRole } from "@testing-library/dom";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { setLocalePreference, t } from "../i18n/index.js";
 import { localized } from "../i18n/messages.js";
 import { ToastProvider, useToast } from "./Toast.js";
@@ -45,4 +45,30 @@ it.each([false, true])("renders JSX toast titles and messages as elements (keyed
   const toast = getByRole(document.body, "status");
   expect(toast.querySelector("strong")?.textContent).toBe("JSX title");
   expect(getByRole(toast, "link", { name: "View details" }).getAttribute("href")).toBe("#details");
+});
+
+it("keeps Undo visible and actionable when a save notice appears at the toast cap", async () => {
+  vi.useFakeTimers();
+  const undo = vi.fn();
+  function Probe() {
+    const toast = useToast();
+    return <button onClick={() => {
+      toast.show({ message: localized("messageDeletedForYou"), action: { label: localized("undo"), onClick: undo } });
+      toast.show({ message: "First notification" });
+      toast.show({ message: "Second notification" });
+    }}>Show</button>;
+  }
+  await render(<ToastProvider><Probe /></ToastProvider>);
+  await click(getByRole(document.body, "button", { name: "Show" }));
+  const undoButton = getByRole(document.body, "button", { name: "Undo" });
+  await act(async () => vi.advanceTimersByTime(1000));
+  await render(<ToastProvider controlledToast={{ tone: "success", title: localized("fileSaved"), message: "notes.pdf", onDismiss: vi.fn() }}>
+    <Probe />
+  </ToastProvider>);
+  const notifications = getByRole(document.body, "region", { name: "Notifications" });
+  expect(notifications.textContent).toContain("Savednotes.pdf");
+  expect(getByRole(notifications, "button", { name: "Undo" })).toBe(undoButton);
+  await act(async () => vi.advanceTimersByTime(3999));
+  await click(undoButton);
+  expect(undo).toHaveBeenCalledOnce();
 });

@@ -116,3 +116,49 @@ it.each(["upload-url", "PUT", "encryption"])("clears file preparation and shows 
     expect(useChatStore.getState().messages.get("chat")).toEqual([]);
   } finally { await act(async () => root.unmount()); }
 });
+
+it.each(["hidden-success", "hidden-failure", "deleted-success", "deleted-failure", "discard-success", "discard-failure"])("does not republish a file after %s during preparation", async (scenario) => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  let state!: ReturnType<typeof useSendMessage>;
+  function Probe() { state = useSendMessage({ id: "chat", type: "direct" } as ConversationWithMembers); return null; }
+  const root = createRoot(document.createElement("div"));
+  let finish!: () => void;
+  let reject!: () => void;
+  vi.mocked(encryptFile).mockImplementationOnce(() => new Promise((resolve, fail) => {
+    finish = () => resolve(new Uint8Array([9])); reject = () => fail(new Error("Encryption failed after removal"));
+  }));
+  await act(async () => root.render(<Probe />));
+  try {
+    const file = new File(["data"], "private.txt", { type: "text/plain" });
+    Object.defineProperty(file, "arrayBuffer", { value: async () => new Uint8Array([1]).buffer });
+    let sending!: Promise<void>;
+    act(() => { sending = state.handleSendFile(file, { ttlSeconds: null }); });
+    await act(async () => { await vi.waitFor(() => expect(encryptFile).toHaveBeenCalled()); });
+    const message = useChatStore.getState().messages.get("chat")![0];
+    const { removeLocalMessageContent } = await import("../../db/index.js");
+    const { deleteMessageForLocalUserOnly } = await import("../../lib/message-sync.js");
+    await act(async () => {
+      if (scenario.startsWith("deleted")) {
+        await removeLocalMessageContent(message.id, { ...message, content: "", deletedAt: 123, deletedByUserId: "alice" });
+        useChatStore.getState().addMessage("chat", { ...message, content: "", deletedAt: 123 });
+      } else {
+        await state.discard(message.id);
+        if (scenario.startsWith("hidden")) await deleteMessageForLocalUserOnly("chat", message.id);
+      }
+      if (scenario.endsWith("failure")) reject(); else finish();
+      await sending;
+    });
+    if (scenario.startsWith("deleted")) {
+      expect(await getMessageById(message.id)).toMatchObject({ content: "", deletedAt: 123 });
+      expect(useChatStore.getState().messages.get("chat")![0]).toMatchObject({ content: "", deletedAt: 123 });
+      await act(async () => state.discard(message.id));
+    } else {
+      expect(await getMessageById(message.id)).toBeUndefined();
+      expect(useChatStore.getState().messages.get("chat")).toEqual([]);
+    }
+    expect(await getAllOutgoing()).toEqual([]);
+    expect(state.sendError).toBeNull();
+    expect(api.post).not.toHaveBeenCalled();
+    expect(api.put).not.toHaveBeenCalled();
+  } finally { await act(async () => root.unmount()); }
+});

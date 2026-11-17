@@ -65,9 +65,14 @@ class Peer {
 const getUserMedia = vi.fn();
 const socket = { send: vi.fn() };
 let callKey: Awaited<ReturnType<typeof deriveCallKey>>;
-const track = () => ({ kind: "audio", stop: vi.fn() }) as unknown as MediaStreamTrack;
+const track = (kind = "audio") => ({ kind, stop: vi.fn() }) as unknown as MediaStreamTrack;
 const media = (tracks: MediaStreamTrack[]) => ({ getTracks: () => tracks }) as MediaStream;
 const asPc = (pc: Peer) => pc as unknown as RTCPeerConnection;
+class RemoteMediaStream extends EventTarget {
+  private tracks: MediaStreamTrack[] = [];
+  getTracks() { return [...this.tracks]; }
+  addTrack(track: MediaStreamTrack) { this.tracks.push(track); }
+}
 
 function legacy() {
   Sender = LegacySender;
@@ -94,6 +99,7 @@ beforeEach(async () => {
   vi.stubGlobal("RTCRtpSender", undefined);
   vi.stubGlobal("RTCRtpReceiver", undefined);
   vi.stubGlobal("RTCRtpScriptTransform", undefined);
+  vi.stubGlobal("MediaStream", RemoteMediaStream);
   vi.mocked(api.get).mockResolvedValue({ iceServers: [] });
   callKey = await deriveCallKey(new Uint8Array(32), "test-call");
 });
@@ -155,9 +161,10 @@ describe("E2EE call capability and setup", () => {
     expect(RTCRtpScriptTransform).toHaveBeenCalledWith(expect.anything(), { kind: "sender", rawKey: callKey.rawKey });
     const receiver = new ScriptReceiver();
     const remoteStream = media([]);
-    peer.ontrack!({ receiver, track: track(), streams: [remoteStream] } as unknown as RTCTrackEvent);
+    const remoteTrack = track();
+    peer.ontrack!({ receiver, track: remoteTrack, streams: [remoteStream] } as unknown as RTCTrackEvent);
     expect(RTCRtpScriptTransform).toHaveBeenLastCalledWith(expect.anything(), { kind: "receiver", rawKey: callKey.rawKey });
-    expect(onRemote).toHaveBeenCalledWith(remoteStream);
+    expect(onRemote.mock.calls[0][0].getTracks()).toEqual([remoteTrack]);
     await acceptCallOffer(pc, socket as unknown as WebSocket, "encrypted-offer");
     expect(peer.createAnswer).toHaveBeenCalledTimes(1);
   });
@@ -264,6 +271,83 @@ describe("E2EE call capability and setup", () => {
     expect(peer.close).toHaveBeenCalled();
     expect(remoteTrack.stop).toHaveBeenCalled();
     expect(onRemote).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["legacy", "streamless"], ["legacy", "shared"], ["legacy", "separate"],
+    ["script", "streamless"], ["script", "shared"], ["script", "separate"],
+  ])("merges %s %s tracks into one peer stream only after attaching each transform", async (mode, shape) => {
+    if (mode === "legacy") legacy(); else script();
+    const audio = track();
+    const video = track("video");
+    const receivers = mode === "legacy"
+      ? [new LegacyReceiver(), new LegacyReceiver()]
+      : [new ScriptReceiver(), new ScriptReceiver()];
+    const isAttached = (index: number) => mode === "legacy"
+      ? vi.mocked((receivers[index] as LegacyReceiver).createEncodedStreams).mock.calls.length === 1
+      : (receivers[index] as ScriptReceiver).transform !== null;
+    const addTrack = RemoteMediaStream.prototype.addTrack;
+    vi.spyOn(RemoteMediaStream.prototype, "addTrack").mockImplementation(function (this: RemoteMediaStream, added) {
+      // A previously exposed stream is already attached to media elements:
+      // adding a track must also happen strictly after transform attachment.
+      expect(isAttached(added === audio ? 0 : 1)).toBe(true);
+      addTrack.call(this, added);
+    });
+    const snapshots: MediaStreamTrack[][] = [];
+    const onRemote = vi.fn((stream: MediaStream) => { snapshots.push(stream.getTracks()); });
+    await createPeerConnection("call", callKey, onRemote);
+    const peer = Peer.instances[0];
+    const browserStream = media([audio, video]);
+    const emit = (index: number) => peer.ontrack!({ receiver: receivers[index], track: [audio, video][index],
+      streams: shape === "streamless" ? [] : [shape === "shared" ? browserStream : media([[audio, video][index]])],
+    } as unknown as RTCTrackEvent);
+    emit(0);
+    expect(snapshots).toEqual([[audio]]);
+    expect(isAttached(1)).toBe(false);
+    emit(1);
+    emit(0); // Redelivery must not duplicate either the track or transform.
+    const ownedStream = onRemote.mock.calls[0][0];
+    expect(onRemote.mock.calls.every(([stream]) => stream === ownedStream)).toBe(true);
+    expect(ownedStream).not.toBe(browserStream);
+    expect(ownedStream.getTracks()).toEqual([audio, video]);
+    expect(snapshots).toEqual([[audio], [audio, video], [audio, video]]);
+    expect(RemoteMediaStream.prototype.addTrack).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["legacy", "script"])("does not expose streamless tracks when %s receiver setup throws", async (mode) => {
+    if (mode === "legacy") legacy(); else script();
+    const onRemote = vi.fn();
+    await createPeerConnection("call", callKey, onRemote);
+    const receiver = mode === "legacy" ? new LegacyReceiver() : new ScriptReceiver();
+    if (mode === "legacy") {
+      (receiver as LegacyReceiver).createEncodedStreams.mockImplementation(() => { throw new Error("Unavailable"); });
+    } else {
+      vi.mocked(RTCRtpScriptTransform).mockImplementation(() => { throw new Error("Unavailable"); });
+    }
+    const remoteTrack = track();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const addTrack = vi.spyOn(RemoteMediaStream.prototype, "addTrack");
+    Peer.instances[0].ontrack!({ receiver, track: remoteTrack, streams: [] } as unknown as RTCTrackEvent);
+    expect(addTrack).not.toHaveBeenCalled();
+    expect(onRemote).not.toHaveBeenCalled();
+    expect(Peer.instances[0].close).toHaveBeenCalledOnce();
+    expect(remoteTrack.stop).toHaveBeenCalledOnce();
+  });
+
+  it("isolates peer streams and discards tracks after call ownership is revoked", async () => {
+    legacy();
+    const callbacks = [vi.fn(), vi.fn()];
+    let current = true;
+    for (const callback of callbacks) await createPeerConnection("call", callKey, callback, () => current);
+    for (const peer of Peer.instances) peer.ontrack!({ receiver: new LegacyReceiver(), track: track(), streams: [] } as unknown as RTCTrackEvent);
+    expect(callbacks[0].mock.calls[0][0]).not.toBe(callbacks[1].mock.calls[0][0]);
+    current = false;
+    const lateTrack = track("video");
+    const receiver = new LegacyReceiver();
+    Peer.instances[0].ontrack!({ receiver, track: lateTrack, streams: [] } as unknown as RTCTrackEvent);
+    expect(lateTrack.stop).toHaveBeenCalledOnce();
+    expect(receiver.createEncodedStreams).not.toHaveBeenCalled();
+    expect(callbacks[0]).toHaveBeenCalledOnce();
   });
 });
 

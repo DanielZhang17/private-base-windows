@@ -28,6 +28,9 @@ export const ICON_PATHS = {
   devices: <><rect x="3" y="5" width="13" height="10" rx="1.5" /><path d="M2 18h9" /><rect x="15" y="9" width="6" height="11" rx="1.5" /></>,
   "device-phone": <><rect x="7" y="3" width="10" height="18" rx="2" /><path d="M11 17.5h2" /></>,
   "device-desktop": <><rect x="3" y="4" width="18" height="12" rx="1.5" /><path d="M9 20h6m-3-4v4" /></>,
+  "device-tablet": <><rect x="4.5" y="3" width="15" height="18" rx="2" /><path d="M11 17.5h2" /></>,
+  laptop: <><path d="M5 15V6.5A1.5 1.5 0 016.5 5h11A1.5 1.5 0 0119 6.5V15" /><path d="M2.5 15h19l-1 3.2a1 1 0 01-1 .8h-15a1 1 0 01-1-.8l-1-3.2z" /></>,
+  globe: <><circle cx="12" cy="12" r="8.5" /><path d="M3.5 12h17" /><path d="M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5s1.1-6.1 3.4-8.5z" /></>,
   palette: <><path d="M12 3.5a8.5 8.5 0 100 17c1.2 0 1.8-.9 1.8-1.8 0-1.6 1-2.2 2.2-2.2h1.5a3 3 0 003-3c0-5.5-3.8-10-8.5-10z" /><path d="M8 10.5v.01M12 7.5v.01M16 10.5v.01" strokeWidth={2.5} /></>,
   bell: <><path d="M6 16V11a6 6 0 0112 0v5l1.5 2h-15L6 16z" /><path d="M10 20.5a2.2 2.2 0 004 0" /></>,
 
@@ -37,7 +40,9 @@ export const ICON_PATHS = {
   emoji: <><circle cx="12" cy="12" r="8.5" /><path d="M8.5 14a4.2 4.2 0 007 0" /><path d="M9 9.5v.01M15 9.5v.01" strokeWidth={2.5} /></>,
   file: <><path d="M13.5 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8.5L13.5 3z" /><path d="M13.5 3v5.5H19" /></>,
   image: <><rect x="3.5" y="4.5" width="17" height="15" rx="2" /><circle cx="9" cy="10" r="1.5" /><path d="M4 17l4.5-4.5 3.5 3.5 3-3 5 5" /></>,
+  "external-link": <><path d="M14 4h6v6M20 4L10 14" /><path d="M10 4H6a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4" /></>,
   download: <path d="M12 4v11m-5-4.5l5 5 5-5M5 20h14" />,
+  share: <><path d="M12 16V3m-4 4l4-4 4 4" /><path d="M6 11H4v10h16V11h-2" /></>,
   copy: <><rect x="8.5" y="8.5" width="11" height="12" rx="2" /><path d="M15.5 8.5V6a2 2 0 00-2-2H6.5a2 2 0 00-2 2v8a2 2 0 002 2h2" /></>,
   check: <path d="M5 12.5l4.5 4.5L19 7.5" />,
   "check-double": <path d="M2.5 12.5l4.5 4.5 9-9.5M12 15.5l1.5 1.5 9-9.5" />,
@@ -47,6 +52,7 @@ export const ICON_PATHS = {
   trash: <><path d="M4.5 7h15M10 3.5h4M6.5 7l.8 12a1.5 1.5 0 001.5 1.5h6.4a1.5 1.5 0 001.5-1.5l.8-12" /><path d="M10 11v5.5M14 11v5.5" /></>,
 
   // Calls
+  play: <path d="M8 4.5l12 7.5L8 19.5v-15z" />,
   phone: <path d="M5.5 3.5h3l1.5 4.5-2 1.5a12 12 0 006.5 6.5l1.5-2 4.5 1.5v3a2 2 0 01-2 2A16 16 0 013.5 5.5a2 2 0 012-2z" />,
   "phone-off": <><path d="M3 15.5c5-5 13-5 18 0l-1.8 2.8-4-1.2-.4-2.6a9 9 0 00-5.6 0l-.4 2.6-4 1.2L3 15.5z" /></>,
   video: <><rect x="3" y="6.5" width="12.5" height="11" rx="2" /><path d="M15.5 10.5l5-3v9l-5-3" /></>,

@@ -11,6 +11,7 @@ import { useMediaElement } from "./useMediaElement.js";
 import CallBubble from "../../components/calls/CallBubble.js";
 import IncomingCallModal from "../../components/calls/IncomingCallModal.js";
 import { usePushCallInvitation } from "./usePushCallInvitation.js";
+import { CallPlaybackProvider } from "./CallPlaybackContext.js";
 
 /** Mounted above Routes for the whole unlocked session, including persistent audio. */
 export function CallProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
@@ -33,17 +34,17 @@ export function CallProvider({ enabled, children }: { enabled: boolean; children
   const minimized = enabled && !!callId && !match && call.stage !== "ended";
   useEffect(() => { setMinimized(minimized); }, [minimized, setMinimized]);
   useEffect(() => { if (!enabled) clearAllCalls(); }, [enabled, clearAllCalls]);
-  return <IncomingCallContext.Provider value={invitation}><CallContext.Provider value={call}>
+  return <IncomingCallContext.Provider value={invitation}><CallContext.Provider value={call}><CallPlaybackProvider>
     {children}
     {enabled && <CallQueue />}
     {enabled && match && <IncomingCallModal />}
     {enabled && call.remoteEntries.map(([id, stream]) => <RemoteAudio key={id} stream={stream} />)}
     {minimized && <CallBubble />}
-  </CallContext.Provider></IncomingCallContext.Provider>;
+  </CallPlaybackProvider></CallContext.Provider></IncomingCallContext.Provider>;
 }
 
 function RemoteAudio({ stream }: { stream: MediaStream }) {
-  const ref = useMediaElement<HTMLAudioElement>(stream);
+  const { ref } = useMediaElement<HTMLAudioElement>(stream, true);
   return <audio ref={ref} autoPlay />;
 }
 

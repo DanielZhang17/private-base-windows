@@ -15,6 +15,10 @@ export enum WSFrameType {
 }
 
 export interface WSMessageFrame {
+  deletedAt?: number | null;
+  deletedByUserId?: string | null;
+  /** Mutation cursor; timestamp/serverTimestamp remain the original send time. */
+  syncTimestamp?: number;
   type: WSFrameType.Message;
   id: string;
   conversationId: string;
@@ -43,6 +47,7 @@ export interface WSPresenceFrame {
 }
 
 export interface MessageEventPayload {
+  deletion?: { ids: string[]; deletedAt: number; deletedByUserId: string };
   conversationId: string;
 }
 

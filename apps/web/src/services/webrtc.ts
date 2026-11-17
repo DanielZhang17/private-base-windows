@@ -272,11 +272,16 @@ export async function createPeerConnection(
     : new RTCPeerConnection(baseConfig);
   encryptedConnections.add(pc);
 
+  let remoteStream: MediaStream | undefined;
   pc.ontrack = (event) => {
     if (!isCurrent()) { event.track.stop(); return; }
     try {
       addReceiverTransform(event.receiver, callKey);
-      if (event.streams[0]) onRemoteStream(event.streams[0]);
+      // Own one stream per peer, including Safari's streamless events. Never
+      // publish event.streams: it may already contain an untransformed sibling.
+      remoteStream ??= new MediaStream();
+      if (!remoteStream.getTracks().includes(event.track)) remoteStream.addTrack(event.track);
+      onRemoteStream(remoteStream);
     } catch (error) {
       // A broken/partial implementation must never expose an untransformed track.
       pc.close();

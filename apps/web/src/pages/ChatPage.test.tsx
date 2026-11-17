@@ -62,7 +62,7 @@ it("shows a rejected file as failed with its upload reason and Discard", async (
   expect(log.textContent).not.toContain("Sending");
   expect(log.textContent).not.toContain("Encrypting");
   await act(async () => log.querySelector<HTMLButtonElement>('[aria-label="Failed message actions"]')!.click());
-  const dialog = document.body.querySelector('[role="dialog"]')!;
+  const dialog = document.body.querySelector('[role="menu"]')!;
   expect(dialog.textContent).toContain("This file couldn't be uploaded");
   const discardButton = [...dialog.querySelectorAll("button")].find((button) => button.textContent === "Discard")!;
   await act(async () => discardButton.click());

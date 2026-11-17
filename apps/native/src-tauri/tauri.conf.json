@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Private Base",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "identifier": "xyz.chat718788.e2eechat",
   "build": {
     "frontendDist": "../../web/dist-native",
@@ -28,7 +28,7 @@
         "default-src": "'self'",
         "script-src": "'self' 'wasm-unsafe-eval'",
         "worker-src": "'self' blob:",
-        "connect-src": "'self' ipc: http://ipc.localhost https://chat.718788.xyz wss://chat.718788.xyz https://chat-api.718788.xyz wss://chat-api.718788.xyz http://localhost:8787 ws://localhost:8787",
+        "connect-src": "'self' ipc: http://ipc.localhost https://chat.718788.xyz wss://chat.718788.xyz https://chat-api.718788.xyz wss://chat-api.718788.xyz https://dist.718788.xyz http://localhost:8787 ws://localhost:8787",
         "img-src": "'self' blob: data: https://chat.718788.xyz https://chat-api.718788.xyz https://genshin.jmp.blue https://api.dicebear.com",
         "media-src": "'self' blob: mediastream:",
         "style-src": "'self' 'unsafe-inline'"
@@ -38,6 +38,13 @@
   "plugins": {
     "fs": {
       "scopeDroppedPaths": false
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU1RDFDNDY0QkVGNkQyMUUKUldRZTB2YStaTVRSVldRM1g5SVpjaEg5Q2U2WmdSVnZNZlNNRzFZZWVuSGczS0VIS1JaNEZTSkgK",
+      "windows": {
+        "installMode": "passive"
+      },
+      "requireSignedVersion": true
     }
   },
   "bundle": {
@@ -49,6 +56,7 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
   }
 }

@@ -23,7 +23,7 @@ vi.mock("../../services/ws.js", () => ({ createChatWebSocket: vi.fn() }));
 vi.mock("../../services/webrtc.js", () => ({ supportsE2EECalling: vi.fn(() => true) }));
 vi.mock("../../lib/message-sync.js", () => ({ loadPersistedConversationMessages: async () => ({ hasOlder: false }), syncConversationMessages: vi.fn(), ingestMessageFrame: vi.fn(), loadOlderPersistedConversationMessages: vi.fn() }));
 vi.mock("../../lib/conversation-cache.js", () => ({ upsertConversationInCache: vi.fn(), refreshConversationList: vi.fn() }));
-vi.mock("../../db/index.js", () => ({ saveMessage: vi.fn(), getPendingCall: vi.fn(async () => ({})), savePendingCall: vi.fn(async () => {}), deletePendingCall: vi.fn(async () => {}) }));
+vi.mock("../../db/index.js", () => ({ guardMessageForPublish: vi.fn(async (message) => message), saveMessage: vi.fn(), getPendingCall: vi.fn(async () => ({})), savePendingCall: vi.fn(async () => {}), deletePendingCall: vi.fn(async () => {}) }));
 vi.mock("../../lib/direct-messages.js", () => ({ sendDirectPayloadFanout: vi.fn(async () => {}) }));
 let root: Root;
 let state: ReturnType<typeof useConversation>;

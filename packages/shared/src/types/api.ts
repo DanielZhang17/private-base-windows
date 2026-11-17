@@ -155,6 +155,9 @@ export interface SendDirectBatchRequest {
 }
 
 export interface SendMessageResponse {
+  deleted?: boolean;
+  deletedAt?: number;
+  deletedByUserId?: string;
   id: string;
   serverTimestamp: number;
   expiresAt: number | null;
@@ -162,6 +165,9 @@ export interface SendMessageResponse {
 }
 
 export interface SendDirectBatchResponse {
+  deleted?: boolean;
+  deletedAt?: number;
+  deletedByUserId?: string;
   ids: string[];
   serverTimestamp: number;
   expiresAt: number | null;
@@ -171,6 +177,9 @@ export interface SendDirectBatchResponse {
 export interface SyncMessagesResponse {
   messages: Message[];
   hasMore: boolean;
+  mutations: (Message & { mutationSeq: number; deletedAt: number; deletedByUserId: string })[];
+  hasMoreMutations: boolean;
+  mutationCursor: number;
 }
 
 // Custom emoji
