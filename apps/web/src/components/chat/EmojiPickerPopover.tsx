@@ -1,8 +1,51 @@
 import { t, useLocale } from "../../i18n/index.js";
 import { emojiImageUrl, type CustomEmoji } from "../../features/chat/presentation.js";
-import { useMemo, useState } from "react";
+import { Component, lazy, Suspense, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+
+import { tabTarget } from "../../features/stickers/picker-model.js";
+import type { StickerTab } from "../../features/stickers/storage.js";
+import { Button, Spinner } from "../../ui/index.js";
+import { loadStickerPicker } from "./loadStickerPicker.js";
+
+let pickerChunk = lazy(loadStickerPicker);
+
+class StickerPickerBoundary extends Component<{ children: ReactNode; onRetry: () => void }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() { return { failed: true }; }
+
+  render() {
+    return this.state.failed ? <div className="flex flex-1 flex-col items-center gap-2 p-4">
+      <p role="alert" className="text-sm text-ink-muted">{t("stickerPickerUnavailable")}</p>
+      <Button variant="secondary" onClick={this.props.onRetry}>{t("retry")}</Button>
+    </div> : this.props.children;
+  }
+}
+
+function LazyStickerPicker() {
+  const [{ Picker, attempt }, setPicker] = useState({ Picker: pickerChunk, attempt: 0 });
+  const retry = () => {
+    pickerChunk = lazy(loadStickerPicker);
+    setPicker({ Picker: pickerChunk, attempt: attempt + 1 });
+  };
+  return <StickerPickerBoundary key={attempt} onRetry={retry}>
+    <Suspense fallback={<Spinner label={t("stickerPacks")} />}><Picker /></Suspense>
+  </StickerPickerBoundary>;
+}
+
+const emojiSections = ["unicode", "custom"] as const;
+const allSections = [...emojiSections, "stickers"] as const;
+const sectionLabels = { unicode: "emoji", custom: "customEmojiTab", stickers: "stickersTab" } as const;
 
 interface Props {
+  id: string;
+  presentation: "popover" | "panel";
+  panelRef: RefObject<HTMLDivElement | null>;
+  focusOnOpen: boolean;
+  allowStickers?: boolean;
+  tab: StickerTab;
+  onTab: (tab: StickerTab) => void;
+
   customEmojis: CustomEmoji[];
   onSelectUnicode: (emoji: string) => void;
   onSelectCustom: (shortcode: string) => void;
@@ -27,33 +70,42 @@ const EMOJI_GROUPS = [
   },
 ] as const;
 
-export default function EmojiPickerPopover({ customEmojis, onSelectUnicode, onSelectCustom }: Props) {
+export default function ComposerPicker({ id, presentation, panelRef, focusOnOpen, allowStickers = true, tab: selectedTab, onTab, customEmojis, onSelectUnicode, onSelectCustom }: Props) {
   useLocale();
-  const [tab, setTab] = useState<"unicode" | "custom">("unicode");
+  const sections: readonly StickerTab[] = allowStickers ? allSections : emojiSections;
+  const tab = !allowStickers && selectedTab === "stickers" ? "unicode" : selectedTab;
+  const label = t(allowStickers ? "emojiAndStickers" : "addEmoji");
+  const tabs = useRef<Array<HTMLButtonElement | null>>([]);
+  useLayoutEffect(() => {
+    if (focusOnOpen) tabs.current[sections.indexOf(tab)]?.focus({ preventScroll: true });
+  }, [focusOnOpen]);
   const sortedCustomEmojis = useMemo(
     () => [...customEmojis].sort((left, right) => left.shortcode.localeCompare(right.shortcode)),
     [customEmojis],
   );
 
   return (
-    <div className="absolute bottom-full end-0 mb-2 w-80 max-w-[calc(100vw-2rem)] rounded-card border border-line bg-raised shadow-overlay p-3 z-20">
-      <div className="mb-3 flex rounded-control bg-sunken p-1">
-        <button
-          type="button"
-          aria-pressed={tab === "unicode"} className={`min-h-11 flex-1 rounded-control ${tab === "unicode" ? "bg-surface text-ink" : "text-ink-muted"}`}
-          onClick={() => setTab("unicode")}
-        >
-          {t("emoji")}</button>
-        <button
-          type="button"
-          aria-pressed={tab === "custom"} className={`min-h-11 flex-1 rounded-control ${tab === "custom" ? "bg-surface text-ink" : "text-ink-muted"}`}
-          onClick={() => setTab("custom")}
-        >
-          {t("customEmojiTab")}</button>
+    <div ref={panelRef} id={id} role={presentation === "panel" ? "region" : "dialog"} aria-label={label} className={`composer-picker composer-picker-${presentation}`}>
+      <div role="tablist" aria-label={label} className="composer-picker-tabs">
+        {sections.map((section, index) => <button key={section} type="button"
+          ref={(button) => { tabs.current[index] = button; }}
+          role="tab" id={`${id}-${section}-tab`} aria-controls={`${id}-${section}`} aria-selected={tab === section} tabIndex={tab === section ? 0 : -1}
+          onClick={() => onTab(section)} onKeyDown={(event) => {
+            const next = tabTarget(event.key, index, sections.length, document.documentElement.dir === "rtl");
+            if (next === undefined) return;
+            event.preventDefault();
+            onTab(sections[next]);
+            tabs.current[next]?.focus({ preventScroll: true });
+          }}>
+          {t(sectionLabels[section])}
+        </button>)}
       </div>
 
+      {sections.filter((section) => section !== tab).map((section) =>
+        <div key={section} hidden id={`${id}-${section}`} role="tabpanel" aria-labelledby={`${id}-${section}-tab`} />)}
+      <div className="composer-picker-content" id={`${id}-${tab}`} role="tabpanel" aria-labelledby={`${id}-${tab}-tab`}>
       {tab === "unicode" ? (
-        <div className="space-y-3 max-h-72 overflow-y-auto pe-1">
+        <div className="space-y-3 overflow-y-auto p-3">
           {EMOJI_GROUPS.map((group) => (
             <div key={t(group.label)}>
               <p className="text-xs font-medium text-ink-muted mb-2">{t(group.label)}</p>
@@ -73,8 +125,8 @@ export default function EmojiPickerPopover({ customEmojis, onSelectUnicode, onSe
             </div>
           ))}
         </div>
-      ) : (
-        <div className="max-h-72 overflow-y-auto pe-1">
+      ) : tab === "custom" ? (
+        <div className="overflow-y-auto p-3">
           {sortedCustomEmojis.length === 0 ? (
             <p className="text-sm text-ink-muted">
               {t("noCustomEmojiYetUploadSomeInSettings")}</p>
@@ -99,7 +151,8 @@ export default function EmojiPickerPopover({ customEmojis, onSelectUnicode, onSe
             </div>
           )}
         </div>
-      )}
+      ) : <LazyStickerPicker />}
+      </div>
     </div>
   );
 }

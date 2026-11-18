@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "windows-biometric-unlock",
+  "description": "Biometric unlock commands for the local Windows main window.",
+  "local": true,
+  "platforms": ["windows"],
+  "windows": ["main"],
+  "permissions": [
+    "allow-biometric-unlock-enroll",
+    "allow-biometric-unlock",
+    "allow-biometric-unlock-remove"
+  ]
+}

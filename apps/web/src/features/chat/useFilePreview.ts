@@ -13,6 +13,9 @@ import { t } from "../../i18n/index.js";
 import { fileUrlResolver } from "../../lib/file-url-resolver.js";
 import { useFileSave } from "../../features/chat/useFileSave.js";
 import { captureSaveFeedback } from "./save-feedback.js";
+import { cacheAttachmentForMessage, getCachedFile } from "../../db/index.js";
+import { getUnlockGeneration, keysLoaded, openCachedAttachment, sealCachedAttachment } from "../../lib/key-manager.js";
+import { registerUnlockedSessionCleanup } from "../../platform/session-cleanup.js";
 
 export const MAX_TEXT_PREVIEW_BYTES = 2 * 1024 * 1024;
 
@@ -20,11 +23,12 @@ const ATTACHMENT_RETRY_DELAYS_MS = [200, 500, 1000, 1500];
 
 export interface FilePreviewOptions {
   fileId: string;
+  messageId?: string;
   fileName: string;
   mimeType: string;
   fileKey: string;
   fileIv: string;
-  sizeBytes: number;
+  sizeBytes?: number;
 }
 
 function toArrayBufferView(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
@@ -45,7 +49,7 @@ async function createResponseError(response: Response): Promise<ApiError> {
   return new ApiError(message, response.status, code);
 }
 
-export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv, sizeBytes }: FilePreviewOptions) {
+export function useFilePreview({ fileId, messageId, fileName, mimeType, fileKey, fileIv, sizeBytes }: FilePreviewOptions) {
   useLocale();
   const { saveUnsupported, handleSave } = useFileSave();
   const active = useRef(false);
@@ -81,11 +85,52 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv, si
     requestRef.current?.abort();
     const request = new AbortController();
     requestRef.current = request;
-    const isCurrent = () => requestRef.current === request && !request.signal.aborted;
+    const auth = useAuthStore.getState();
+    const ownerId = messageId && auth.accessToken && keysLoaded() ? auth.user?.id : undefined;
+    const unlock = ownerId ? getUnlockGeneration() : undefined;
+    const isCurrent = () => requestRef.current === request && !request.signal.aborted && (!ownerId
+      || (keysLoaded() && getUnlockGeneration() === unlock && useAuthStore.getState().user?.id === ownerId
+        && useAuthStore.getState().sessionId === auth.sessionId));
     setLoading(true);
     setError(null);
     setExpired(false);
     try {
+      const key: FileEncryptionKey = { key: fileKey, iv: fileIv };
+      const decryptCompleteFile = async (encrypted: Uint8Array) => {
+        const decrypted = await decryptFile(encrypted, key);
+        if (typeof sizeBytes === "number" && Number.isSafeInteger(sizeBytes) && sizeBytes >= 0 && decrypted.byteLength !== sizeBytes) {
+          throw new LocalizedError("failedToLoadFile");
+        }
+        return decrypted;
+      };
+      const publish = (decrypted: Uint8Array): Blob | null => {
+        if (!isCurrent()) return null;
+        const blob = new Blob([toArrayBufferView(decrypted)], { type: mimeType });
+        loadedBlob.current = blob;
+        if (isInline) {
+          const nextUrl = URL.createObjectURL(blob);
+          if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+          urlRef.current = nextUrl;
+          setObjectUrl(nextUrl);
+        }
+        return blob;
+      };
+      let failedCopy: { cachedAt: number; iv: Uint8Array } | undefined;
+      if (ownerId) {
+        try {
+          const file = await getCachedFile(fileId, ownerId);
+          if (file?.ownerId === ownerId && file.sealed && file.expiresAt > Date.now() && isCurrent()) {
+            let decrypted: Uint8Array | undefined;
+            try {
+              const wire = await openCachedAttachment(ownerId, fileId, file.sealed);
+              decrypted = await decryptCompleteFile(new Uint8Array(await wire.arrayBuffer()));
+            } catch {
+              if (file.explicitTransfer) failedCopy = { cachedAt: file.cachedAt, iv: file.sealed.iv };
+            }
+            if (decrypted) return publish(decrypted);
+          }
+        } catch { /* A stale or damaged cache can fall back to the authorized download. */ }
+      }
       // Only encrypted bytes are fetched; decrypted bytes remain in memory.
       let resolvedUrl: { downloadUrl: string | null; expiresAt: number | null } | null = null;
       for (let attempt = 0; attempt <= ATTACHMENT_RETRY_DELAYS_MS.length; attempt += 1) {
@@ -134,19 +179,15 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv, si
       }
 
       const encryptedBytes = new Uint8Array(await response.arrayBuffer());
-      const key: FileEncryptionKey = { key: fileKey, iv: fileIv };
-      const decrypted = await decryptFile(encryptedBytes, key);
+      const decrypted = await decryptCompleteFile(encryptedBytes);
       if (!isCurrent()) return null;
-      const blob = new Blob([toArrayBufferView(decrypted)], { type: mimeType });
-      loadedBlob.current = blob;
-
-      if (isInline) {
-        const nextUrl = URL.createObjectURL(blob);
-        if (urlRef.current) URL.revokeObjectURL(urlRef.current);
-        urlRef.current = nextUrl;
-        setObjectUrl(nextUrl);
+      if (ownerId && messageId && resolvedUrl.expiresAt != null) {
+        const expiresAt = resolvedUrl.expiresAt;
+        void sealCachedAttachment(ownerId, fileId, new Blob([encryptedBytes])).then((sealed) =>
+          cacheAttachmentForMessage({ id: fileId, ownerId, sealed, cachedAt: Date.now(), expiresAt }, messageId, isCurrent, failedCopy)
+        ).catch(() => undefined);
       }
-      return blob;
+      return publish(decrypted);
     } catch (err: any) {
       if (!isCurrent()) return null;
       if (err instanceof ApiError && err.code === "FILE_EXPIRED") {
@@ -158,7 +199,7 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv, si
     } finally {
       if (isCurrent()) setLoading(false);
     }
-  }, [fileId, fileKey, fileIv, mimeType, isInline]);
+  }, [fileId, messageId, fileKey, fileIv, mimeType, isInline, sizeBytes]);
 
   useEffect(() => {
     active.current = true;
@@ -166,15 +207,26 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv, si
     closeTextPreview();
     loadedBlob.current = null;
     if (isInline) void load();
-    return () => {
-      active.current = false;
+    const release = () => {
       requestRef.current?.abort();
       requestRef.current = null;
       loadedBlob.current = null;
       if (urlRef.current) URL.revokeObjectURL(urlRef.current);
       urlRef.current = null;
     };
-  }, [load, isInline]);
+    const unregister = messageId ? registerUnlockedSessionCleanup(() => {
+      active.current = false;
+      release();
+      setObjectUrl(null);
+      setTextPreview(null);
+      setLoading(false);
+    }) : undefined;
+    return () => {
+      active.current = false;
+      unregister?.();
+      release();
+    };
+  }, [load, isInline, messageId]);
 
   async function handleDownload(): Promise<void> {
     if (!isActive()) return;
@@ -203,7 +255,7 @@ export function useFilePreview({ fileId, fileName, mimeType, fileKey, fileIv, si
     if (!canOpen || (isNative() && !capabilities.fileOpen && capabilities.saveFile)) return handleDownload();
     let prepared: ReturnType<typeof prepareFileOpen> = null;
     try {
-      if (isText && sizeBytes > MAX_TEXT_PREVIEW_BYTES) {
+      if (isText && (sizeBytes ?? 0) > MAX_TEXT_PREVIEW_BYTES) {
         setTextPreview({ content: "", tooLarge: true });
         return;
       }

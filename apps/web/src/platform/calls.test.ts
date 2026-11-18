@@ -11,7 +11,6 @@ vi.mock("../services/api.js", () => ({ api: { get: vi.fn() } }));
 vi.mock("../stores/authStore.js", () => ({ useAuthStore: { getState: () => ({ user: { id: "me" } }) } }));
 vi.mock("../stores/callStore.js", () => ({ useCallStore: { getState: () => ({ setLocalStream: vi.fn(), addRemoteStream: vi.fn() }) } }));
 
-const { webcrypto } = await vi.importActual<{ webcrypto: Crypto }>("node:crypto");
 type Frame = RTCEncodedAudioFrame;
 
 function framePipeline(data?: ArrayBuffer) {
@@ -92,7 +91,6 @@ function script() {
 beforeEach(async () => {
   vi.clearAllMocks();
   Peer.instances = [];
-  vi.stubGlobal("crypto", webcrypto);
   vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
   vi.stubGlobal("RTCSessionDescription", class { constructor(public init: unknown) {} });
   vi.stubGlobal("RTCPeerConnection", undefined);

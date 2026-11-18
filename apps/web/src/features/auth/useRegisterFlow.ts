@@ -1,6 +1,6 @@
 import { localized, renderMessage, type LocalizedMessage } from "../../i18n/messages.js";
 import { toErrorMessage } from "../shared/errors.js";
-import { t, useLocale, getLocale } from "../../i18n/index.js";
+import { t, useLocale } from "../../i18n/index.js";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "../../stores/authStore.js";
@@ -94,7 +94,7 @@ export function useRegisterFlow() {
 
     submitting.current = true;
     setLoading(true);
-    let initialized = false;
+    let vaultId: string | undefined;
     let registered = false;
     let recoveryKey: string | null = null;
     try {
@@ -103,9 +103,9 @@ export function useRegisterFlow() {
         return;
       }
       recoveryKey = generateRecoveryKey();
-      const deviceName = buildDefaultDeviceName(getLocale(), t("browser"));
-      initialized = true;
-      const identityKey = await initializeKeys(password);
+      const deviceName = buildDefaultDeviceName();
+      vaultId = crypto.randomUUID();
+      const identityKey = await initializeKeys(password, vaultId);
       await register(username, displayName, password, recoveryKey, deviceName, identityKey, avatarUrl);
       registered = true;
       const { user, device } = useAuthStore.getState();
@@ -132,7 +132,7 @@ export function useRegisterFlow() {
       }
       setUploadWarning(true);
     } catch (submitError: any) {
-      if (initialized && !registered) await resetLocalCryptoState().catch(() => undefined);
+      if (vaultId && !registered) await resetLocalCryptoState(undefined, vaultId).catch(() => undefined);
       setError(toErrorMessage(submitError, registered ? "yourDeviceKeysWillFinishUploadingAutomatically" : "registrationFailed"));
     } finally {
       submitting.current = false;

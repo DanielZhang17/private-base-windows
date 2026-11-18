@@ -3,7 +3,7 @@ import { getLocale, t, useLocale } from "../../i18n/index.js";
 import { dismissSaveFeedback, presentSaveFeedback, useSaveFeedbackStore } from "../../features/chat/save-feedback.js";
 import { useMediaGestures } from "../../features/chat/useMediaGestures.js";
 import { DarkSurface, IconButton, LiveAnnouncement, Notice, Portal } from "../../ui/index.js";
-import { OVERLAY_RANK, registerOverlay } from "../../ui/overlay-stack.js";
+import { getTopOverlay, OVERLAY_RANK, registerOverlay } from "../../ui/overlay-stack.js";
 import { useModalFocus } from "../../ui/useModalFocus.js";
 import "./MediaViewer.css";
 
@@ -38,14 +38,19 @@ export default function MediaViewer({ objectUrl, fileName, isVideo, onClose, onE
   const closeRef = useRef<HTMLButtonElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const titleId = useId();
+  const dismiss = useRef(onClose);
+  dismiss.current = onClose;
   const saveFeedback = useSaveFeedbackStore(({ topOverlay, notice }) =>
     topOverlay?.kind === "viewer" && topOverlay.id === titleId ? notice : null);
   const announcement = useSaveFeedbackStore(({ announcement }) => announcement?.viewer === titleId ? announcement : undefined);
-  useLayoutEffect(() => registerOverlay({ kind: "viewer", id: titleId, rank: OVERLAY_RANK.mediaViewer }), [titleId]);
+  useLayoutEffect(() => registerOverlay({ kind: "viewer", id: titleId, rank: OVERLAY_RANK.mediaViewer, onBack: () => dismiss.current() }), [titleId]);
   useLayoutEffect(() => {
     if (saveFeedback) presentSaveFeedback(saveFeedback, titleId);
   }, [saveFeedback, titleId]);
-  useModalFocus({ open: true, onClose, panelRef, initialFocusRef: closeRef });
+  useModalFocus({ open: true, onClose, panelRef, initialFocusRef: closeRef, isTop: () => {
+    const top = getTopOverlay();
+    return top?.kind === "viewer" && top.id === titleId;
+  } });
   useEffect(() => {
     const video = videoRef.current;
     return () => { video?.pause(); };

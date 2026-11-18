@@ -1,6 +1,7 @@
 /** Public release manifest for the native clients. No session, token or cookie is ever sent. */
 export const DOWNLOAD_ORIGIN = "https://dist.718788.xyz";
 export const MANIFEST_URL = `${DOWNLOAD_ORIGIN}/private-base/releases/latest.json`;
+export const NOTES_URL = `${DOWNLOAD_ORIGIN}/private-base/releases/notes.json`;
 export const MANIFEST_TIMEOUT_MS = 8_000;
 
 export type PlatformKey = "macos" | "windows" | "android" | "ios";
@@ -93,14 +94,15 @@ export function parseReleaseManifest(input: unknown): ReleaseManifest {
   return { version, published, platforms };
 }
 
-/** Fetches and validates the manifest. Rejects on network errors, timeout, non-2xx and bad JSON. */
-export async function fetchReleaseManifest(signal?: AbortSignal, timeoutMs = MANIFEST_TIMEOUT_MS): Promise<ReleaseManifest> {
+/** Fetches public release metadata without sharing browser credentials. */
+export async function fetchReleaseJson(url: typeof MANIFEST_URL | typeof NOTES_URL, signal?: AbortSignal, timeoutMs = MANIFEST_TIMEOUT_MS): Promise<unknown> {
+  if (signal?.aborted) throw new DOMException("Release request aborted", "AbortError");
   const controller = new AbortController();
   const abort = () => controller.abort();
   signal?.addEventListener("abort", abort, { once: true });
   const timer = setTimeout(abort, timeoutMs);
   try {
-    const response = await fetch(MANIFEST_URL, {
+    const response = await fetch(url, {
       cache: "no-store",
       credentials: "omit",
       mode: "cors",
@@ -110,9 +112,14 @@ export async function fetchReleaseManifest(signal?: AbortSignal, timeoutMs = MAN
       headers: { Accept: "application/json" },
     });
     if (!response.ok) throw new ManifestError(`HTTP ${response.status}`);
-    return parseReleaseManifest(await response.json());
+    return await response.json();
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
   }
+}
+
+/** Fetches and validates the manifest. Rejects on network errors, timeout, non-2xx and bad JSON. */
+export async function fetchReleaseManifest(signal?: AbortSignal, timeoutMs = MANIFEST_TIMEOUT_MS): Promise<ReleaseManifest> {
+  return parseReleaseManifest(await fetchReleaseJson(MANIFEST_URL, signal, timeoutMs));
 }

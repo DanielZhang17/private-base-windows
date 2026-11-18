@@ -10,6 +10,7 @@ export const ACCESS_TOKEN_TTL = 15 * 60; // 15 minutes
 export const REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60; // 30 days
 export const PBKDF2_ITERATIONS = 600_000;
 export const PRESIGNED_URL_EXPIRY = 3600; // 1 hour
+export const MAX_ACTIVE_DEVICES = 10;
 export const DEVICE_LINK_REQUEST_TTL_SECONDS = 10 * 60; // 10 minutes
 export const UNBOUND_FILE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 export const MIN_TIMED_MESSAGE_TTL_SECONDS = 10;

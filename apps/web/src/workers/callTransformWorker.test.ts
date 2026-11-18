@@ -1,12 +1,10 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
-const { webcrypto } = await vi.importActual<{ webcrypto: Crypto }>("node:crypto");
 let onTransform: (event: { transformer: unknown }) => void;
 let rawKey: Uint8Array<ArrayBuffer>;
 
 beforeEach(async () => {
   vi.resetModules();
-  vi.stubGlobal("crypto", webcrypto);
   vi.stubGlobal("self", { addEventListener: (_name: string, listener: typeof onTransform) => { onTransform = listener; } });
   await vi.importActual("./callTransformWorker.js");
   rawKey = new Uint8Array(16);

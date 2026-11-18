@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { renderMessage, type LocalizedMessage } from "../../i18n/messages.js";
 import { useLocale } from "../../i18n/index.js";
@@ -16,7 +16,7 @@ export interface PendingLocalAcceptance { callId: string; epoch: number; deadlin
 export function useCallInvitationOwner(enabled: boolean) {
   useLocale();
   const navigate = useNavigate();
-  const { activeCallId, localCallEpoch } = useCallStore();
+  const { activeCallId, localCallEpoch, callStatus, keyReady } = useCallStore();
   const userId = useAuthStore((state) => state.user?.id);
   const deviceId = useAuthStore((state) => state.device?.id);
   const sessionId = useAuthStore((state) => state.sessionId);
@@ -26,6 +26,7 @@ export function useCallInvitationOwner(enabled: boolean) {
   const generation = useRef(0);
   const mounted = useRef(true);
   const busy = useRef(false);
+  const waitingForKey = useRef<(() => void) | null>(null);
   const [loadingAction, setLoadingAction] = useState<"accept" | "decline" | null>(null);
   const [error, setError] = useState<LocalizedMessage | null>(null);
   const [pendingLocalAcceptance, setPendingLocalAcceptance] = useState<PendingLocalAcceptance | null>(null);
@@ -71,9 +72,10 @@ export function useCallInvitationOwner(enabled: boolean) {
     mounted.current = true;
     return () => { mounted.current = false; generation.current += 1; };
   }, []);
-  useEffect(() => {
+  useLayoutEffect(() => {
     generation.current += 1;
     busy.current = false;
+    waitingForKey.current = null;
     setLoadingAction(null);
     setError(null);
     pendingAcceptanceRef.current = null;
@@ -86,7 +88,7 @@ export function useCallInvitationOwner(enabled: boolean) {
     if (consent && (consent.callId !== activeCallId || !consent.isCurrent() || call.callStatus !== "ringing")) return;
     if (!enabledRef.current || busy.current || !activeCallId || call.activeCallId !== activeCallId ||
         call.direction !== "incoming" || (call.callStatus !== "ringing" && call.callStatus !== "active") ||
-        (action === "accept" && (!call.keyReady || !capabilities.e2eeCalls))) return;
+        (action === "accept" && !capabilities.e2eeCalls)) return;
     const request = generation.current;
     const auth = useAuthStore.getState();
     const epoch = call.localCallEpoch;
@@ -100,6 +102,17 @@ export function useCallInvitationOwner(enabled: boolean) {
         currentAuth.user?.id === auth.user?.id && currentAuth.device?.id === auth.device?.id &&
         (consent ? isSameSession(auth, currentAuth) : currentAuth.sessionId === auth.sessionId);
     };
+    if (action === "accept" && !call.keyReady) {
+      if (!consent && call.callStatus === "ringing" && !waitingForKey.current) {
+        // Keep this tab's click while the encrypted offer is being recovered.
+        waitingForKey.current = () => {
+          if (isCurrent() && useCallStore.getState().callStatus === "ringing") void respond("accept");
+        };
+        setLoadingAction("accept");
+      }
+      return;
+    }
+    waitingForKey.current = null;
     busy.current = true;
     setLoadingAction(action);
     setError(null);
@@ -125,5 +138,18 @@ export function useCallInvitationOwner(enabled: boolean) {
       }
     }
   };
+
+  useEffect(() => {
+    const accept = waitingForKey.current;
+    if (!accept) return;
+    if (callStatus !== "ringing") {
+      waitingForKey.current = null;
+      setLoadingAction(null);
+    } else if (keyReady) {
+      waitingForKey.current = null;
+      setLoadingAction(null);
+      accept();
+    }
+  }, [callStatus, keyReady]);
   return { loadingAction, error: error ? renderMessage(error) : null, respond, pendingLocalAcceptance, finishNativeCaptureWait };
 }

@@ -1,4 +1,5 @@
 import { act } from "react";
+import { BrowserRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setLocalePreference } from "../i18n/index.js";
 import { LATEST } from "../features/clients/manifest.fixture.js";
@@ -27,7 +28,7 @@ async function open(search = "", respond: () => Promise<Response> = async () => 
   window.history.replaceState(null, "", `/clients${search}`);
   fetchMock = vi.fn(respond);
   vi.stubGlobal("fetch", fetchMock);
-  await render(<ToastProvider><ClientsPage /></ToastProvider>);
+  await render(<BrowserRouter><ToastProvider><ClientsPage /></ToastProvider></BrowserRouter>);
   await settle();
 }
 
@@ -78,13 +79,20 @@ describe("loaded", () => {
     const featured = $("section[aria-labelledby='clients-featured']")!;
     expect(featured.textContent).toContain("Apple silicon");
     expect(featured.textContent).toContain("macOS 12.3 or later");
-    expect(featured.textContent).toContain("Open Anyway");
+    expect(featured.textContent).toContain("System Settings › Privacy & Security and choose Open Anyway.");
+    expect(featured.textContent).toContain("choosing Open works only on macOS 14 and earlier.");
     const details = featured.querySelector("details")!;
     expect(details.open).toBe(false);
     expect(details.querySelectorAll(".secret-text span")).toHaveLength(8);
     expect(details.textContent).toContain("shasum -a 256 ~/Downloads/PrivateBase-0.0.1-20261115-macos-arm64.dmg");
     expect(details.textContent).toContain("The result must match the checksum above.");
-    expect(text("footer")[0]).toMatch(/^Version 0\.0\.1-20261115 · Published November 1[67], 2026$/);
+    expect(text("footer p")[0]).toMatch(/^Version 0\.0\.1-20261115 · Published November 1[67], 2026$/);
+    expect($("footer a[href='/clients/releases?platform=macos']")?.textContent).toBe("What’s new");
+  });
+
+  it("displays the Android 7.0 minimum with a localized requirement suffix", async () => {
+    await open("?platform=android");
+    expect($("section[aria-labelledby='clients-featured']")?.textContent).toContain("Android 7.0 or later");
   });
 
   it.each([

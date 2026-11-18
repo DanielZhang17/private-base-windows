@@ -24,7 +24,9 @@
     "date-fns": "^4.1.0",
     "i18next": "25.5.2",
     "idb": "^8.0.2",
+    "jsqr": "1.4.0",
     "mediabunny": "1.65.0",
+    "qrcode": "1.5.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-i18next": "15.7.3",
@@ -34,6 +36,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.0",
     "@testing-library/dom": "10.4.1",
+    "@types/qrcode": "1.5.5",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^4.5.0",

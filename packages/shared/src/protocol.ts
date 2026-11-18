@@ -1,3 +1,4 @@
+import type { DeviceAlert } from "./types/users.js";
 import type { CallEventPayload } from "./types/calls.js";
 
 export enum WSFrameType {
@@ -9,12 +10,17 @@ export enum WSFrameType {
   Signal = "signal",
   Call = "call",
   Conversation = "conversation",
+  DeviceAlert = "device.alert",
+  DeviceAlertAcknowledged = "device.alert.acknowledged",
+  DeviceRevoked = "device.revoked",
   Profile = "profile",
   Ack = "ack",
   Error = "error",
 }
 
 export interface WSMessageFrame {
+  latestEditSeq?: number | null;
+  editKeyAccepted?: boolean;
   deletedAt?: number | null;
   deletedByUserId?: string | null;
   /** Mutation cursor; timestamp/serverTimestamp remain the original send time. */
@@ -32,6 +38,8 @@ export interface WSMessageFrame {
   expiryKind: "timed" | "retention";
   senderId: string;
   senderDeviceId: string;
+  /** Server routing target on a live frame. Targeting the sender confirms acceptance. */
+  recipientDeviceId?: string;
 }
 
 export interface WSTypingFrame {
@@ -48,7 +56,23 @@ export interface WSPresenceFrame {
 
 export interface MessageEventPayload {
   deletion?: { ids: string[]; deletedAt: number; deletedByUserId: string };
+  edit?: MessageEditFrame;
+  editAvailable?: boolean;
   conversationId: string;
+}
+
+export interface MessageEditFrame {
+  messageId: string;
+  conversationId: string;
+  senderId: string;
+  senderDeviceId: string;
+  ciphertext: string;
+  nonce: string;
+  signature: string;
+  editSeq: number;
+  expiresAt: number;
+  editedAt: number;
+  mutationSeq: number;
 }
 
 export interface WSMessageEventFrame {
@@ -109,7 +133,26 @@ export interface WSErrorFrame {
   message: string;
 }
 
+export interface WSDeviceAlertFrame {
+  type: WSFrameType.DeviceAlert;
+  payload: DeviceAlert;
+}
+
+export interface WSDeviceAlertAcknowledgedFrame {
+  type: WSFrameType.DeviceAlertAcknowledged;
+  alertId: string;
+}
+
+export interface WSDeviceRevokedFrame {
+  type: WSFrameType.DeviceRevoked;
+  deviceId: string;
+  replacementDeviceName?: string;
+}
+
 export type WSFrame =
+  | WSDeviceRevokedFrame
+  | WSDeviceAlertFrame
+  | WSDeviceAlertAcknowledgedFrame
   | WSMessageFrame
   | WSMessageEventFrame
   | WSTypingFrame

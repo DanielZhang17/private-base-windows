@@ -1,12 +1,13 @@
 import { t, useLocale } from "../i18n/index.js";
-import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Button, IconButton } from "./Button.js";
 import { cx } from "./cx.js";
 import { Icon } from "./Icon.js";
 import type { IconName } from "./icons/paths.js";
 import { useModalFocus } from "./useModalFocus.js";
 import { Portal } from "./Portal.js";
-import { OVERLAY_RANK, registerOverlay } from "./overlay-stack.js";
+import { OVERLAY_RANK } from "./overlay-stack.js";
+import { useOverlayLayer } from "./useOverlayLayer.js";
 
 interface OverlayProps {
   open: boolean;
@@ -15,6 +16,7 @@ interface OverlayProps {
   title: ReactNode;
   ariaLabel?: string;
   closeButtonSize?: "sm" | "md";
+  dismissOnBack?: boolean;
   description?: ReactNode;
   /** When false, Esc and the scrim do nothing and no close button is shown: the user must pick an action. */
   dismissible?: boolean;
@@ -37,6 +39,7 @@ function Overlay({
   title,
   ariaLabel,
   closeButtonSize = "sm",
+  dismissOnBack = false,
   description,
   dismissible = true,
   initialFocusRef,
@@ -52,8 +55,8 @@ function Overlay({
   const panelRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
 
-  useLayoutEffect(() => open ? registerOverlay({ kind: "modal", rank: OVERLAY_RANK.dialog }) : undefined, [open]);
-  useModalFocus({ open, onClose, dismissible, panelRef, bodyRef, initialFocusRef });
+  const isTop = useOverlayLayer(open, "modal", OVERLAY_RANK.dialog, () => { if (dismissible) onClose(); }, dismissOnBack);
+  useModalFocus({ open, onClose, dismissible, panelRef, bodyRef, initialFocusRef, isTop });
 
   if (!open) return null;
 
@@ -67,7 +70,7 @@ function Overlay({
       )}
       data-overlay-scrim=""
       onMouseDown={(event) => {
-        if (dismissible && event.target === event.currentTarget) onClose();
+        if (isTop() && dismissible && event.target === event.currentTarget) onClose();
       }}
     >
       <div

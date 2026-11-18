@@ -1,6 +1,8 @@
 import { useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../services/api.js";
+import { createDeviceActionPayload } from "@e2ee-chat/shared";
+import { signWithIdentityKey } from "../../lib/key-manager.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { capabilities } from "../../platform/capabilities.js";
 import { getCaptureProtection, setCaptureProtection } from "../../platform/capture-protection.js";
@@ -9,6 +11,7 @@ import { translateError } from "../shared/errors.js";
 
 export interface PrivacySettings {
   discoverable: boolean;
+  requireDeviceApproval: boolean;
   groupInvites: "everyone" | "contacts" | "nobody";
 }
 
@@ -20,16 +23,24 @@ export function usePrivacySettings(active: boolean) {
   const query = useQuery({ queryKey, queryFn: () => api.get<PrivacySettings>("/api/account/privacy"), enabled: active && !!userId });
   const savingRef = useRef(false);
   const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const save = async (patch: Partial<PrivacySettings>) => {
     if (savingRef.current || !query.data) return false;
-    savingRef.current = true; setSaving(true); setSaveError(false);
+    savingRef.current = true; setSaving(true); setSaveError(null);
     try {
       await client.cancelQueries({ queryKey });
-      const updated = await api.patch<PrivacySettings>("/api/account/privacy", patch);
+      let approvalProof: { challengeId: string; signature: string } | undefined;
+      if (patch.requireDeviceApproval === false) {
+        const { device } = useAuthStore.getState();
+        if (!device) throw new Error("No active device");
+        const { challengeId } = await api.post<{ challengeId: string }>("/api/account/privacy/approval-disable-options");
+        const signature = await signWithIdentityKey(createDeviceActionPayload("disable_approval", device.id, challengeId));
+        approvalProof = { challengeId, signature };
+      }
+      const updated = await api.patch<PrivacySettings>("/api/account/privacy", approvalProof ? { ...patch, approvalProof } : patch);
       client.setQueryData(queryKey, updated);
       return true;
-    } catch { setSaveError(true); return false; }
+    } catch (error) { setSaveError((error as { body?: { error?: string } }).body?.error ?? "privacy_save_failed"); return false; }
     finally { savingRef.current = false; setSaving(false); }
   };
   const captureCapability = capabilities.captureProtection;
@@ -55,7 +66,7 @@ export function usePrivacySettings(active: boolean) {
   return {
     data: query.data, loading: query.isLoading, disabled: saving || !query.data || query.isError,
     error: saveError ? t("privacySaveFailed") : query.error ? translateError(query.error, "privacyLoadFailed") : null,
-    save, retry: () => { setSaveError(false); void query.refetch(); },
+    save, approvalSaveError: saveError, setDeviceApproval: (enabled: boolean) => save({ requireDeviceApproval: enabled }), retry: () => { setSaveError(null); void query.refetch(); },
     capture: {
       capability: captureCapability, enabled: captureQuery.isError ? undefined : captureQuery.data, busy: captureBusy,
       error: captureError || captureQuery.isError ? t("captureProtectionFailed") : null,

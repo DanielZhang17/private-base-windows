@@ -212,3 +212,55 @@ adapter tab fallback retains its sandboxed wrapper. SVG, HTML/XHTML, XML, JavaSc
 and unknown types remain download-only, regardless of a `.pdf` filename. No attachment
 content or filename enters generated wrapper HTML. Decrypted bytes remain in memory;
 only user-initiated downloads write them. No decrypted attachment enters IndexedDB.
+
+### Biometric device unlock
+
+A supported native shell advertises
+`window.__PRIVATEBASE_NATIVE_CAPABILITIES__.biometricUnlock` before JS starts.
+Its value is `"touchid"`, `"faceid"`, `"windows-hello"`, or
+`"android-biometric"`. Browsers and older shells leave it absent. The web
+adapter in `biometric-unlock.ts` exposes enroll, unlock, and remove.
+
+| Command | Arguments | Success |
+| --- | --- | --- |
+| `biometric_unlock_enroll` | `{ vaultId, key }` | No value |
+| `biometric_unlock` | `{ vaultId }` | The stored key |
+| `biometric_unlock_remove` | `{ vaultId }` | No value, including if the item is absent |
+
+The vault ID is a random local identifier for this keystore slot. The key is exactly 32 bytes encoded
+as unpadded base64url. Enroll and unlock require fresh biometric authentication.
+Bind secrets to this installation and current biometric set via the OS keystore.
+The shell must deny unlock if the biometric set changes and reject with
+`"invalidated"`. Use `"cancelled"` for a dismissed prompt and `"unsupported"`
+when the keystore cannot enforce the contract.
+
+Accepted platform guarantees (PM decision, 2026-11-18). The minimum is that
+adding a new biometric must invalidate the item, because that is the takeover
+risk. Removing one of several enrolled biometrics need not invalidate it.
+- **macOS / iOS:** Keychain `biometryCurrentSet` invalidates on any change to
+  the enrolled set.
+- **Android:** a Keystore key with `setInvalidatedByBiometricEnrollment(true)`
+  is invalidated when a biometric is added or all are removed. Removing one of
+  several may leave the item usable.
+- **Windows:** the factor is Windows Hello verification (face, fingerprint or
+  the TPM-backed Hello PIN) using a `KeyCredentialManager` credential.
+  Biometric re-enrolment cannot be detected. Deleting or resetting the Hello
+  credential invalidates the item. The UI labels this method "Windows Hello",
+  never biometrics alone. Never include key material in logs,
+errors, or persistent IPC state. IndexedDB stores only the vault ID and slot
+metadata for native unlock. The app can use any other enrolled method if a
+biometric item is invalidated.
+Turning off native unlock stores its key identifier for cleanup in the same
+IndexedDB write that removes the slot. Security settings can retry removal
+after a failure or restart. The identifier is cleared after the command succeeds.
+Vault and device resets retain the same cleanup identifier in IndexedDB. A
+supported shell retries cleanup at app startup, including before sign-in.
+
+### Native passkey provisioning capability
+
+Advertise `passkeyProvisionHandoff: true` alongside `passkeyHandoff: true`
+when the launcher accepts `mode=provision&bundleHash=<base64url SHA-256>`
+on the existing sign-in path while retaining the state and callback checks.
+Older launchers can continue ordinary passkey sign-in and registration.
+
+The biometric commands may reject with `cancelled`, `lockout`, `invalidated` or `failed` (a string or an object carrying `code`). Use `invalidated` only when the enrolled key is confirmed permanently unavailable. Unknown failures are retryable. An Android shell may advertise `androidBiometricKind: "fingerprint"` next to `biometricUnlock: "android-biometric"` when its prompt is fingerprint-only. Otherwise the app displays the generic biometric label.

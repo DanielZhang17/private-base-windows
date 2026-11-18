@@ -2,8 +2,11 @@ import { useState } from "react";
 import { act } from "react";
 import { getByRole, queryByRole } from "@testing-library/dom";
 import { afterEach, expect, it, vi } from "vitest";
+import { Sheet } from "./Dialog.js";
+import { OVERLAY_RANK } from "./overlay-stack.js";
+import { useOverlayLayer } from "./useOverlayLayer.js";
 import { ActionMenu, type ActionMenuPosition } from "./ActionMenu.js";
-import { click, press, setupDom } from "./test-utils.js";
+import { click, mockCloseRequests, press, setupDom } from "./test-utils.js";
 const dom = setupDom();
 afterEach(() => vi.restoreAllMocks());
 function Harness({ position = { x: 300, y: 100 } }: { position?: ActionMenuPosition }) {
@@ -61,10 +64,27 @@ it("shows the phone preview with pointer focus, 52px rows, 20px icons and a 44px
 });
 it("consumes the phone back gesture to close the menu", async () => {
   vi.stubGlobal("matchMedia", () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const back = mockCloseRequests();
   await dom.render(<Harness />);
-  expect(history.state?.messageActionMenu).toBeTruthy();
-  // Model the popstate after the browser has traversed the temporary entry.
-  history.replaceState(null, "");
-  await act(async () => window.dispatchEvent(new PopStateEvent("popstate")));
+  await back();
   expect(queryByRole(document.body, "menu")).toBeNull();
+});
+
+it("lets Back dismiss a regular sheet above the phone picker before closing the picker", async () => {
+  function Layers() {
+    const [picker, setPicker] = useState(true);
+    const [details, setDetails] = useState(true);
+    useOverlayLayer(picker, "popover", OVERLAY_RANK.picker, () => setPicker(false));
+    return <>
+      {picker && <div role="region" aria-label="Picker" />}
+      <Sheet open={details} onClose={() => setDetails(false)} title="Conversation details" />
+    </>;
+  }
+  const back = mockCloseRequests();
+  await dom.render(<Layers />);
+  await back();
+  expect(queryByRole(document.body, "dialog", { name: "Conversation details" })).toBeNull();
+  expect(getByRole(document.body, "region", { name: "Picker" })).toBeTruthy();
+  await back();
+  expect(queryByRole(document.body, "region", { name: "Picker" })).toBeNull();
 });

@@ -10,16 +10,16 @@ it.each(["marker-first", "writer-first", "no-record-yet"])("atomically evicts de
   vi.resetModules();
   const tabB = await import("./index.js");
   const dbB = await tabB.getAppDB(); opened.push(dbB);
-  const message = { id: "attachment", conversationId: "conv", senderId: "alice", type: "file", content: JSON.stringify({ fileId: "private-file", fileKey: "secret", iv: "private-iv" }), timestamp: Date.now(), expiresAt: Date.now() + 60000, status: "sent" };
+  const message = { id: "attachment", ownerId: "alice", conversationId: "conv", senderId: "alice", type: "file", content: JSON.stringify({ fileId: "private-file", fileKey: "secret", iv: "private-iv" }), timestamp: Date.now(), expiresAt: Date.now() + 60000, status: "sent" };
   if (order !== "no-record-yet") await tabA.saveMessage(message);
-  await dbA.put("fileCache", { id: "private-file", blob: new Blob(["decrypted bytes"]) });
+  await dbA.put("accountFiles", { id: "private-file", blob: new Blob(["decrypted bytes"]) });
   const mark = () => tabA.rememberMessageDeletion(message.id, "conv", 123, "alice");
   const write = () => tabB.saveMessage({ ...message, status: "delivered" });
   if (order === "no-record-yet") { await mark(); await write(); }
   else await Promise.all(order === "marker-first" ? [mark(), write()] : [write(), mark()]);
   // Read both stores in one snapshot: a redacted record must never coexist with cached bytes.
-  const tx = dbB.transaction(["messages", "fileCache"], "readonly");
-  expect(await tx.objectStore("messages").get(message.id)).toMatchObject({ content: "", deletedAt: 123 });
-  expect(await tx.objectStore("fileCache").get("private-file")).toBeUndefined();
+  const tx = dbB.transaction(["displayMessages", "accountFiles"], "readonly");
+  expect(await tx.objectStore("displayMessages").get(["alice", message.id])).toMatchObject({ content: "", deletedAt: 123 });
+  expect(await tx.objectStore("accountFiles").get("private-file")).toBeUndefined();
   await tx.done;
 });

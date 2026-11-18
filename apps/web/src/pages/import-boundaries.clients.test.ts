@@ -3,7 +3,7 @@ import ts from "typescript";
 import { expect, it } from "vitest";
 
 // The public download page must not load session, store, API, database or crypto code:
-// a direct visit to /clients mounts ClientsApp instead of App (see main.tsx).
+// Direct visits to /clients and /clients/releases both mount ClientsApp (see main.tsx).
 // Keys are paths relative to src/, e.g. "pages/ClientsPage.tsx".
 const sources = Object.fromEntries(Object.entries(import.meta.glob<string>(
   ["../**/*.ts", "../**/*.tsx", "!../**/*.test.ts", "!../**/*.test.tsx", "!../**/*.d.ts"],
@@ -66,6 +66,7 @@ it("ClientsApp loads no session, store, API or crypto modules", () => {
   const { files, packages } = importGraph("ClientsApp.tsx");
   expect(files).toContain("pages/ClientsPage.tsx");
   expect(files).toContain("features/clients/useClientsPage.ts");
+  expect(files).toContain("features/clients/ClientsReleaseNotes.tsx");
   expect(files.filter((file) => forbidden.test(file))).toEqual([]);
   expect(files.filter((file) => file.startsWith("platform/")).sort()).toEqual(["platform/clipboard.ts", "platform/environment.ts", "platform/external.ts"]);
   expect(packages.filter((name) => name.startsWith("@e2ee-chat/") || /sodium|idb|zustand|@tanstack/.test(name))).toEqual([]);

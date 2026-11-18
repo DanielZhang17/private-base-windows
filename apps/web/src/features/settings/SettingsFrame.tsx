@@ -1,25 +1,31 @@
+import { UnlockOffer } from "../auth/UnlockOffer.js";
+import { NewDeviceAlerts } from "../devices/NewDeviceAlert.js";
 import { t, useLocale } from "../../i18n/index.js";
 import { useEffect, type ReactNode } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { useAuthStore } from "../../stores/authStore.js";
 import { api } from "../../services/api.js";
 import { showWebPushSettings } from "../../services/web-push.js";
 import { capabilities } from "../../platform/capabilities.js";
+import { TRANSFER_PATH, TRANSFER_SETUP_PATH, useTransferBanner } from "../transfer/HistoryTransferScreens.js";
 import { resolveAvatarImageUrl } from "./avatar.js";
 import { AppShell, Avatar, BottomBar, EmptyState, Icon, ListItem, NavItem, NavRail, TopBar, ToastProvider, Button } from "../../ui/index.js";
 
 import { SETTINGS_SECTIONS, type SettingsSection } from "./sections.js";
 export { SETTINGS_SECTIONS } from "./sections.js";
 
-export function SettingsFrame({ section, detail, detailActive = true, title, onSignOut }: {
-  section?: SettingsSection; detail: ReactNode; detailActive?: boolean; title: string; onSignOut?: () => void;
+export function SettingsFrame({ section, detail, detailActive = true, title, onSignOut, detailOwnsHeading = false }: {
+  section?: SettingsSection; detail: ReactNode; detailActive?: boolean; title: string; onSignOut?: () => void; detailOwnsHeading?: boolean;
 }) {
   const { locale } = useLocale();
   const navigate = useNavigate();
+  const { pathname } = useLocation();
+  const onTransferScreen = pathname === TRANSFER_PATH || pathname === TRANSFER_SETUP_PATH;
+  const transferBanner = useTransferBanner();
   const user = useAuthStore((state) => state.user);
   const { data: devices } = useQuery({ queryKey: ["myDevices"], queryFn: () => api.get<unknown[]>("/api/devices") });
-  useEffect(() => { document.title = t("privateBase2", { title: title }); }, [title, locale]);
+  useEffect(() => { if (!detailOwnsHeading) document.title = t("privateBase2", { title }); }, [detailOwnsHeading, title, locale]);
   const destinations = <>
     <NavItem
       icon="chats"
@@ -35,6 +41,13 @@ export function SettingsFrame({ section, detail, detailActive = true, title, onS
   </>;
   return <ToastProvider>
     <AppShell
+      banner={<>
+        {transferBanner}
+        {user && <>
+          {section !== "devices" && <NewDeviceAlerts filter={section === "privacy" ? alert => alert.kind !== "approval_disabled" : undefined} />}
+          {!onTransferScreen && <UnlockOffer />}
+        </>}
+      </>}
 
       rail={<NavRail footer={<Avatar
         name={user?.displayName ?? t("selfAvatarFallback")}
@@ -49,7 +62,7 @@ export function SettingsFrame({ section, detail, detailActive = true, title, onS
       </BottomBar>}
 
       list={<>
-        <TopBar title={t("settings")} />
+        <TopBar title={t("settings")} heading={!detailOwnsHeading} />
         <div className="min-h-0 grow overflow-y-auto px-2 py-4">
 
           <div className="flex items-center gap-3 px-3 pb-5">

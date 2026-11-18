@@ -1,5 +1,5 @@
 import { t, useLocale } from "../i18n/index.js";
-import { useEffect } from "react";
+import { useEffect, type ReactNode } from "react";
 import { useCallPresentation } from "../features/calls/useCallPresentation.js";
 import { useCall } from "../features/calls/useCall.js";
 import { useMediaElement } from "../features/calls/useMediaElement.js";
@@ -9,7 +9,7 @@ import CallControls from "../components/calls/CallControls.js";
 import VideoGrid from "../components/calls/VideoGrid.js";
 import CallPlaybackRecovery from "../components/calls/CallPlaybackRecovery.js";
 
-export default function CallPage() {
+export default function CallPage({ banner }: { banner?: ReactNode }) {
   const { locale } = useLocale();
   const call = useCall();
   const { ref: localVideoRef } = useMediaElement<HTMLVideoElement>(call.localStream);
@@ -23,6 +23,7 @@ export default function CallPage() {
     {video && connected && <div className="absolute inset-x-0 bottom-0 top-[var(--titlebar-height)]"><VideoGrid streams={new Map(call.remoteEntries)} /></div>}
     {!ended && <div className="absolute end-[calc(var(--safe-right)+1rem)] top-[calc(var(--safe-top)+var(--titlebar-height)+1rem)] z-10"><IconButton icon="chevron-down" label={t("minimizeCall")} variant="secondary" onClick={call.minimizeCall} /></div>}
     <div className="relative flex min-h-0 flex-1 flex-col overflow-y-auto pt-safe [@media(max-width:319px),(max-height:319px)]:flex-none [@media(max-width:319px),(max-height:319px)]:overflow-visible">
+      {banner}
       <div className={`flex grow shrink-0 flex-col items-center gap-4 text-center ${video && connected ? "justify-start" : "justify-center-safe"}`}>
         {!(video && connected) && <div className="rounded-full p-2.5 ring-1 ring-line shadow-[0_0_0_14px_color-mix(in_srgb,var(--primary)_10%,transparent)]"><UserAvatar avatarUrl={call.peerAvatarUrl} displayName={call.peerName} group={call.isGroupCall} size="xl" /></div>}
         <div className={video && connected ? "mt-4 rounded-card bg-canvas px-6 py-3" : "px-4"}>

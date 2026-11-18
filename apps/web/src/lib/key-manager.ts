@@ -22,12 +22,26 @@ import {
 import {
   OTP_KEY_POOL_SIZE,
   OTP_KEY_REPLENISH_THRESHOLD,
-  PBKDF2_ITERATIONS,
+  createPasskeyProvisionPayload,
+  type DevicePlatform,
+  type PasskeyProvisionBundle,
   type DeviceLinkPublicBundle,
 } from "@e2ee-chat/shared";
-import { saveKey, saveKeys, getKey, clearCryptoState } from "../db/index.js";
+import { saveKey, saveKeys, getKey, clearAll, clearCryptoState, migrateLocalEditKeys, pendingResetNativeKeyIds, clearResetNativeKeyId,
+  recordNativeKeyCleanup, hasNativeKeyCleanup,
+  type LocalKey, type PendingSetupRecord } from "../db/index.js";
 import { api } from "../services/api.js";
 import { clearRegisteredLocalCallState } from "../platform/session-cleanup.js";
+
+import {
+  deriveEncryptionKey, generateVault, readVault, vaultRecord,
+  enrollNativeUnlockSlot, wrapUnlockSlot, unwrapUnlockSlot, unlockMethodAvailable,
+  type DeviceVault, type UnlockSlot, type UnlockSetup, type UnlockMethod,
+} from "./device-key-vault.js";
+import { decryptData, encryptData, localEncryptionKey as _encryptionKey, openAttachmentBytes, sealAttachmentBytes,
+  setLocalEncryptionKey, type SealedAttachment } from "./local-key-encryption.js";
+import { biometricUnlock } from "../platform/biometric-unlock.js";
+import { notifyUnlockMethodsChanged } from "./unlock-method-changes.js";
 
 const IDENTITY_KEY_ID = "identity";
 const SIGNED_PRE_KEY_ID = "signedPreKey";
@@ -99,7 +113,8 @@ export function decideLocalKeyAction(input: {
 let _identityKeyPair: IdentityKeyPair | null = null;
 let _signedPreKey: SignedPreKey | null = null;
 let _oneTimePreKeys: OneTimePreKey[] = [];
-let _encryptionKey: CryptoKey | null = null;
+let _vaultId: string | null = null;
+let _lockEpoch = 0;
 let _otpNextId = 1;
 let _pendingOTPIds = new Set<number>();
 let _otpWrites: Promise<void> = Promise.resolve();
@@ -110,11 +125,14 @@ let _bundleUpload: Promise<void> | null = null;
 let _bundlePublished = false;
 /** Counts unlocks (key generation or loading) of this tab; never shared with other tabs. */
 let _unlockGeneration = 0;
+const activeNativeEnrollments = new Set<string>();
 
 const IDLE_LOCK_MS = 15 * 60 * 1_000; // 15 minutes
-let _idleTimer: ReturnType<typeof window.setTimeout> | null = null;
+// The window overload returns a DOM handle even when dependency types add Node timer overloads.
+let _idleTimer: number | null = null;
 let _lastActivityReset = 0;
 const _lockListeners = new Set<() => void>();
+const idleHolds = new Set<symbol>();
 
 export function onKeysLocked(cb: () => void): () => void {
   _lockListeners.add(cb);
@@ -141,76 +159,94 @@ export function resetIdleTimer(): void {
   if (!_identityKeyPair) return;
   _lastActivityReset = Date.now();
   if (_idleTimer !== null) window.clearTimeout(_idleTimer);
+  _idleTimer = null;
+  if (idleHolds.size) return;
   _idleTimer = window.setTimeout(() => {
     lockLocalCryptoState();
     for (const listener of _lockListeners) listener();
   }, IDLE_LOCK_MS);
 }
 
-function asArrayBufferView(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
-  if (bytes.buffer instanceof ArrayBuffer) {
-    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  }
-  return new Uint8Array(bytes);
+/** An active data transfer leases the idle timer. Explicit lock always wins. */
+export function holdIdleLock(): () => void {
+  if (!_identityKeyPair) return () => {};
+  const lease = Symbol();
+  idleHolds.add(lease);
+  resetIdleTimer();
+  return () => { if (idleHolds.delete(lease)) resetIdleTimer(); };
 }
 
-/** Derive an AES-256 encryption key from the user's password and a stored salt. */
-async function deriveEncryptionKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
-  const keyMaterial = await crypto.subtle.importKey(
-    "raw", asArrayBufferView(new TextEncoder().encode(password)), "PBKDF2", false, ["deriveKey"],
-  );
-  return crypto.subtle.deriveKey(
-    {
-      name: "PBKDF2",
-      salt: asArrayBufferView(salt),
-      iterations: PBKDF2_ITERATIONS,
-      hash: "SHA-256",
-    },
-    keyMaterial,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"],
-  );
+export async function sealCachedAttachment(ownerId: string, fileId: string, wire: Blob) {
+  const key = _encryptionKey;
+  if (!key) throw new KeysLockedError();
+  const sealed = await sealAttachmentBytes(key, ownerId, fileId, await wire.arrayBuffer());
+  if (key !== _encryptionKey) throw new KeysLockedError();
+  return sealed;
 }
 
-async function encryptData(key: CryptoKey, data: Uint8Array): Promise<{ iv: string; ciphertext: string }> {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: asArrayBufferView(iv) },
-    key,
-    asArrayBufferView(data),
-  );
-  return { iv: toBase64Url(iv), ciphertext: toBase64Url(new Uint8Array(encrypted)) };
+export async function openCachedAttachment(ownerId: string, fileId: string, sealed: SealedAttachment): Promise<Blob> {
+  const key = _encryptionKey;
+  if (!key) throw new KeysLockedError();
+  const wire = await openAttachmentBytes(key, ownerId, fileId, sealed);
+  if (key !== _encryptionKey) throw new KeysLockedError();
+  return new Blob([wire]);
 }
 
-async function decryptData(key: CryptoKey, iv: string, ciphertext: string): Promise<Uint8Array> {
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: asArrayBufferView(fromBase64Url(iv)) },
-    key,
-    asArrayBufferView(fromBase64Url(ciphertext)),
-  );
-  return new Uint8Array(decrypted);
-}
-
-/**
- * Called on first registration. Generates all key material, encrypts private keys
- * with a password-derived key, and stores it in IndexedDB.
- *
- * Returns the public identity key (base64url) for the registration API call.
- * The pre-key bundle is uploaded after auth succeeds via uploadPreKeyBundle().
- */
-export async function initializeKeys(password: string): Promise<string> {
+export async function initializeKeys(password: string, vaultId?: string): Promise<string> {
   lockLocalCryptoState();
-  await _otpWrites;
-  // Generate a random salt and derive the IndexedDB encryption key
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const encKey = await deriveEncryptionKey(password, salt);
+  const epoch = _lockEpoch;
+  const prepared = await generateDeviceKeys();
+  if (vaultId) prepared.vault.id = vaultId;
+  await commitDeviceKeys(prepared, { method: "password", password }, epoch, true);
+  return toBase64Url(prepared.identityKeyPair.publicEd25519);
+}
 
-  // Generate key material
+async function generateDeviceKeys() {
+  const { vault, encKey } = await generateVault();
   const identityKeyPair = await generateIdentityKeyPair();
   const signedPreKey = await generateSignedPreKey(1, identityKeyPair.privateEd25519);
   const oneTimePreKeys = await generateOneTimePreKeys(1, OTP_KEY_POOL_SIZE);
+  return { vault, encKey, identityKeyPair, signedPreKey, oneTimePreKeys };
+}
 
+type PreparedDeviceKeys = Awaited<ReturnType<typeof generateDeviceKeys>>;
+
+const nativeKeyLock = (keyId: string) => `native-unlock:${keyId}`;
+
+async function removePendingNativeKey(keyId: string): Promise<void> {
+  if (!await hasNativeKeyCleanup(keyId)) return;
+  await biometricUnlock.remove(keyId);
+  await clearResetNativeKeyId(keyId);
+}
+
+async function commitUnlockSlot(
+  key: CryptoKey, setup: UnlockSetup, assertCurrent: () => void,
+  commit: (slot: UnlockSlot, nativeEnrollmentId?: string) => Promise<void>,
+): Promise<void> {
+  if (setup.method !== "native") return commit(await wrapUnlockSlot(key, setup));
+  const keyId = crypto.randomUUID();
+  const enroll = async () => {
+    activeNativeEnrollments.add(keyId);
+    try {
+      // Startup and resets can remove this key even if the webview closes
+      // between the native write and the IndexedDB slot commit.
+      await recordNativeKeyCleanup(keyId);
+      try {
+        assertCurrent();
+        await commit(await enrollNativeUnlockSlot(key, keyId), keyId);
+      } catch (error) {
+        await removePendingNativeKey(keyId).catch(() => undefined);
+        throw error;
+      }
+    } finally {
+      activeNativeEnrollments.delete(keyId);
+    }
+  };
+  await (navigator.locks ? navigator.locks.request(nativeKeyLock(keyId), enroll) : enroll());
+}
+
+async function commitDeviceKeys(prepared: PreparedDeviceKeys, setup: UnlockSetup, epoch: number, fresh = false, checkpoint?: { record: PendingSetupRecord; owner: LocalKeyOwner }) {
+  const { vault, encKey, identityKeyPair, signedPreKey, oneTimePreKeys } = prepared;
   // Encrypt every private record before opening the write transaction.
   const serialized = serializeIdentityKeyPair(identityKeyPair);
   const { iv, ciphertext } = await encryptData(
@@ -235,29 +271,51 @@ export async function initializeKeys(password: string): Promise<string> {
   }));
   const otpEnc = await encryptData(encKey, new TextEncoder().encode(JSON.stringify(otpData)));
   const nextId = OTP_KEY_POOL_SIZE + 1;
+  const assertCurrent = () => { if (_lockEpoch !== epoch) throw new KeysLockedError(); };
+  await commitUnlockSlot(encKey, setup, assertCurrent, async (slot, nativeEnrollmentId) => {
+    vault.slots = [slot];
+    await withOneTimePreKeyLock(async () => {
+      assertCurrent();
+      await saveKeys([
+        vaultRecord(vault),
+        { id: IDENTITY_KEY_ID, type: "identity", data: JSON.stringify({ iv, ciphertext }) },
+        { id: SIGNED_PRE_KEY_ID, type: "signedPreKey", data: JSON.stringify(spkEnc) },
+        { id: OTP_KEYS_ID, type: "otpKeys", data: JSON.stringify(otpEnc) },
+        { id: OTP_NEXT_ID, type: OTP_NEXT_ID, data: String(nextId) },
+        { id: OTP_PENDING_IDS, type: OTP_PENDING_IDS, data: "[]" },
+        ...(checkpoint ? [{ id: "owner", type: "owner", data: JSON.stringify(checkpoint.owner) }] : []),
+      ], fresh ? [{ id: DB_ENCRYPTION_KEY_ID }, { id: IDENTITY_KEY_ID }] : [], checkpoint?.record, undefined, nativeEnrollmentId);
+      notifyUnlockMethodsChanged();
+      assertCurrent();
+      publishUnlockedKeys(encKey, vault.id, identityKeyPair, signedPreKey, {
+        keys: oneTimePreKeys, nextId, pendingIds: new Set(),
+      });
+    });
+  });
+}
 
-  // A failed initialization must leave either the old records or no records.
-  await saveKeys([
-    { id: DB_ENCRYPTION_KEY_ID, type: "salt", data: toBase64Url(salt) },
-    { id: IDENTITY_KEY_ID, type: "identity", data: JSON.stringify({ iv, ciphertext }) },
-    { id: SIGNED_PRE_KEY_ID, type: "signedPreKey", data: JSON.stringify(spkEnc) },
-    { id: OTP_KEYS_ID, type: "otpKeys", data: JSON.stringify(otpEnc) },
-    { id: OTP_NEXT_ID, type: OTP_NEXT_ID, data: String(nextId) },
-    { id: OTP_PENDING_IDS, type: OTP_PENDING_IDS, data: "[]" },
-  ]);
+/** Generate fresh keys in memory. Persist them under an unlock method before publishing the bundle. */
+export async function prepareDeviceKeySetup(deviceName: string, platform: DevicePlatform) {
+  const epoch = _lockEpoch;
+  if (await hasLocalKeyMaterial()) throw new Error("This device already has local keys");
+  let prepared: PreparedDeviceKeys | undefined = await generateDeviceKeys();
+  const unsigned = {
+    ...publicBundle(deviceName, prepared.identityKeyPair, prepared.signedPreKey, prepared.oneTimePreKeys),
+    platform,
+  };
+  const signature = await sign(prepared.identityKeyPair.privateEd25519,
+    Uint8Array.from(new TextEncoder().encode(createPasskeyProvisionPayload(unsigned))));
+  const bundle: PasskeyProvisionBundle = { ...unsigned, bundleSignature: toBase64Url(signature) };
+  return {
+    bundle,
+    commit: async (setup: UnlockSetup, checkpoint?: { record: PendingSetupRecord; owner: LocalKeyOwner }) => {
+      if (!prepared) throw new Error("Device setup has ended");
+      await commitDeviceKeys(prepared, setup, epoch, true, checkpoint);
+      prepared = undefined;
+    },
+    discard: () => { prepared = undefined; },
 
-  // Publish the unlocked cache only after the complete key set is committed.
-  _identityKeyPair = identityKeyPair;
-  _signedPreKey = signedPreKey;
-  _oneTimePreKeys = oneTimePreKeys;
-  _encryptionKey = encKey;
-  _unlockGeneration++;
-  _otpNextId = nextId;
-  _pendingOTPIds = new Set();
-  installActivityListeners();
-
-  // Return public identity key for registration
-  return toBase64Url(identityKeyPair.publicEd25519);
+  };
 }
 
 export function buildDeviceLinkPublicBundle(deviceName: string): DeviceLinkPublicBundle {
@@ -272,13 +330,17 @@ function buildPublicBundle(deviceName: string): DeviceLinkPublicBundle {
   if (!_signedPreKey) throw new Error("Signed pre-key not initialized");
   if (_oneTimePreKeys.length === 0) throw new Error("No one-time pre-keys available");
 
+  return publicBundle(deviceName, _identityKeyPair, _signedPreKey, _oneTimePreKeys);
+}
+
+function publicBundle(deviceName: string, identity: IdentityKeyPair, preKey: SignedPreKey, otp: OneTimePreKey[]): DeviceLinkPublicBundle {
   return {
     deviceName,
-    identityKey: toBase64Url(_identityKeyPair.publicEd25519),
-    signedPreKey: toBase64Url(_signedPreKey.keyPair.publicKey),
-    signedPreKeyId: _signedPreKey.id,
-    signedPreKeySig: toBase64Url(_signedPreKey.signature),
-    oneTimePreKeys: serializeOneTimePreKeys(_oneTimePreKeys),
+    identityKey: toBase64Url(identity.publicEd25519),
+    signedPreKey: toBase64Url(preKey.keyPair.publicKey),
+    signedPreKeyId: preKey.id,
+    signedPreKeySig: toBase64Url(preKey.signature),
+    oneTimePreKeys: serializeOneTimePreKeys(otp),
   };
 }
 
@@ -305,28 +367,89 @@ export async function uploadPreKeyBundle(): Promise<void> {
   return upload;
 }
 
-/**
- * Called on login. Decrypts private keys from IndexedDB using the password.
- * Populates the in-memory key cache.
- */
-export async function loadKeys(password: string): Promise<void> {
+/** Unlock the vault and migrate legacy password-encrypted records on first successful use. */
+export function loadKeys(password: string): Promise<void> {
+  return unlockLocalKeys("password", password);
+}
+
+export async function unlockLocalKeys(method: UnlockMethod, password?: string, onUnwrap?: () => void): Promise<void> {
   lockLocalCryptoState();
-  await _otpWrites;
-  const saltRecord = await getKey(DB_ENCRYPTION_KEY_ID);
-  if (!saltRecord) throw new Error("No keys found — register first");
+  const epoch = _lockEpoch;
+  const assertCurrent = () => { if (_lockEpoch !== epoch) throw new KeysLockedError(); };
+  // Keep biometric prompts outside the cross-tab lock so a prompt cannot block pre-key operations.
+  const initialRecord = await getKey(DB_ENCRYPTION_KEY_ID);
+  const initialVault = readVault(initialRecord);
+  const slot = initialVault?.slots.find((entry) => entry.method === method);
+  const unlockedKey = slot && await unwrapUnlockSlot(slot, password);
+  onUnwrap?.();
+  await withOneTimePreKeyLock(async () => {
+    assertCurrent();
+    const [record, identityRecord, spkRecord, otpRecord] = await Promise.all([
+      getKey(DB_ENCRYPTION_KEY_ID), getKey(IDENTITY_KEY_ID), getKey(SIGNED_PRE_KEY_ID), getKey(OTP_KEYS_ID),
+    ]);
+    if (!record) throw new Error("No keys found — register first");
+    const currentVault = readVault(record);
+    if (currentVault && (currentVault.id !== initialVault?.id || !unlockedKey)) {
+      if (!initialVault && method === "password") {
+        const passwordSlot = currentVault.slots.find((entry) => entry.method === "password");
+        if (!passwordSlot) throw new Error("Password unlock is unavailable");
+        const migratedKey = await unwrapUnlockSlot(passwordSlot, password);
+        await finishUnlock(migratedKey, record, currentVault.id, assertCurrent, identityRecord, spkRecord, otpRecord);
+        return;
+      }
+      throw new Error("This unlock method is unavailable");
+    }
+    if (currentVault && unlockedKey) {
+      if (!currentVault.slots.some((entry) => JSON.stringify(entry) === JSON.stringify(slot))) {
+        throw new Error("This unlock method changed");
+      }
+      await finishUnlock(unlockedKey, record, currentVault.id, assertCurrent, identityRecord, spkRecord, otpRecord);
+      return;
+    }
+    if (record.type !== "salt") throw new Error("Invalid local key vault");
+    if (method !== "password" || password === undefined) throw new Error("Password unlock is required");
 
-  const salt = fromBase64Url(saltRecord.data);
-  const encKey = await deriveEncryptionKey(password, salt);
+    const legacyKey = await deriveEncryptionKey(password, fromBase64Url(record.data));
+    const keyState = await decodeLocalKeys(legacyKey, identityRecord, spkRecord, otpRecord);
+    const { vault, encKey } = await generateVault();
+    vault.slots = [await wrapUnlockSlot(encKey, { method: "password", password })];
+    const encryptedRecords = [identityRecord, spkRecord, otpRecord].filter((item): item is LocalKey => !!item);
+    const migrated = await Promise.all(encryptedRecords.map(async (entry) => {
+      const { iv, ciphertext } = JSON.parse(entry.data);
+      const clear = await decryptData(legacyKey, iv, ciphertext);
+      try {
+        return { ...entry, data: JSON.stringify(await encryptData(encKey, clear)) };
+      } finally { clear.fill(0); }
+    }));
+    await migrateLocalEditKeys(encKey, record, assertCurrent, {
+      key: legacyKey,
+      keys: [vaultRecord(vault), ...migrated],
+      expected: [...encryptedRecords, ...(!otpRecord ? [{ id: OTP_KEYS_ID }] : [])],
+    });
+    assertCurrent();
+    publishUnlockedKeys(encKey, vault.id, keyState.identityKeyPair, keyState.signedPreKey, keyState.otpState);
+  });
+}
 
+async function finishUnlock(
+  key: CryptoKey, record: LocalKey, vaultId: string, assertCurrent: () => void,
+  identity?: LocalKey, preKey?: LocalKey, otp?: LocalKey,
+) {
+  const state = await decodeLocalKeys(key, identity, preKey, otp);
+  assertCurrent();
+  await migrateLocalEditKeys(key, record, assertCurrent);
+  assertCurrent();
+  publishUnlockedKeys(key, vaultId, state.identityKeyPair, state.signedPreKey, state.otpState);
+}
+
+async function decodeLocalKeys(encKey: CryptoKey, identityRecord?: LocalKey, spkRecord?: LocalKey, otpRecord?: LocalKey) {
   // Decrypt identity key pair
-  const identityRecord = await getKey(IDENTITY_KEY_ID);
   if (!identityRecord) throw new Error("Identity key not found");
   const { iv: idIv, ciphertext: idCt } = JSON.parse(identityRecord.data);
   const idBytes = await decryptData(encKey, idIv, idCt);
   const identityKeyPair = deserializeIdentityKeyPair(JSON.parse(new TextDecoder().decode(idBytes)));
 
   // Decrypt signed pre-key
-  const spkRecord = await getKey(SIGNED_PRE_KEY_ID);
   let signedPreKey: SignedPreKey | null = null;
   if (spkRecord) {
     const { iv, ciphertext } = JSON.parse(spkRecord.data);
@@ -339,23 +462,125 @@ export async function loadKeys(password: string): Promise<void> {
     };
   }
 
-  const otpState = await readOneTimePreKeyState(encKey);
+  const otpState = await readOneTimePreKeyState(encKey, otpRecord);
+  return { identityKeyPair, signedPreKey, otpState };
+}
+
+function publishUnlockedKeys(
+  encKey: CryptoKey, vaultId: string, identityKeyPair: IdentityKeyPair, signedPreKey: SignedPreKey | null,
+  otpState: Awaited<ReturnType<typeof readOneTimePreKeyState>>,
+) {
+  _vaultId = vaultId;
   _otpNextId = otpState.nextId;
   _pendingOTPIds = otpState.pendingIds;
   _identityKeyPair = identityKeyPair;
   _signedPreKey = signedPreKey;
   _oneTimePreKeys = otpState.keys;
-  _encryptionKey = encKey;
+  setLocalEncryptionKey(encKey);
   _unlockGeneration++;
   installActivityListeners();
 }
 
-async function readOneTimePreKeyState(encKey: CryptoKey): Promise<{
+export async function listLocalUnlockMethods(): Promise<UnlockMethod[]> {
+  const record = await getKey(DB_ENCRYPTION_KEY_ID);
+  return readVault(record)?.slots.map(slot => slot.method) ?? (record?.type === "salt" ? ["password"] : []);
+}
+
+export async function localPasskeyUnlockId(): Promise<string | undefined> {
+  return readVault(await getKey(DB_ENCRYPTION_KEY_ID))?.slots.find(slot => slot.method === "passkey")?.credentialId;
+}
+
+export async function hasPendingNativeUnlockRemoval(): Promise<boolean> {
+  return !!readVault(await getKey(DB_ENCRYPTION_KEY_ID))?.pendingNativeRemoval;
+}
+
+export async function isOnlyLocalPasskeyUnlock(credentialId: string): Promise<boolean> {
+  const slots = readVault(await getKey(DB_ENCRYPTION_KEY_ID))?.slots;
+  return !!slots?.some(slot => slot.method === "passkey" && slot.credentialId === credentialId) &&
+    !slots.some(slot => slot.method !== "passkey" && unlockMethodAvailable(slot.method));
+}
+
+export function bindLocalUnlockEnrollment(isCurrent: () => boolean = () => true) {
+  const startingKey = _encryptionKey;
+  const startingVaultId = _vaultId;
+  const assertCurrent = () => {
+    if (!startingKey || _encryptionKey !== startingKey || _vaultId !== startingVaultId || !isCurrent()) {
+      throw new KeysLockedError();
+    }
+  };
+  assertCurrent();
+  return async (setup: UnlockSetup): Promise<void> => {
+    assertCurrent();
+    const { vault, record, key } = await unlockedVault();
+    assertCurrent();
+    if (setup.method === "native" && vault.slots.some(slot => slot.method === "native")) {
+      throw new Error("Native unlock is already enrolled");
+    }
+    if (setup.method === "native" && vault.pendingNativeRemoval) {
+      throw new Error("Finish removing the previous native unlock key");
+    }
+    await commitUnlockSlot(key, setup, assertCurrent, async (slot, nativeEnrollmentId) => {
+      vault.slots = [...vault.slots.filter(entry => entry.method !== setup.method), slot];
+      await saveKeys([vaultRecord(vault)], [record], undefined, assertCurrent, nativeEnrollmentId);
+    });
+    notifyUnlockMethodsChanged();
+  };
+}
+
+export async function enrollLocalUnlockMethod(setup: UnlockSetup): Promise<void> {
+  await bindLocalUnlockEnrollment()(setup);
+}
+
+export async function removeLocalUnlockMethod(method: UnlockMethod): Promise<void> {
+  const { vault, record, key } = await unlockedVault();
+  const slot = vault.slots.find(entry => entry.method === method);
+  if (!slot) {
+    if (method === "native" && vault.pendingNativeRemoval) await finishNativeUnlockRemoval(vault.pendingNativeRemoval);
+    return;
+  }
+  const remaining = vault.slots.filter(slot => slot.method !== method);
+  if (!remaining.some(slot => slot.method === "password")) {
+    const alternate = remaining.find(slot => unlockMethodAvailable(slot.method));
+    if (!alternate) throw new Error("Keep at least one unlock method");
+    // Authenticate the alternative against the actual vault key before dropping the fallback.
+    const candidate = await unwrapUnlockSlot(alternate);
+    const proof = await encryptData(key, new Uint8Array(0));
+    await decryptData(candidate, proof.iv, proof.ciphertext);
+  }
+  vault.slots = remaining;
+  // Persist the identifier with the slot removal so an interrupted native command is retryable.
+  if (slot.method === "native") vault.pendingNativeRemoval = slot.keyId;
+  await saveKeys([vaultRecord(vault)], [record], undefined, () => {
+    if (_encryptionKey !== key) throw new KeysLockedError();
+  });
+  notifyUnlockMethodsChanged();
+  if (slot.method === "native") await finishNativeUnlockRemoval(slot.keyId);
+}
+
+async function finishNativeUnlockRemoval(keyId: string) {
+  await biometricUnlock.remove(keyId);
+  const { vault, record, key } = await unlockedVault();
+  if (vault.pendingNativeRemoval !== keyId) return;
+  delete vault.pendingNativeRemoval;
+  await saveKeys([vaultRecord(vault)], [record], undefined, () => {
+    if (_encryptionKey !== key) throw new KeysLockedError();
+  });
+  notifyUnlockMethodsChanged();
+}
+
+async function unlockedVault(): Promise<{ vault: DeviceVault; record: LocalKey; key: CryptoKey }> {
+  const key = _encryptionKey;
+  const record = await getKey(DB_ENCRYPTION_KEY_ID);
+  const vault = readVault(record);
+  if (!key || key !== _encryptionKey || !record || !vault || vault.id !== _vaultId) throw new KeysLockedError();
+  return { vault, record, key };
+}
+
+async function readOneTimePreKeyState(encKey: CryptoKey, otpRecord?: LocalKey): Promise<{
   keys: OneTimePreKey[];
   nextId: number;
   pendingIds: Set<number>;
 }> {
-  const otpRecord = await getKey(OTP_KEYS_ID);
   let keys: OneTimePreKey[] = [];
   if (otpRecord) {
     const { iv, ciphertext } = JSON.parse(otpRecord.data);
@@ -394,7 +619,7 @@ function withOneTimePreKeyLock<T>(fn: () => Promise<T>): Promise<T> {
 /** Replace the in-memory OTP state with the persisted copy. Call only under the OTP lock. */
 async function reloadOneTimePreKeys(encKey: CryptoKey): Promise<void> {
   await _otpWrites;
-  const state = await readOneTimePreKeyState(encKey);
+  const state = await readOneTimePreKeyState(encKey, await getKey(OTP_KEYS_ID));
   if (_encryptionKey !== encKey) throw new KeysLockedError("Keys were locked during reload");
   const removals = state.keys.filter((k) => _deferredOTPRemovals.has(k.id));
   _oneTimePreKeys = removals.length > 0 ? state.keys.filter((k) => !_deferredOTPRemovals.has(k.id)) : state.keys;
@@ -439,7 +664,7 @@ export function getSignedPreKey(): SignedPreKey | null {
 export async function signWithIdentityKey(payload: string | Uint8Array): Promise<string> {
   if (!_identityKeyPair) throw new KeysLockedError();
   resetIdleTimer();
-  const bytes = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
+  const bytes = typeof payload === "string" ? Uint8Array.from(new TextEncoder().encode(payload)) : payload;
   const signature = await sign(_identityKeyPair.privateEd25519, bytes);
   return toBase64Url(signature);
 }
@@ -636,16 +861,24 @@ export async function hasLocalKeyMaterial(): Promise<boolean> {
   return !!saltRecord || !!identityRecord;
 }
 
+/** Snapshot the encrypted identity record, or the vault record for a partial vault. */
+export async function getLocalVaultKey(): Promise<LocalKey | undefined> {
+  return await getKey(IDENTITY_KEY_ID) ?? await getKey(DB_ENCRYPTION_KEY_ID);
+}
+
 export function lockLocalCryptoState(): void {
+  _lockEpoch++;
+  _vaultId = null;
   if (_idleTimer !== null) window.clearTimeout(_idleTimer);
   _idleTimer = null;
+  idleHolds.clear();
   window.removeEventListener("pointerdown", onActivity);
   window.removeEventListener("keydown", onActivity);
   document.removeEventListener("visibilitychange", onVisibilityChange);
   _identityKeyPair = null;
   _signedPreKey = null;
   _oneTimePreKeys = [];
-  _encryptionKey = null;
+  setLocalEncryptionKey(null);
   _pendingOTPIds = new Set();
   _deferredOTPRemovals.clear();
   _maintenance = null;
@@ -654,12 +887,45 @@ export function lockLocalCryptoState(): void {
   clearRegisteredLocalCallState();
 }
 
-/**
- * Clears all locally stored crypto state.
- * Use after failed registration to avoid keeping orphaned key material.
- */
-export async function resetLocalCryptoState(): Promise<void> {
+function nativeKeyForCleanup(record: LocalKey | undefined): string | undefined {
+  const vault = readVault(record);
+  return vault?.slots.find(slot => slot.method === "native")?.keyId ?? vault?.pendingNativeRemoval;
+}
+
+export async function retryNativeKeyCleanup(): Promise<void> {
+  const keyIds = await pendingResetNativeKeyIds();
+  await Promise.allSettled(keyIds.map(async keyId => {
+    if (activeNativeEnrollments.has(keyId)) return;
+    if (navigator.locks) {
+      await navigator.locks.request(nativeKeyLock(keyId), { ifAvailable: true }, async lock => {
+        if (lock) await removePendingNativeKey(keyId);
+      });
+    } else await removePendingNativeKey(keyId);
+  }));
+}
+
+/** Clears local crypto state, including orphaned key material after a failed registration. */
+export async function resetLocalCryptoState(expectedSetupId?: string, expectedVaultId?: string): Promise<boolean> {
+  const recoveryKey = _encryptionKey;
+  const recoveryVaultId = _vaultId;
   lockLocalCryptoState();
-  await _otpWrites;
-  await clearCryptoState();
+  return withOneTimePreKeyLock(async () => {
+    await _otpWrites;
+    const record = await getKey(DB_ENCRYPTION_KEY_ID);
+    const vault = readVault(record);
+    if (expectedVaultId && vault?.id !== expectedVaultId) return false;
+    const recovery = recoveryKey && record && vault?.id === recoveryVaultId ? { key: recoveryKey, vault: record } : undefined;
+    if (!await clearCryptoState(expectedSetupId, expectedVaultId ? record : undefined, nativeKeyForCleanup, recovery)) return false;
+    await retryNativeKeyCleanup().catch(() => undefined);
+    return true;
+  });
+}
+
+/** Use after the user confirms that local history and keys should be erased. */
+export async function resetLocalDevice(expectedKey?: LocalKey): Promise<boolean> {
+  return withOneTimePreKeyLock(async () => {
+    if (!await clearAll(expectedKey, lockLocalCryptoState, nativeKeyForCleanup)) return false;
+    await retryNativeKeyCleanup().catch(() => undefined);
+    return true;
+  });
 }

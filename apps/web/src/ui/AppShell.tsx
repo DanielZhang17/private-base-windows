@@ -76,11 +76,13 @@ export interface TopBarProps {
   actions?: ReactNode;
   /** Makes the title block a button, e.g. to open conversation details. */
   onTitleClick?: () => void;
+  /** Use a plain label when the page supplies its own heading. */
+  heading?: boolean;
   className?: string;
 }
 
 /** Header for a pane or page. Adds the top safe-area inset. */
-export function TopBar({ title, subtitle, onBack, backLabel = t("back"), backOnPhoneOnly = false, leading, actions, onTitleClick, className }: TopBarProps) {
+export function TopBar({ title, subtitle, onBack, backLabel = t("back"), backOnPhoneOnly = false, leading, actions, onTitleClick, heading = true, className }: TopBarProps) {
   useLocale();
   const titleBlock = (
     <>
@@ -103,7 +105,7 @@ export function TopBar({ title, subtitle, onBack, backLabel = t("back"), backOnP
           </button>
         ) : (
           <div className="flex min-w-0 grow items-center gap-3 px-2">
-            <h1 className="contents">{titleBlock}</h1>
+            {heading ? <h1 className="contents">{titleBlock}</h1> : titleBlock}
           </div>
         )}
         {actions && <div className="flex shrink-0 items-center">{actions}</div>}

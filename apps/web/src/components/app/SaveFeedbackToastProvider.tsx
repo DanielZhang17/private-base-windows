@@ -13,7 +13,7 @@ function focusFallback(document: Document) {
 }
 
 export default function SaveFeedbackToastProvider({ children }: { children: ReactNode }) {
-  const feedback = useSaveFeedbackStore(({ topOverlay, notice }) => topOverlay ? null : notice);
+  const feedback = useSaveFeedbackStore(({ topOverlay, notice }) => topOverlay && topOverlay.kind !== "popover" ? null : notice);
   const announcement = useSaveFeedbackStore(({ announcement }) => announcement?.viewer === undefined ? announcement ?? undefined : undefined);
   useLayoutEffect(() => {
     if (feedback) presentSaveFeedback(feedback);

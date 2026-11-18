@@ -16,12 +16,19 @@ const keyState = vi.hoisted(() => {
   return { loaded: true, unlockedEffects: 0 };
 });
 vi.mock("../../lib/key-manager.js", () => ({
+  listLocalUnlockMethods: vi.fn(async () => ["password"]),
+  localPasskeyUnlockId: vi.fn(async () => undefined),
+  hasPendingNativeUnlockRemoval: vi.fn(async () => false),
   keysLoaded: () => keyState.loaded,
   hasLocalKeyMaterial: async () => true,
+  getLocalKeyOwner: async () => null,
   resetLocalCryptoState: vi.fn(),
   lockLocalCryptoState: vi.fn(() => { keyState.loaded = false; }),
   // The real manual lock does not notify these listeners; idle lock does.
   onKeysLocked: () => () => {},
+}));
+vi.mock("../../db/index.js", async original => ({
+  ...await original<typeof import("../../db/index.js")>(), readPendingSetupRecord: async () => undefined,
 }));
 vi.mock("../../services/api.js", () => ({ api: { get: vi.fn(), post: vi.fn() }, resolveApiUrl: (path: string) => path }));
 vi.mock("../../pages/LoginPage.js", () => ({ default: () => <h1>Sign in</h1> }));

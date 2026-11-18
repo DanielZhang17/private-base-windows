@@ -15,11 +15,14 @@ import {
   type OneTimePreKey,
   type SignedPreKey,
 } from "@e2ee-chat/crypto";
-import { getAppDB, getSession, saveMessage, saveSession } from "../db/index.js";
+import { getAppDB, getSession, saveMessage as writeOwnedMessage, saveSession } from "../db/index.js";
 import { api } from "../services/api.js";
 import { decryptMessage as decryptMessageAndCommit, type IncomingMessage } from "./message-processor.js";
 import { decryptFromDevice as decryptFromDeviceAndCommit, decryptInitialMessage as decryptInitialMessageAndCommit, encryptForDevice, resetSession } from "./session-manager.js";
 import { consumeOneTimePreKey, findOneTimePreKey } from "./key-manager.js";
+
+const saveMessage = (row: Parameters<typeof writeOwnedMessage>[0], current?: () => boolean, ownerId = row.ownerId ?? "bob") =>
+  writeOwnedMessage(row, current, ownerId);
 
 let identity: IdentityKeyPair;
 let signed: SignedPreKey;

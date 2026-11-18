@@ -5,6 +5,27 @@ export type SessionSnapshot = {
   sessionId: string | null;
 };
 
+/** Compare against the latest cross-tab write even before its storage event arrives. */
+export function readAuthStorage(): string | null {
+  try { return localStorage.getItem("e2ee-auth"); }
+  catch { return null; }
+}
+
+type PersistedSession = {
+  accessToken?: unknown;
+  refreshToken?: unknown;
+  sessionId?: unknown;
+  user?: { id?: unknown } | null;
+  device?: { id?: unknown } | null;
+};
+
+export function readPersistedSession(storage = readAuthStorage()): PersistedSession | undefined {
+  try {
+    const state = JSON.parse(storage ?? "null")?.state;
+    return state && typeof state === "object" ? state : undefined;
+  } catch { return undefined; }
+}
+
 /**
  * Whether `now` is still the session a request started in. The per-login sessionId decides:
  * it changes on every login (even on the same device) and on logout, but not on an idle lock,

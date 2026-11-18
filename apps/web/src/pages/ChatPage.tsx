@@ -2,35 +2,53 @@ import { t, useLocale } from "../i18n/index.js";
 import { useEffect, useRef, useState } from "react";
 import { useConversationMutations } from "../features/chat/useConversationMutations.js";
 import { useConversation } from "../features/chat/useConversation.js";
-import { messageRun, timedDuration } from "../features/chat/presentation.js";
+import { canEditMessage, messageRun, timedDuration } from "../features/chat/presentation.js";
 import { Badge, Button, ConfirmDialog, CountBadge, Dialog, EmptyState, Field, Icon, IconButton, Input, ListItem, Notice, Sheet, Spinner, TopBar, useToast } from "../ui/index.js";
+import { getTopOverlay } from "../ui/overlay-stack.js";
 import MessageBubble from "../components/chat/MessageBubble.js";
 import MessageInput from "../components/chat/MessageInput.js";
 import UserAvatar from "../components/avatar/UserAvatar.js";
 import AddMembersModal from "../components/user-picker/AddMembersModal.js";
+import { ConversationTransferMarkers, TRANSFER_RECEIVE_PATH } from "../features/transfer/HistoryTransferScreens.js";
+import { StickerProvider } from "../features/stickers/useStickerPicker.js";
 import { DateDivider } from "../components/chat/DateDivider.js";
+import { capabilities } from "../platform/capabilities.js";
 
 export default function ChatPage() {
   const { locale } = useLocale();
   const flow = useConversation();
   const paneRef = useRef<HTMLDivElement>(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [edit, setEdit] = useState<{ id: string; content: string; baseSequence: number }>();
   const mutations = useConversationMutations(flow.conversationId, () => flow.navigate("/"));
   const toast = useToast();
   const group = flow.conversation?.type === "group";
-  const failed = flow.outgoing.filter((row) => row.status === "failed");
+  const failed = flow.outgoing.filter((row) => row.status === "failed" && !row.editTargetId);
+  const failedEdits = flow.outgoing.filter((row) => row.status === "failed" && row.editTargetId);
+  const canEdit = flow.conversation?.members.some((member) => member.userId === flow.user?.id && member.acceptedAt != null);
+  const currentEditMessage = canEdit && edit ? flow.conversationMessages.find((message) => message.id === edit.id
+    && canEditMessage({ ...message, pendingEdit: null }, flow.user?.id, flow.deviceId)) : undefined;
+  const editing = currentEditMessage ? edit : undefined;
+  const editConflict = !!editing && (currentEditMessage?.editSequence ?? 0) !== editing.baseSequence;
   const timer = timedDuration(flow.conversationMessages);
   useEffect(() => {
+    setEdit(undefined);
+  }, [flow.conversationId]);
+  useEffect(() => {
+    if (getTopOverlay()) return;
     const wide = window.matchMedia?.("(min-width: 640px)").matches;
     const target = paneRef.current?.querySelector<HTMLElement>(wide ? "textarea" : "header button");
     target?.focus({ preventScroll: true });
   }, [flow.conversationId, flow.conversation?.id]);
+  useEffect(() => {
+    if (edit && !editing) setEdit(undefined);
+  }, [edit, editing]);
   useEffect(() => { document.title = t("privateBase", { conversationName: flow.conversationName }); }, [flow.conversationName, locale]);
   useEffect(() => {
     if (flow.noticeMessage) { toast.show({ tone: "danger", message: flow.noticeMessage }); flow.dismissNotice(); }
   }, [flow.noticeMessage, flow.dismissNotice, toast]);
 
-  return <div ref={paneRef} className="flex h-full min-h-0 flex-1 flex-col overflow-clip bg-surface"
+  return <StickerProvider><div ref={paneRef} className="flex h-full min-h-0 flex-1 flex-col overflow-clip bg-surface"
     onDragOver={(event) => { if (event.dataTransfer.types.includes("Files")) event.preventDefault(); }}
     onDrop={(event) => { if (event.dataTransfer.files.length) event.preventDefault(); }}>
     <TopBar title={flow.conversationName} onBack={() => flow.navigate("/")} backLabel={t("backToConversations")} backOnPhoneOnly onTitleClick={() => setDetailsOpen(true)}
@@ -45,28 +63,44 @@ export default function ChatPage() {
     {flow.callUnsupported ? <Notice tone="warning" className="m-3">{t("encryptedCallsArenTSupportedOnThisDevice")}</Notice> : flow.callError && <Notice tone="danger" className="m-3">{flow.callError}</Notice>}
     <div ref={flow.messageListRef} role="log" data-call-message-area="" aria-label={t("messages")} aria-live="polite" aria-relevant="additions" className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 py-3">
       {(flow.hasOlderCachedMessages || flow.loadingOlderCachedMessages) && <div className="flex justify-center pb-2"><Button variant="ghost" size="sm" loading={flow.loadingOlderCachedMessages} onClick={() => void flow.handleLoadOlderCachedMessages()}>{t("loadOlderCachedMessages")}</Button></div>}
+      {flow.hasUnverifiedLegacyHistory && <Notice tone="warning">{t("unverifiedLegacyHistory")}</Notice>}
       {flow.conversationError && <Notice tone="danger">{flow.conversationError}</Notice>}
       {flow.conversationLoading && <div className="py-3 text-center"><Spinner label={t("loadingConversation")} /></div>}
-      {!flow.conversationMessages.length && !flow.conversationError && !flow.conversationLoading && <EmptyState title={t("noMessagesYetSayHello")} />}
+      {!flow.conversationMessages.length && !flow.conversationError && !flow.conversationLoading && <EmptyState
+        title={t(flow.showHistoryGuidance ? "chats.emptyLinkedConversation" : "noMessagesYetSayHello")}
+        description={flow.showHistoryGuidance ? t("chats.historyOnOtherDevices") : undefined}
+        action={flow.showHistoryGuidance && capabilities.historyTransfer &&
+          <Button leadingIcon="transfer" onClick={() => flow.navigate(TRANSFER_RECEIVE_PATH)}>{t("passkeySetup.transferAction")}</Button>} />}
+      <ConversationTransferMarkers conversationId={flow.conversationId} />
       {flow.conversationMessages.map((message, index, messages) => {
         const member = flow.conversation?.members.find((entry) => entry.userId === message.senderId);
         const queueEntry = flow.outgoing.find((row) => row.id === message.id);
+        const failedEdit = failedEdits.find((row) => row.editTargetId === message.id);
         const divider = !index || new Date(messages[index - 1].timestamp).toDateString() !== new Date(message.timestamp).toDateString();
         const run = messageRun(messages, index);
         return <div key={message.id} className={run.first ? "mt-3" : "mt-0.5"}>
           {divider && <DateDivider date={new Date(message.timestamp)} />}
           <MessageBubble showMeta={run.last} firstInRun={run.first} message={message} isOwn={message.senderId === flow.user?.id} isGroup={group} senderAvatarUrl={member?.user.avatarUrl} senderName={member?.user.displayName}
-            failure={queueEntry?.error} onRetry={queueEntry ? () => void flow.retry(message.id) : undefined} onDiscard={queueEntry ? () => void flow.discard(message.id) : undefined} />
+            failure={queueEntry?.error} onRetry={queueEntry ? () => void flow.retry(message.id) : undefined} onDiscard={queueEntry ? () => void flow.discard(message.id) : undefined}
+            onEdit={canEdit && edit?.id !== message.id && !queueEntry && canEditMessage(message, flow.user?.id, flow.deviceId)
+              ? () => setEdit({ id: message.id, content: message.content, baseSequence: message.editSequence ?? 0 }) : undefined} />
+          {failedEdit && <Notice tone="danger" className="ms-auto mt-1 max-w-sm" action={<>
+            {(!failedEdit.sendDispatched || !failedEdit.retryable) && <Button size="sm" variant="ghost" onClick={() => void flow.discard(failedEdit.id)}>{t("discard")}</Button>}
+            <Button size="sm" variant="danger-ghost" onClick={() => void flow.retry(failedEdit.id)}>{t("retry")}</Button>
+          </>}>{failedEdit.error || t("messageEditFailed")}</Notice>}
         </div>;
       })}
     </div>
     {flow.showScrollToBottom && <div className="relative"><div className="absolute end-4 bottom-3 z-10"><IconButton icon="arrow-down" label={t("scrollToBottom")} variant="secondary" className="shadow-raised" onClick={flow.scrollToLatest} /><CountBadge count={flow.newMessagesBelowCount} label={t("newMessages")} announcement={t("newCount", { count: flow.newMessagesBelowCount })} className="absolute -top-1 -end-1" /></div></div>}
     {!!flow.typingNames?.length && <p role="status" className="px-4 py-1 text-xs text-ink-muted">{t("typing", { count: flow.typingNames.length, names: flow.typingNames.join(", ") })}</p>}
-    {flow.sendError && <Notice tone="danger" className="mx-3 mb-2">{flow.sendError}</Notice>}
+    {flow.sendError && !editConflict && <Notice tone="danger" className="mx-3 mb-2">{flow.sendError}</Notice>}
     {flow.outgoingRemoved && <Notice className="mx-3 mb-2" onDismiss={flow.dismissOutgoingRemoval}>{t("unsentMessageRemoved")}</Notice>}
     {failed.length > 1 && <Notice tone="danger" className="mx-3 mb-2" action={<Button size="sm" variant="danger-ghost" onClick={() => { failed.forEach((row) => void flow.retry(row.id)); }}>{t("retryAll")}</Button>}>{t("failedMessages", { count: failed.length })}</Notice>}
     {flow.isPendingRequest ? <Notice className="m-3" title={group ? t("youWereInvitedTo", { conversationName: flow.conversationName }) : t("wantsToMessageYou", { conversationName: flow.conversationName })} action={<div className="flex gap-2"><Button variant="secondary" onClick={() => void flow.handleDeclineRequest()}>{t("decline")}</Button><Button onClick={() => void flow.handleAcceptRequest()}>{t("accept")}</Button></div>} />
-      : <MessageInput key={flow.conversationId} dropTarget={paneRef} onSend={flow.handleSend} onSendFile={flow.handleSendFile} onTyping={flow.handleTyping} disabled={!flow.user || !flow.conversation} />}
+      : <MessageInput key={flow.conversationId} dropTarget={paneRef} messageList={flow.messageListRef} onSend={flow.handleSend} onSendFile={flow.handleSendFile} onTyping={flow.handleTyping}
+        disabled={!flow.user || !flow.conversation || !flow.conversation.members.some((member) => member.userId === flow.user?.id)}
+        editing={editing} editConflict={editConflict} onSaveEdit={editing ? (id, text) => flow.handleEdit(id, text, editing.baseSequence) : undefined}
+        onCancelEdit={() => setEdit((current) => current === edit ? undefined : current)} />}
 
     <Sheet side="end" open={detailsOpen || !!flow.showGroupSettings} onClose={() => { setDetailsOpen(false); flow.setShowGroupSettings(false); }} title={t("conversationDetails")}>
       <div className="flex flex-col items-center gap-2 py-3"><UserAvatar avatarUrl={flow.directPeer?.user.avatarUrl} displayName={flow.conversationName} size="lg" group={group} /><h2 className="text-lg font-semibold">{flow.conversationName}</h2>
@@ -89,5 +123,5 @@ export default function ChatPage() {
     </Dialog>
     <ConfirmDialog open={!!flow.showDeleteConfirm} tone="danger" title={group && flow.isGroupAdmin ? t("deleteGroupConfirmTitle", { conversationName: flow.conversationName }) : t("leaveConversation2")} description={group && flow.isGroupAdmin ? t("thisWillPermanentlyDeleteTheGroupAndAll") : t("youWillNoLongerReceiveMessagesFromThis")} confirmLabel={group && flow.isGroupAdmin ? t("deleteGroup") : t("leaveConversation")} acknowledgeLabel={group && flow.isGroupAdmin ? t("iUnderstandThisCannotBeUndone") : undefined} busy={mutations.deleting} error={mutations.deleteError} onConfirm={() => void mutations.deleteConversation()} onCancel={() => flow.setShowDeleteConfirm(false)} />
     <ConfirmDialog open={!!mutations.removeTarget} tone="danger" title={t("removeFrom", { value: mutations.removeTarget?.displayName ?? t("memberDisplayNameFallback"), conversationName: flow.conversationName })} description={t("theyWillStopReceivingNewMessages")} confirmLabel={t("removeMemberAction")} busy={mutations.removing} error={mutations.removeError} onConfirm={() => void mutations.removeMember()} onCancel={mutations.cancelRemoval} />
-  </div>;
+  </div></StickerProvider>;
 }

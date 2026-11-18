@@ -15,6 +15,7 @@ import {
   fromBase64Url,
   type SenderKeyEncryptResult,
   type SenderKeyState,
+  type EditKeyToSeal,
 } from "@e2ee-chat/crypto";
 import type {
   ConversationWithMembers,
@@ -23,9 +24,10 @@ import type {
   SendDirectBatchResponse,
 } from "@e2ee-chat/shared";
 import { api } from "../services/api.js";
-import { type OutgoingStep, getAppDB, getSenderKey, saveSenderKey, hasReceivedMessage, type LocalSenderKey } from "../db/index.js";
+import { type OutgoingStep, getAppDB, getSenderKey, getSession, saveSenderKey, hasReceivedMessage, type LocalSenderKey } from "../db/index.js";
 import { useAuthStore } from "../stores/authStore.js";
 import { encryptMessage } from "./message-processor.js";
+import { matchEditSigningIdentity } from "./message-edit.js";
 import { decryptPayload, finishReceive, withReceiveLock, MissingSenderKeyError, InvalidSenderKeyDistributionError, type ReceiveContext } from "./receive.js";
 
 interface RecipientRegistryEntry {
@@ -99,7 +101,7 @@ async function hasRecipientEntry(
   recipientDeviceId: string,
 ): Promise<boolean> {
   const db = await getAppDB();
-  const existing = await db.get("senderKeyRecipients", senderKeyRecipientId(
+  const existing = await db.get("receiveSenderKeyRecipients", senderKeyRecipientId(
     conversationId,
     senderDeviceId,
     senderKeyId,
@@ -117,7 +119,7 @@ async function markRecipientEntriesDistributed(
   const db = await getAppDB();
   const now = Date.now();
   await Promise.all(recipientDeviceIds.map((recipientDeviceId) =>
-    db.put("senderKeyRecipients", {
+    db.put("receiveSenderKeyRecipients", {
       id: senderKeyRecipientId(conversationId, senderDeviceId, senderKeyId, recipientDeviceId),
       conversationId,
       senderDeviceId,
@@ -247,9 +249,10 @@ export async function prepareRemoteSenderKey(
 export async function encryptGroupMessage(
   conversationId: string,
   plaintext: Uint8Array,
+  editKey?: EditKeyToSeal,
 ): Promise<SenderKeyEncryptResult> {
   const state = await getOrCreateSenderKey(conversationId);
-  const result = await senderKeyEncrypt(state, plaintext);
+  const result = await senderKeyEncrypt(state, plaintext, editKey);
   await persistOwnSenderKey(conversationId, state);
   return result;
 }
@@ -265,12 +268,14 @@ export async function decryptGroupMessage(
 ): Promise<Uint8Array | null> {
   const key = remoteSenderKeyId(conversationId, senderId, senderDeviceId, header.senderKeyId);
   return withReceiveLock(receive, `${senderId}:${senderDeviceId}`, async () => {
-    if (await hasReceivedMessage(receive.messageId)) return null;
+    if (await hasReceivedMessage(receive.messageId, receive.ownerId, receive.deviceId)) return null;
     if (!await getSenderKey(key)) throw new MissingSenderKeyError(key);
     await receive.beforeGroupDecrypt?.(header);
     // Draining may advance this chain; reload its committed state before decrypting.
     const stored = await getSenderKey(key);
     if (!stored) throw new MissingSenderKeyError(key);
+    const peer = receive.editKey ? await getSession(`${senderId}:${senderDeviceId}`) : undefined;
+    const editKey = matchEditSigningIdentity(receive.editKey, peer?.peerIdentityKey);
     const decrypted = await decryptPayload(async () => {
       const state: SenderKeyState = {
         senderKeyId: stored.senderKeyId,
@@ -279,7 +284,7 @@ export async function decryptGroupMessage(
         signingPrivateKey: new Uint8Array(0),
         chainIndex: stored.chainIndex,
       };
-      const plaintext = await senderKeyDecrypt(state, header, ciphertext, iv);
+      const plaintext = await senderKeyDecrypt(state, header, ciphertext, iv, editKey);
       return { state, plaintext };
     });
     return finishReceive(receive, decrypted.plaintext, {

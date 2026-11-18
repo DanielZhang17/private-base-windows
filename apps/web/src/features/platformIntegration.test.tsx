@@ -25,7 +25,16 @@ vi.mock("../stores/authStore.js", async () => {
 vi.mock("../services/api.js", () => ({ api: { get: vi.fn(), post: vi.fn() } }));
 vi.mock("../platform/session.js", () => ({ clearAccountScopedState: vi.fn(() => { order.push("clear"); }) }));
 vi.mock("../platform/clipboard.js", () => ({ copyText: vi.fn(async () => {}) }));
-vi.mock("../lib/key-manager.js", () => ({ hasLocalKeyMaterial: async () => true, lockLocalCryptoState: vi.fn(), resetLocalCryptoState: vi.fn() }));
+vi.mock("../lib/key-manager.js", async original => ({
+  resolveLocalKeyDeviceId: (await original<typeof import("../lib/key-manager.js")>()).resolveLocalKeyDeviceId,
+  hasLocalKeyMaterial: async () => true, getLocalKeyOwner: vi.fn(async () => null),
+  getLocalVaultKey: vi.fn(async () => ({ id: "identity", type: "identity", data: "encrypted" })),
+  lockLocalCryptoState: vi.fn(), resetLocalCryptoState: vi.fn(),
+}));
+vi.mock("../lib/passkey-provision.js", async original => ({
+  ...await original<object>(),
+  readPendingPasskeySetup: vi.fn(async () => undefined),
+}));
 vi.mock("../lib/device-link.js", () => ({ generateRecoveryKey: () => "recovery", buildDefaultDeviceName: () => "Browser" }));
 vi.mock("../lib/webauthn.js", async (original) => ({
   ...await original<object>(),
@@ -75,7 +84,7 @@ it("exposes the platform passkey capability and skips unsupported prefetch and W
   expect(login.passkeysSupported).toBe(false);
   await act(async () => { login.setUsername("alice"); settings.setPasskeyName("Phone"); });
   await act(async () => {
-    await login.prefetchPasskeyOptions("alice");
+    await login.preparePasskeyEntry();
     await login.handlePasskeyLogin();
     await settings.handleRegisterPasskey();
   });
@@ -90,9 +99,9 @@ it("guards cached passkey options if support becomes unavailable", async () => {
   vi.spyOn(capabilities, "passkeys", "get").mockReturnValue(true);
   await render();
   await act(async () => { login.setUsername("alice"); settings.setPasskeyName("Phone"); });
-  await act(async () => { await login.prefetchPasskeyOptions("alice"); });
+  await act(async () => { await login.preparePasskeyEntry(); });
   expect(api.post).toHaveBeenCalledWith("/api/passkeys/register-options", {});
-  expect(api.post).toHaveBeenCalledWith("/auth/passkey/login-options", { username: "alice", deviceId: "device" });
+  expect(api.post).toHaveBeenCalledWith("/auth/passkey/login-options", { deviceId: "device" }, { signal: expect.any(AbortSignal) });
   vi.spyOn(capabilities, "passkeys", "get").mockReturnValue(false);
   vi.mocked(api.post).mockClear();
   await act(async () => { await login.handlePasskeyLogin(); await settings.handleRegisterPasskey(); });

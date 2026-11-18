@@ -1,5 +1,7 @@
 import { formatDate, formatDuration } from "../../i18n/format.js";
 import { t, getLocale } from "../../i18n/index.js";
+import { isSticker } from "../../lib/stickers.js";
+export { isSticker, parseStickerToken } from "../../lib/stickers.js";
 import { isToday, isYesterday } from "date-fns";
 import { useSecondTicker } from "../../lib/second-ticker.js";
 export type { DecryptedMessage, CustomEmoji } from "@e2ee-chat/shared";
@@ -21,10 +23,25 @@ export function parseFilePayload(content: string): FilePayload | null {
   } catch { return null; }
 }
 
-import type { ConversationWithMembers, DecryptedMessage } from "@e2ee-chat/shared";
+import type { ConversationWithMembers, DecryptedMessage, Device } from "@e2ee-chat/shared";
+
+export function linkedDeviceTime(device: Pick<Device, "linkMethod" | "activatedAt" | "createdAt"> | null) {
+  return device?.linkMethod && device.linkMethod !== "register" ? device.activatedAt ?? device.createdAt : undefined;
+}
+
+// SQLite conversation and membership timestamps can be in seconds.
+function conversationTimeMs(timestamp: number): number {
+  return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
+}
+
+export function predatesDeviceLink(conversation: ConversationWithMembers, linkedAt: number, joinedAt?: number): boolean {
+  return conversationTimeMs(conversation.createdAt) < linkedAt &&
+    (conversation.type !== "group" || (joinedAt !== undefined && conversationTimeMs(joinedAt) < linkedAt));
+}
+
 export function chatPreview(message: DecryptedMessage, conversation: ConversationWithMembers, userId?: string) {
   if (message.deletedAt) return t("messageDeleted");
-  let preview = message.content;
+  let preview = copyableMessageText(message);
   if (message.type === "file") {
     const file = parseFilePayload(message.content);
     preview = file?.mimeType.startsWith("image/") ? t("photoMessagePreview") : file ? t("chatPreviewFileName", { fileName: file.fileName }) : t("fileTypeLabel");
@@ -35,6 +52,18 @@ export function chatPreview(message: DecryptedMessage, conversation: Conversatio
   if (message.senderId === userId) return t("chatPreviewFromYou", { preview });
   return conversation.type === "group" && sender ? t("chatPreviewFromMember", { name: sender.user.displayName, preview }) : preview;
 }
+
+export function canEditMessage(message: DecryptedMessage, userId?: string, deviceId?: string): boolean {
+  return message.senderId === userId && message.type === "text" && !message.deletedAt && !message.pendingEdit && !isSticker(message)
+    && message.editKeyAccepted === true && !!deviceId && message.editSenderDeviceId === deviceId
+    && ["sent", "delivered", "read"].includes(message.status)
+    && (message.expiresAt === null || message.expiresAt > Date.now());
+}
+
+export function copyableMessageText(message: DecryptedMessage) {
+  return isSticker(message) ? t("stickerPreview") : (message.pendingEdit?.content ?? message.content);
+}
+
 export function timedDuration(messages: DecryptedMessage[]) {
   const lastTimed = [...messages].reverse().find((message) => message.expiryKind === "timed" && message.expiresAt != null);
   if (!lastTimed?.expiresAt) return null;

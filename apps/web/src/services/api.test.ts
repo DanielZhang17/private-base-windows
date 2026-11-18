@@ -55,6 +55,13 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+it("accepts the empty successful transfer-room status response", async () => {
+  fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+  await expect(api.get<void>("/api/history-transfer/room")).resolves.toBeUndefined();
+  expect(authorization(fetchMock.mock.calls[0][1])).toBe("Bearer old-access");
+  expect(refreshCalls()).toHaveLength(0);
+});
+
 it("returns an anonymous 401 without clearing the session or navigating away", async () => {
   useAuthStore.setState({ accessToken: null, refreshToken: null });
   fetchMock.mockResolvedValueOnce(json({ error: "Missing authorization" }, 401));
@@ -446,4 +453,25 @@ describe("API token refresh", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+});
+
+it("refreshes invalid active-session credentials before verifying the same password", async () => {
+  fetchMock.mockResolvedValueOnce(json({ error: "Invalid token" }, 401))
+    .mockResolvedValueOnce(json(newTokens))
+    .mockResolvedValueOnce(json({ verified: true }));
+  await expect(api.post("/auth/password/verify", { password: "valid-password" })).resolves.toEqual({ verified: true });
+  expect(refreshCalls()).toHaveLength(1);
+  expect(authorization(fetchMock.mock.calls[2][1])).toBe(`Bearer ${newTokens.accessToken}`);
+  expect(fetchMock.mock.calls[2][1]?.body).toBe(JSON.stringify({ password: "valid-password" }));
+});
+
+it.each([
+  { error: "invalid_password" },
+  { error: "Invalid token", setup: "explicit-setup-token" },
+])("does not refresh $error on a password rejection or with a setup bearer", async ({ error, setup }) => {
+  fetchMock.mockResolvedValueOnce(json({ error }, 401));
+  await expect(api.post("/auth/password/verify", { password: "password" }, setup ? { bearerToken: setup } : undefined))
+    .rejects.toMatchObject({ status: 401, body: { error } });
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(authorization(fetchMock.mock.calls[0][1])).toBe(`Bearer ${setup ?? oldTokens.accessToken}`);
 });

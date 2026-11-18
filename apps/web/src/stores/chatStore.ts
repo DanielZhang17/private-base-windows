@@ -10,6 +10,21 @@ function sortMessages(messages: DecryptedMessage[]): DecryptedMessage[] {
   });
 }
 
+function mergeMessage(preferred: DecryptedMessage, other: DecryptedMessage): DecryptedMessage {
+  const sameOwner = preferred.ownerId === other.ownerId && preferred.senderId === other.senderId && preferred.conversationId === other.conversationId;
+  if (sameOwner && other.deletedAt && !preferred.deletedAt) return other;
+  const merged = { ...other, ...preferred };
+  if (sameOwner && !preferred.deletedAt && ((other.editedAt ?? 0) > (preferred.editedAt ?? 0)
+    || ((other.editedAt ?? 0) === (preferred.editedAt ?? 0) && (other.editSequence ?? 0) > (preferred.editSequence ?? 0)))) {
+    merged.content = other.content;
+    merged.editedAt = other.editedAt;
+    merged.editedByUserId = other.editedByUserId;
+    merged.editSequence = other.editSequence;
+    merged.pendingEdit = other.pendingEdit;
+  }
+  return merged;
+}
+
 interface ChatState {
   conversations: ConversationWithMembers[];
   activeConversationId: string | null;
@@ -76,7 +91,9 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         msgs.set(conversationId, sortMessages([...existing, message]));
       } else {
         const updated = [...existing];
-        updated[idx] = { ...updated[idx], ...message };
+        const next = mergeMessage(message, updated[idx]);
+        if (next === updated[idx]) return state;
+        updated[idx] = next;
         msgs.set(conversationId, sortMessages(updated));
       }
       return { messages: msgs };
@@ -93,8 +110,16 @@ export const useChatStore = create<ChatState>()((set, get) => ({
 
       for (const message of incomingMessages) {
         const existingMessage = byId.get(message.id);
-        // Cached history fills gaps; current local/live entries win conflicts.
-        byId.set(message.id, existingMessage ? { ...message, ...existingMessage } : message);
+        const merged = existingMessage ? mergeMessage(existingMessage, message) : message;
+        // Eligibility and pending state can change without a new committed revision.
+        if (existingMessage && !merged.deletedAt && existingMessage.ownerId === message.ownerId && existingMessage.senderId === message.senderId
+          && existingMessage.conversationId === message.conversationId) {
+          merged.editKeyAccepted = message.editKeyAccepted;
+          merged.editSenderDeviceId = message.editSenderDeviceId;
+          if ((existingMessage.editSequence ?? 0) === (message.editSequence ?? 0)
+            && existingMessage.pendingEdit !== message.pendingEdit) merged.pendingEdit = message.pendingEdit;
+        }
+        byId.set(message.id, merged);
       }
 
       msgs.set(conversationId, sortMessages([...byId.values()]));

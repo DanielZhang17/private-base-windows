@@ -6,12 +6,25 @@ import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { promisify, stripVTControlCharacters } from 'node:util';
+import ts from 'typescript';
 
 export const RELEASE_BASE = 'https://dist.718788.xyz/private-base/releases/';
 const PREFIX = 'private-base/releases/';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const exec = promisify(execFile);
+const DESKTOP_TARGETS = ['darwin-aarch64', 'darwin-x86_64', 'windows-x86_64'];
+// Compile the browser's dependency-free notes modules with the repo toolchain so the CLI also runs on Node 18.
+async function loadNotesModule(name) {
+  const source = await readFile(join(ROOT, 'apps/web/src/features/clients', name), 'utf8');
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+}
+const [{ parseReleaseNotes, MAX_NOTES_BYTES, RELEASE_NOTE_PLATFORMS }, { plainTextNotes }] = await Promise.all([
+  loadNotesModule('releaseNotes.ts'), loadNotesModule('notesMarkdown.ts'),
+]);
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 // Mirrored from features/clients/manifest.ts. Its CLI integration test checks interoperability.
 const FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
@@ -80,37 +93,55 @@ export function validateOptions(options) {
   versionParts(minimum);
   if (compare(minimum, version) > 0) throw new Error('Minimum version must not exceed the release version.');
   blocked.forEach(versionParts);
-  if (!Number.isInteger(options.minSdk ?? 24) || (options.minSdk ?? 24) < 24) throw new Error('Android minSdk must be an integer at least 24.');
+  const minSdk = options.minSdk ?? 24;
+  if (!Number.isInteger(minSdk) || minSdk < 24) throw new Error('Android minSdk must be an integer at least 24.');
+  const androidMinOs = matching(options.androidMinOs ?? (minSdk === 24 ? 'Android 7.0' : `Android API ${minSdk}`), MIN_OS, 'androidMinOs');
   matching(options.androidArch ?? 'arm64', SHORT_TOKEN, 'androidArch');
   matching(options.macMinOs ?? 'macOS 12.3', MIN_OS, 'macMinOs');
   matching(options.windowsMinOs ?? 'Windows 10', MIN_OS, 'windowsMinOs');
   const date = new Date(options.pubDate ?? new Date());
   if (!Number.isFinite(date.getTime())) throw new Error('Invalid publication date.');
-  return { ...options, minimum, blocked: [...new Set(blocked)], pubDate: date.toISOString(), minSdk: options.minSdk ?? 24 };
+  return { ...options, minimum, blocked: [...new Set(blocked)], pubDate: date.toISOString(), minSdk, androidMinOs };
 }
 const urlFor = (version, file) => `${RELEASE_BASE}${version}/${encodeURIComponent(file)}`;
+
+function boundedNotes(text) {
+  const bytes = Buffer.from(text);
+  let end = Math.min(bytes.length, MAX_NOTES_BYTES);
+  while ((bytes[end] & 0xc0) === 0x80) end--;
+  return bytes.toString('utf8', 0, end);
+}
+
+function notesArchiveFor(latest, notes) {
+  const { product, version, published, platforms } = latest;
+  return parseReleaseNotes({
+    product,
+    entries: [{ version, published, notes, platforms: RELEASE_NOTE_PLATFORMS.filter(key => platforms[key]) }],
+  });
+}
 
 /** Pure manifest generation, also used by the CLI and unit tests. */
 export function generateManifests(input, artifacts) {
   const o = validateOptions(input);
   if (!artifacts.length) throw new Error('Provide at least one platform artifact set.');
   validateArtifacts(artifacts);
+  const notes = boundedNotes(o.notesMarkdown === undefined ? o.notes ?? '' : plainTextNotes(o.notesMarkdown));
   const manifests = {};
   const policy = { rolloutPercent: o.rollout, minimumVersion: o.minimum, blocked: o.blocked };
   const find = (target, kind) => artifacts.find(a => a.target === target && a.kind === kind);
-  for (const target of ['darwin-aarch64', 'darwin-x86_64', 'windows-x86_64']) {
+  for (const target of DESKTOP_TARGETS) {
     const update = find(target, 'update');
     if (!update) continue;
     if (!update.signature?.trim()) throw new Error(`Missing updater signature for ${target}.`);
     manifests[`${o.channel}/updater/${target}.json`] = {
-      version: o.version, notes: o.notes ?? '', pub_date: o.pubDate,
+      version: o.version, notes, pub_date: o.pubDate,
       platforms: { [target]: { signature: update.signature.trim(), url: urlFor(o.version, update.file) } }, ...policy,
     };
   }
   const apk = find('android', 'installer');
   if (apk) manifests[`${o.channel}/android.json`] = {
     versionName: o.version, versionCode: androidVersionCode(o.version), url: urlFor(o.version, apk.file),
-    sha256: apk.sha256, size: apk.size, minSdk: o.minSdk, notes: o.notes ?? '', pub_date: o.pubDate, ...policy,
+    sha256: apk.sha256, size: apk.size, minSdk: o.minSdk, notes, pub_date: o.pubDate, ...policy,
   };
   if (o.channel === 'stable') {
     const entry = (a, arch, minOs, signed) => a ? { file: a.file, url: urlFor(o.version, a.file), size: a.size, sha256: a.sha256, arch, minOs, signed } : null;
@@ -120,13 +151,16 @@ export function generateManifests(input, artifacts) {
       product: 'Private Base', version: o.version, published: o.pubDate,
       platforms: {
         macos: entry(arm ?? find('darwin-x86_64', 'installer'), arm ? 'arm64' : 'x64', o.macMinOs ?? 'macOS 12.3', o.macSigning ?? 'See release notes'),
-        android: entry(apk, o.androidArch ?? 'arm64', `Android API ${o.minSdk}+`, o.androidSigning ?? 'release key'),
+        android: entry(apk, o.androidArch ?? 'arm64', o.androidMinOs, o.androidSigning ?? 'release key'),
         windows: entry(find('windows-x86_64', 'update'), 'x64', o.windowsMinOs ?? 'Windows 10', o.windowsSigning ?? 'unsigned'),
         ios: null,
       },
     };
+    validateDownloadManifest(manifests['latest.json']);
+    if (o.notesMarkdown !== undefined) {
+      manifests['notes.json'] = notesArchiveFor(manifests['latest.json'], o.notesMarkdown);
+    }
   }
-  if (manifests['latest.json']) validateDownloadManifest(manifests['latest.json']);
   return manifests;
 }
 
@@ -177,12 +211,13 @@ export async function collectArtifacts(args) {
   }
   return artifacts;
 }
-const VALUE_ARGS = new Set(['version', 'channel', 'rollout', 'minimum', 'block', 'notes-file', 'pub-date', 'out', 'android-min-sdk', 'android-arch', 'macos-min-os', 'macos-signing', 'android-signing', 'windows-min-os', 'windows-signing', ...GROUPS.flatMap(g => g.args)]);
+const VALUE_ARGS = new Set(['version', 'channel', 'rollout', 'minimum', 'block', 'notes-file', 'pub-date', 'out', 'android-min-sdk', 'android-arch', 'macos-min-os', 'android-min-os', 'macos-signing', 'android-signing', 'windows-min-os', 'windows-signing', ...GROUPS.flatMap(g => g.args)]);
 export function parseArgs(argv) {
   const result = { block: [], publish: false };
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i].slice(2);
     if (argv[i] === '--publish') { result.publish = true; continue; }
+    if (argv[i] === '--publish-notes-only') { result.notesOnly = true; continue; }
     if (argv[i] === '--help') { result.help = true; continue; }
     if (!argv[i].startsWith('--') || !VALUE_ARGS.has(key) || !argv[i + 1] || argv[i + 1].startsWith('--')) throw new Error('Unknown option or missing option value. Use --help.');
     const value = argv[++i];
@@ -200,14 +235,53 @@ async function wrangler(args) {
     });
   } catch (error) {
     // Wrangler diagnostics are deliberately not printed (credentials may be in the environment).
-    if (String(error.stderr).includes('The specified key does not exist.')) return { missing: true };
+    const diagnostic = stripVTControlCharacters(String(error.stderr)).split(/\r?\n/).find(line => line.includes('[ERROR]'));
+    if (args[0] === 'get' && diagnostic?.trimEnd().endsWith('[ERROR] The specified key does not exist.')) return { missing: true };
     throw new Error('Wrangler failed. Check local authentication and bucket access; no further uploads attempted.');
   }
 }
+
+async function readRemoteJson(name, temp, remote) {
+  const path = join(temp, name.replaceAll('/', '-'));
+  const result = await remote(['get', `dist/${PREFIX}${name}`, '--file', path]);
+  if (result.missing !== true) return JSON.parse(await readFile(path, 'utf8'));
+}
+
+async function readNotesEntries(temp, remote) {
+  const previous = await readRemoteJson('notes.json', temp, remote);
+  return previous === undefined ? [] : parseReleaseNotes(previous).entries;
+}
+
+function parseNotesForVersion(notes, version) {
+  const parsed = parseReleaseNotes(notes);
+  if (parsed.entries.length !== 1 || parsed.entries[0].version !== version) throw new Error('Expected notes for this release version.');
+  return parsed;
+}
+
+async function writeMergedNotes(path, previous, { product, entries: [candidate] }) {
+  const entries = [candidate, ...previous.filter(entry => entry.version !== candidate.version)]
+    .sort((a, b) => Date.parse(b.published) - Date.parse(a.published));
+  const merged = parseReleaseNotes({ product, entries });
+  await writeFile(path, JSON.stringify(merged, null, 2) + '\n');
+}
+
+async function uploadDiscovery(name, path, remote) {
+  await remote(['put', `dist/${PREFIX}${name}`, '--file', path, '--content-type', 'application/json', '--cache-control', 'no-cache, max-age=0, must-revalidate']);
+}
+
 export async function publishRelease({ version, artifacts, manifests, out }, remote = wrangler) {
   versionParts(version);
   validateArtifacts(artifacts);
-  if ('latest.json' in manifests) validateDownloadManifest(manifests['latest.json']);
+  const { 'notes.json': notes, ...discovery } = manifests;
+  const latest = discovery['latest.json'];
+  let noteArchive;
+  if ('latest.json' in discovery || Object.keys(discovery).some(name => name.startsWith('stable/'))) {
+    validateDownloadManifest(latest);
+    if (!notes) throw new Error('Stable publication requires --notes-file.');
+    noteArchive = parseNotesForVersion(notes, version);
+  } else if (notes !== undefined) {
+    throw new Error('Only stable publication can include release notes.');
+  }
   const temp = await mkdtemp(join(tmpdir(), 'private-base-release-'));
   try {
     // Authenticated reads avoid CDN negative caching. Fail closed on every error except a missing key.
@@ -216,21 +290,79 @@ export async function publishRelease({ version, artifacts, manifests, out }, rem
     const snapshotKey = `${PREFIX}${version}/release.json`;
     for (const key of [snapshotKey, ...immutable.map(a => a.key)]) {
       const result = await remote(['get', `dist/${key}`, '--file', join(temp, 'existing')]);
-      if (!result.missing) throw new Error(`Refusing to overwrite immutable release object: ${key}`);
+      if (result.missing !== true) throw new Error(`Refusing to overwrite immutable release object: ${key}`);
+    }
+    if (noteArchive) {
+      const previous = await readNotesEntries(temp, remote);
+      await writeMergedNotes(join(out, 'notes.json'), previous, noteArchive);
     }
     const snapshotPath = join(out, 'release.json');
     await writeFile(snapshotPath, JSON.stringify({ version, artifacts: artifacts.map(({ path, signature, ...a }) => a), manifests }, null, 2) + '\n');
     immutable.push({ key: snapshotKey, path: snapshotPath, contentType: 'application/json' });
     for (const a of immutable) await remote(['put', `dist/${a.key}`, '--file', a.path, '--content-type', a.contentType, '--cache-control', 'public, max-age=31536000, immutable']);
     // Only make a release discoverable once all immutable objects have uploaded successfully.
-    for (const name of Object.keys(manifests)) await remote(['put', `dist/${PREFIX}${name}`, '--file', join(out, name), '--content-type', 'application/json', '--cache-control', 'no-cache, max-age=0, must-revalidate']);
+    for (const name of Object.keys(discovery)) await uploadDiscovery(name, join(out, name), remote);
+    if (noteArchive) await uploadDiscovery('notes.json', join(out, 'notes.json'), remote);
   } finally { await rm(temp, { recursive: true, force: true }); }
 }
 
-export async function main(argv) {
+async function hasPublishedReference(latest, manifests, temp, remote) {
+  const version = latest.version;
+  const versionUrl = `${RELEASE_BASE}${version}/`;
+  const activeLatest = await readRemoteJson('latest.json', temp, remote);
+  if (activeLatest !== undefined) validateDownloadManifest(activeLatest);
+  const activeVersion = activeLatest?.version;
+  if (!SEMVER.test(activeVersion ?? '') || compare(version, activeVersion) > 0) {
+    throw new Error(`Stable latest.json must reference version ${version} or newer (found ${activeVersion ?? 'no manifest'}). Finish or repair the stable publish before recovering its notes.`);
+  }
+  if (activeLatest.product === latest.product && activeVersion === version && RELEASE_NOTE_PLATFORMS.some(key => {
+    const expectedUrl = latest.platforms[key]?.url;
+    return expectedUrl?.startsWith(versionUrl) && activeLatest.platforms[key]?.url === expectedUrl;
+  })) return true;
+
+  // A partial newer release can leave an older version live on individual stable platforms.
+  for (const target of ['android', ...DESKTOP_TARGETS]) {
+    const android = target === 'android';
+    const name = android ? 'stable/android.json' : `stable/updater/${target}.json`;
+    const readUrl = value => android ? value?.url : value?.platforms?.[target]?.url;
+    const expectedUrl = readUrl(manifests[name]);
+    if (typeof expectedUrl !== 'string' || !expectedUrl.startsWith(versionUrl)) continue;
+    const active = await readRemoteJson(name, temp, remote);
+    if ((android ? active?.versionName : active?.version) === version && readUrl(active) === expectedUrl) return true;
+  }
+  return false;
+}
+
+async function publishNotesOnly(version, remote) {
+  versionParts(version);
+  const temp = await mkdtemp(join(tmpdir(), 'private-base-notes-'));
+  try {
+    const snapshot = await readRemoteJson(`${version}/release.json`, temp, remote);
+    const latest = snapshot?.manifests?.['latest.json'];
+    if (snapshot?.version !== version || latest?.version !== version || latest.product !== 'Private Base') {
+      throw new Error('Expected an immutable stable release snapshot for this version.');
+    }
+    validateDownloadManifest(latest);
+    if (!await hasPublishedReference(latest, snapshot.manifests, temp, remote)) {
+      throw new Error('No published stable manifest references this release.');
+    }
+    const previous = await readNotesEntries(temp, remote);
+    if (previous.some(entry => entry.version === version)) return false;
+    const noteArchive = Object.hasOwn(snapshot.manifests, 'notes.json')
+      ? parseNotesForVersion(snapshot.manifests['notes.json'], version)
+      : notesArchiveFor(latest, await readFile(join(ROOT, 'release-notes', `${version}.md`), 'utf8'));
+    const output = join(temp, 'merged-notes.json');
+    await writeMergedNotes(output, previous, noteArchive);
+    await uploadDiscovery('notes.json', output, remote);
+    return true;
+  } finally { await rm(temp, { recursive: true, force: true }); }
+}
+
+export async function main(argv, remote = wrangler) {
   const args = parseArgs(argv);
   if (args.help) {
     console.log(`Usage: node scripts/release.mjs --version X.Y.Z --channel stable|beta --rollout 0..100 [artifacts] [--publish]
+       node scripts/release.mjs --publish-notes-only --version X.Y.Z
 Artifacts (all files in each supplied group are required):
   --macos-aarch64-dmg FILE --macos-aarch64-update FILE.app.tar.gz --macos-aarch64-sig FILE.sig
   --macos-x86_64-dmg FILE --macos-x86_64-update FILE.app.tar.gz --macos-x86_64-sig FILE.sig
@@ -238,19 +370,31 @@ Artifacts (all files in each supplied group are required):
   --android FILE.apk [--android-min-sdk 24] [--android-arch arm64]
 Policy: --minimum X.Y.Z --block X.Y.Z (repeatable) --notes-file FILE --pub-date ISO_DATE
 Download-page metadata: --macos-signing TEXT --android-signing TEXT --windows-signing TEXT
-  --macos-min-os TEXT --windows-min-os TEXT
+  --macos-min-os TEXT --android-min-os TEXT --windows-min-os TEXT
 Output: --out DIRECTORY (default dist/release/VERSION/CHANNEL)
 Default: local generation only; no network requests. --publish uploads via the repo's Wrangler.
-Never publish the same version twice. Publish from one release operator at a time.`);
+Stable publication requires --notes-file release-notes/VERSION.md.
+Use --publish-notes-only to recover missing notes for a published stable version.
+Publish from one release operator at a time.`);
+    return;
+  }
+  if (args.notesOnly) {
+    const { version, notesOnly, block, publish, ...other } = args;
+    if (publish || block.length || Object.keys(other).length) {
+      throw new Error('--publish-notes-only accepts only --version.');
+    }
+    const uploaded = await publishNotesOnly(version, remote);
+    console.log(uploaded ? `Published release notes for ${version}.` : `Release notes for ${version} are already published.`);
     return;
   }
   const options = validateOptions({
     version: args.version, channel: args.channel, rollout: Number(args.rollout), minimum: args.minimum,
     blocked: args.block, pubDate: args['pub-date'], minSdk: args['android-min-sdk'] === undefined ? 24 : Number(args['android-min-sdk']),
-    androidArch: args['android-arch'], macMinOs: args['macos-min-os'], macSigning: args['macos-signing'],
+    androidArch: args['android-arch'], androidMinOs: args['android-min-os'], macMinOs: args['macos-min-os'], macSigning: args['macos-signing'],
     androidSigning: args['android-signing'], windowsMinOs: args['windows-min-os'], windowsSigning: args['windows-signing'],
   });
-  options.notes = args['notes-file'] ? await readFile(resolve(args['notes-file']), 'utf8') : '';
+  if (args.publish && options.channel === 'stable' && !args['notes-file']) throw new Error('Stable publication requires --notes-file.');
+  if (args['notes-file']) options.notesMarkdown = await readFile(resolve(args['notes-file']), 'utf8');
   const artifacts = await collectArtifacts(args);
   const manifests = generateManifests(options, artifacts);
   const out = resolve(args.out ?? join(ROOT, 'dist/release', options.version, options.channel));
@@ -262,7 +406,7 @@ Never publish the same version twice. Publish from one release operator at a tim
   console.log(`Generated ${Object.keys(manifests).length} manifests in ${out}.`);
   for (const artifact of artifacts) console.log(`${artifact.file}: ${artifact.size} bytes, sha256 ${artifact.sha256}`);
   if (args.publish) {
-    await publishRelease({ version: options.version, artifacts, manifests, out });
+    await publishRelease({ version: options.version, artifacts, manifests, out }, remote);
     console.log(`Published ${options.version} to ${options.channel}.`);
   } else console.log('Dry run: nothing uploaded. Review the manifests before using --publish.');
 }

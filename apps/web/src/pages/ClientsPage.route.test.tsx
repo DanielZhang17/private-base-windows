@@ -20,8 +20,12 @@ const keyState = vi.hoisted(() => {
 vi.mock("../lib/key-manager.js", () => ({
   keysLoaded: () => keyState.loaded,
   hasLocalKeyMaterial: async () => keyState.hasKeys,
+  getLocalKeyOwner: async () => null,
   lockLocalCryptoState: vi.fn(() => { keyState.loaded = false; }),
   onKeysLocked: () => () => {},
+}));
+vi.mock("../db/index.js", async original => ({
+  ...await original<typeof import("../db/index.js")>(), readPendingSetupRecord: async () => undefined,
 }));
 vi.mock("../pages/LoginPage.js", () => ({ default: () => <div>Login</div> }));
 vi.mock("../pages/RegisterPage.js", () => ({ default: () => null }));
@@ -94,25 +98,35 @@ it.each(cases)("/clients is public when %s: no redirect to /login or /unlock", a
   expect(container.textContent).not.toContain("Unlock");
 });
 
-it.each(["/clients", "/clients/"])("%s never checks, downloads or renders update UI in a capable native shell", async path => {
+it.each(cases)("/clients/releases is public when %s", async (_label, auth, loaded, hasKeys) => {
+  await visit("/clients/releases", auth, loaded, hasKeys);
+  expect(pathname).toBe("/clients/releases");
+  expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe("Release notes");
+});
+
+it.each([
+  ["/clients", "Download"], ["/clients/", "Download"], ["/clients/releases", "Release notes"],
+  ["/clients/releases/", "Release notes"], ["/Clients/Releases//", "Release notes"], ["/clients/%72eleases", "Release notes"],
+])("%s never checks, downloads or renders update UI in a capable native shell", async (path, label) => {
   vi.spyOn(capabilities, "autoUpdate", "get").mockReturnValue("desktop");
   vi.mocked(updates.check).mockResolvedValue({ available: true, version: "0.1.1", mandatory: true });
   vi.useFakeTimers();
   await visit(path, { accessToken: null, device: null, user: null }, false, true);
+  expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe(label);
   await act(async () => { await vi.advanceTimersByTimeAsync(UPDATE_INTERVAL); });
   expect(updates.check).not.toHaveBeenCalled(); expect(updates.download).not.toHaveBeenCalled();
   expect(updates.getVersion).not.toHaveBeenCalled();
   expect(document.body.textContent).not.toContain("Update required");
   expect(container.querySelector('[aria-label="App update"]')).toBeNull();
 });
-it("stops the updater timer when navigating in-app to /clients", async () => {
+it.each(["/clients", "/clients/releases"])("stops the updater timer when navigating in-app to %s", async path => {
   vi.spyOn(capabilities, "autoUpdate", "get").mockReturnValue("desktop");
   vi.useFakeTimers();
   await visit("/login", { accessToken: null, device: null, user: null }, false, true);
   expect(updates.check).toHaveBeenCalledOnce();
-  await act(async () => navigate("/clients"));
+  await act(async () => navigate(path));
   await act(async () => { await vi.advanceTimersByTimeAsync(UPDATE_INTERVAL); });
-  expect(pathname).toBe("/clients");
+  expect(pathname).toBe(path);
   expect(updates.check).toHaveBeenCalledOnce(); expect(updates.download).not.toHaveBeenCalled();
   expect(container.querySelector('[aria-label="App update"]')).toBeNull();
 });

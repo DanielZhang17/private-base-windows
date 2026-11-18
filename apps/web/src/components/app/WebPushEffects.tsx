@@ -10,7 +10,7 @@ import { isSameSession } from "../../services/session-identity.js";
 import { keysLoaded } from "../../lib/key-manager.js";
 
 function validDestination(value: unknown): value is string {
-  return typeof value === "string" && (value === "/?push=message" ||
+  return typeof value === "string" && (value === "/?push=message" || value === "/devices" || value === "/settings?section=privacy" ||
     /^\/(chat|call)\/[A-Za-z0-9_-]{1,128}$/.test(value) ||
     /^\/call\/[A-Za-z0-9_-]{1,128}\?push=call$/.test(value));
 }
@@ -51,17 +51,21 @@ export default function WebPushEffects({ unlocked }: { unlocked: boolean }) {
     if (!("serviceWorker" in navigator)) return;
     const worker = navigator.serviceWorker;
     const open = (event: MessageEvent) => {
-      if (!live.current || !keysLoaded() || !useAuthStore.getState().accessToken ||
-          event.data?.type !== "push-open" || !validDestination(event.data.destination)) return;
+      if (!useAuthStore.getState().accessToken || event.data?.type !== "push-open" ||
+          !validDestination(event.data.destination)) return;
+      const destination = event.data.destination;
+      // These generic routes carry no account data. The route guard preserves the
+      // destination in the unlock route's state and opens it only after unlocking.
+      if (destination !== "/devices" && destination !== "/settings?section=privacy" && (!live.current || !keysLoaded())) return;
       requestEpoch.current++;
-      if (event.data.destination === "/?push=message") resolveMessage();
-      else navigate(event.data.destination);
+      if (destination === "/?push=message") resolveMessage();
+      else navigate(destination);
     };
     worker.addEventListener("message", open);
     return () => worker.removeEventListener("message", open);
   }, [navigate, resolveMessage]);
   useEffect(() => {
-    void storePushLocale(locale, t("webPush.newMessage"), t("webPush.incomingCall")).catch(() => undefined);
+    void storePushLocale(locale, t("webPush.newMessage"), t("webPush.incomingCall"), t("deviceSignInPush"), t("deviceApprovalChangedPush")).catch(() => undefined);
   }, [locale]);
   useEffect(() => {
     // Explicit lock/sign-out clears subscriptions. Closing the tab keeps delivery enabled.

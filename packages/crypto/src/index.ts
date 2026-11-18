@@ -1,4 +1,4 @@
-export { ensureSodium, toBase64Url, fromBase64Url, constantTimeEqual, concat, randomBytes } from "./utils.js";
+export { ensureSodium, toBase64Url, fromBase64Url, constantTimeEqual, concat, randomBytes, asArrayBufferView } from "./utils.js";
 export { generateIdentityKeyPair, serializeIdentityKeyPair, deserializeIdentityKeyPair, sign, verify } from "./identity.js";
 export type { IdentityKeyPair, SerializedIdentityKeyPair } from "./identity.js";
 export { generateX25519KeyPair, generateSignedPreKey, generateOneTimePreKeys, serializeSignedPreKey, serializeOneTimePreKeys } from "./prekeys.js";
@@ -15,6 +15,9 @@ export {
 export type { RatchetSession, SerializedRatchetSession, EncryptResult } from "./double-ratchet.js";
 export { generateSenderKey, createDistribution, fromDistribution, senderKeyEncrypt, senderKeyDecrypt } from "./sender-keys.js";
 export type { SenderKeyState, SenderKeyDistribution, SenderKeyEncryptResult } from "./sender-keys.js";
+export { encryptMessageEdit, decryptMessageEdit, messageEditAAD } from "./message-edits.js";
+export type { SealedEditKey, EditKeyToSeal, EditKeyToOpen } from "./message-edits.js";
 export { generateFileKey, encryptFile, decryptFile } from "./file-crypto.js";
 export type { FileEncryptionKey } from "./file-crypto.js";
 export { generateSafetyNumber, formatSafetyNumber } from "./safety-number.js";
+export { deriveHistoryTransferKeys } from "./history-transfer.js";

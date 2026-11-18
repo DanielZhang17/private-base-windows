@@ -74,6 +74,14 @@ export function concat(...arrays: Uint8Array[]): Uint8Array {
   return result;
 }
 
+/** Preserve the byte range and copy shared-backed bytes for Web Crypto. */
+export function asArrayBufferView(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  if (bytes.buffer instanceof ArrayBuffer) {
+    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+  return new Uint8Array(bytes);
+}
+
 export function randomBytes(length: number): Uint8Array {
   const bytes = new Uint8Array(length);
   crypto.getRandomValues(bytes);

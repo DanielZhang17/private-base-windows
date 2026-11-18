@@ -1,9 +1,12 @@
-import { supportsPasskeyHandoff } from "./passkeyHandoff.js";
+import type { BiometricUnlock } from "./biometric-unlock.js";
+import { supportsPasskeyHandoff, supportsPasskeyProvisionHandoff } from "./passkeyHandoff.js";
 import { isNative, platformName } from "./environment.js";
 import { supportsE2EECalling } from "./calls.js";
+import { historyTransferEnabled } from "../features/transfer/flag.js";
 
 // Getters keep feature detection current, including after browser API initialization.
 export const capabilities = {
+  historyTransfer: historyTransferEnabled,
   get autoUpdate(): "desktop" | "android" | undefined {
     if (!isNative()) return undefined;
     const value = window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.autoUpdate;
@@ -40,6 +43,15 @@ export const capabilities = {
       typeof window.PublicKeyCredential !== "undefined" &&
       typeof navigator.credentials?.create === "function" &&
       typeof navigator.credentials?.get === "function";
+  },
+  get biometricUnlock(): BiometricUnlock | undefined {
+    if (!isNative()) return undefined;
+    const value = window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.biometricUnlock;
+    return value === "touchid" || value === "faceid" || value === "windows-hello" || value === "android-biometric"
+      ? value : undefined;
+  },
+  get nativePasskeyProvisioning(): boolean {
+    return supportsPasskeyProvisionHandoff();
   },
   get nativePasskeys(): boolean {
     return supportsPasskeyHandoff();

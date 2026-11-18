@@ -1,9 +1,11 @@
 import { z } from "zod";
+import { MAX_LATEST_EDIT_IDS } from "./types/messages.js";
 import {
   MAX_CUSTOM_EMOJIS_PER_USER,
   MAX_CUSTOM_EMOJI_SIZE,
   MAX_TIMED_MESSAGE_TTL_SECONDS,
   MIN_TIMED_MESSAGE_TTL_SECONDS,
+  OTP_KEY_POOL_SIZE,
 } from "./constants.js";
 
 export const ALLOWED_MIME_TYPES = [
@@ -95,7 +97,13 @@ export const createConversationSchema = z.object({
 export const updatePrivacySchema = z.object({
   discoverable: z.boolean().optional(),
   groupInvites: z.enum(["everyone", "contacts", "nobody"]).optional(),
-}).strict().refine(data => data.discoverable !== undefined || data.groupInvites !== undefined, {
+  requireDeviceApproval: z.boolean().optional(),
+  newDeviceApproval: z.boolean().optional(),
+  approvalProof: z.object({ challengeId: z.string().min(1).max(128), signature: base64url.length(86) }).strict().optional(),
+}).strict().refine(({ approvalProof, ...data }) => Object.values(data).some(value => value !== undefined) &&
+  (data.requireDeviceApproval === undefined || data.newDeviceApproval === undefined ||
+    data.requireDeviceApproval === data.newDeviceApproval) &&
+  (!approvalProof || (data.requireDeviceApproval ?? data.newDeviceApproval) === false), {
   message: "At least one field required",
 });
 
@@ -201,6 +209,23 @@ export const sendDirectBatchSchema = z.object({
   }
 });
 
+export const messageEditSchema = z.object({
+  messageId: familyMessageId,
+  conversationId: z.string().min(1),
+  editSeq: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  ciphertext: base64url,
+  nonce: base64url.length(16),
+  signature: base64url.length(86),
+});
+
+export const latestMessageEditsSchema = z.object({
+  ids: z.array(familyMessageId).min(1).max(MAX_LATEST_EDIT_IDS),
+  after: z.record(familyMessageId, z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)).optional(),
+  confirm: z.boolean().optional(),
+}).refine(({ ids, after }) => !after || Object.keys(after).every((id) => ids.includes(id)), {
+  path: ["after"], message: "Sequences must belong to requested message IDs",
+});
+
 export const requestUploadUrlSchema = z.object({
   conversationId: z.string(),
   mimeType: z.enum(ALLOWED_MIME_TYPES),
@@ -259,6 +284,7 @@ const webauthnCredential = z.object({
 });
 
 export const passkeyRegisterSchema = z.object({
+  deviceSignature: base64url.length(86),
   challengeId: z.string().min(1),
   credential: webauthnCredential,
   friendlyName: z.string().min(1).max(64),
@@ -269,24 +295,68 @@ const passkeyHandoffSchema = z.object({ codeChallenge: passkeyCodeChallengeSchem
 
 export const passkeyLoginOptionsSchema = z.union([
   z.object({ handoff: passkeyHandoffSchema }),
-  z.object({ username: z.string(), deviceId: z.string().trim().min(1) }),
+  z.object({ username: z.string().optional(), deviceId: z.string().trim().min(1) }),
 ]);
 
 export const passkeyLoginSchema = z.union([
   z.object({ challengeId: z.string().min(1), credential: webauthnCredential, handoff: passkeyHandoffSchema }),
-  z.object({ challengeId: z.string().min(1), credential: webauthnCredential, username: z.string(), deviceId: z.string().trim().min(1) }),
+  z.object({ challengeId: z.string().min(1), credential: webauthnCredential, username: z.string().optional(), deviceId: z.string().trim().min(1) }),
 ]);
 
-export const passkeyHandoffRedeemSchema = z.object({
-  code: passkeyCodeChallengeSchema,
-  codeVerifier: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
-  deviceId: z.string().trim().min(1),
+export const passkeyProvisionBundleSchema = publicPreKeyBundleSchema.extend({
+  identityKey: base64url.length(43),
+  signedPreKey: base64url.length(43),
+  signedPreKeyId: z.number().int().min(0).max(0xffffffff),
+  signedPreKeySig: base64url.length(86),
+  oneTimePreKeys: z.array(z.object({
+    id: z.number().int().min(0).max(0xffffffff),
+    key: base64url.length(43),
+  }).strict()).min(1).max(OTP_KEY_POOL_SIZE),
+  platform: z.enum(["web", "macos", "windows", "android", "ios"]),
+  bundleSignature: base64url.length(86),
+}).strict().refine(bundle => new Set(bundle.oneTimePreKeys.map(key => key.id)).size === bundle.oneTimePreKeys.length, {
+  message: "Duplicate one-time pre-key IDs",
 });
+
+export const passkeyProvisionOptionsSchema = z.object({
+  bundleHash: passkeyCodeChallengeSchema,
+  handoff: passkeyHandoffSchema.optional(),
+}).strict();
+
+const provisionAssertion = z.object({
+  challengeId: z.string().min(1).max(128),
+  credential: webauthnCredential,
+});
+export const passkeyProvisionSchema = z.union([
+  provisionAssertion.extend({ setupId: z.string().uuid(), bundle: passkeyProvisionBundleSchema }).strict(),
+  provisionAssertion.extend({ bundleHash: passkeyCodeChallengeSchema, handoff: passkeyHandoffSchema }).strict(),
+]);
+
+const redeemSecrets = z.object({ code: passkeyCodeChallengeSchema, codeVerifier: passkeyCodeChallengeSchema });
+export const passkeyHandoffRedeemSchema = z.union([
+  redeemSecrets.extend({ deviceId: z.string().trim().min(1) }).strict(),
+  redeemSecrets.extend({ setupId: z.string().uuid(), bundle: passkeyProvisionBundleSchema }).strict(),
+]);
 export const passkeyHandoffStartSchema = z.object({ codeChallenge: passkeyCodeChallengeSchema });
 export const passkeyTicketSchema = z.object({ ticket: passkeyCodeChallengeSchema });
-export const passkeyTicketRegisterSchema = passkeyRegisterSchema.omit({ friendlyName: true }).extend({ ticket: passkeyCodeChallengeSchema });
+export const passkeyTicketRegisterSchema = passkeyRegisterSchema.omit({ friendlyName: true, deviceSignature: true }).extend({ ticket: passkeyCodeChallengeSchema });
 export const passkeyHandoffCompleteSchema = z.object({
+  deviceSignature: base64url.length(86),
   pendingId: z.string().min(1),
   codeVerifier: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   friendlyName: z.string().trim().min(1).max(64).default("Private Base"),
 });
+
+export const passkeySetupSchema = z.object({ setupId: z.string().uuid() }).strict();
+export const deviceActionProofSchema = z.object({
+  challengeId: z.string().min(1).max(128),
+  signature: base64url.length(86),
+}).strict();
+export const passkeySetupProofSchema = passkeySetupSchema.extend(deviceActionProofSchema.shape).strict();
+export const passkeyReplaceSchema = passkeySetupSchema.extend({
+  limitTicket: z.string().max(2048),
+  revokeDeviceId: z.string().min(1).max(128).nullable(),
+  recoveryKeyProof: recoveryKey.optional(),
+  bundle: passkeyProvisionBundleSchema,
+}).strict().refine(data => data.revokeDeviceId === null || !!data.recoveryKeyProof);
+export const verifyAccountPasswordSchema = z.object({ password: z.string().min(1).max(128) }).strict();

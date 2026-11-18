@@ -1,13 +1,6 @@
-/**
- * HKDF using Web Crypto API (works in both browser and Cloudflare Workers).
- */
-function asArrayBufferView(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
-  if (bytes.buffer instanceof ArrayBuffer) {
-    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  }
-  return new Uint8Array(bytes);
-}
+import { asArrayBufferView } from "./utils.js";
 
+/** HKDF using Web Crypto API (works in both browser and Cloudflare Workers). */
 export async function hkdf(
   ikm: Uint8Array,
   salt: Uint8Array,

@@ -3,6 +3,7 @@ import { hkdf, hmacSha256 } from "./hkdf.js";
 import * as aesGcm from "./aes-gcm.js";
 import type { RatchetHeader } from "@e2ee-chat/shared";
 import { MAX_SKIPPED_KEYS } from "@e2ee-chat/shared";
+import { openEditKey, sealEditKey, type EditKeyToOpen, type EditKeyToSeal, type SealedEditKey } from "./message-edits.js";
 
 const RATCHET_INFO = new TextEncoder().encode("RatchetRK");
 const CHAIN_KEY_SEED_MSG = new Uint8Array([0x01]);
@@ -186,6 +187,7 @@ export interface EncryptResult {
   header: RatchetHeader;
   ciphertext: Uint8Array;
   iv: Uint8Array;
+  sealedEditKey?: SealedEditKey;
 }
 
 /**
@@ -202,6 +204,7 @@ function canonicalHeaderAAD(header: RatchetHeader): Uint8Array {
 export async function ratchetEncrypt(
   session: RatchetSession,
   plaintext: Uint8Array,
+  editKey?: EditKeyToSeal,
 ): Promise<EncryptResult> {
   if (!session.sendingChainKey) {
     throw new Error("Session not ready to send");
@@ -221,7 +224,7 @@ export async function ratchetEncrypt(
   const headerBytes = canonicalHeaderAAD(header);
   const ciphertext = await aesGcm.encrypt(messageKey, iv, plaintext, headerBytes);
 
-  return { header, ciphertext, iv };
+  return { header, ciphertext, iv, ...(editKey && { sealedEditKey: await sealEditKey(messageKey, iv, ciphertext, editKey) }) };
 }
 
 export async function ratchetDecrypt(
@@ -229,6 +232,7 @@ export async function ratchetDecrypt(
   header: RatchetHeader,
   ciphertext: Uint8Array,
   iv: Uint8Array,
+  editKey?: EditKeyToOpen,
 ): Promise<Uint8Array> {
   const remotePublicKey = fromBase64Url(header.dhPublicKey);
   const headerBytes = canonicalHeaderAAD(header);
@@ -238,7 +242,9 @@ export async function ratchetDecrypt(
   const skippedKey = session.skippedKeys.get(skId);
   if (skippedKey) {
     session.skippedKeys.delete(skId);
-    return aesGcm.decrypt(skippedKey, iv, ciphertext, headerBytes);
+    const plaintext = await aesGcm.decrypt(skippedKey, iv, ciphertext, headerBytes);
+    if (editKey) await openEditKey(skippedKey, iv, ciphertext, editKey);
+    return plaintext;
   }
 
   // Check if we need a DH ratchet step
@@ -263,5 +269,7 @@ export async function ratchetDecrypt(
   session.receivingChainKey = nextChainKey;
   session.recvMessageNumber++;
 
-  return aesGcm.decrypt(messageKey, iv, ciphertext, headerBytes);
+  const plaintext = await aesGcm.decrypt(messageKey, iv, ciphertext, headerBytes);
+  if (editKey) await openEditKey(messageKey, iv, ciphertext, editKey);
+  return plaintext;
 }

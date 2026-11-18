@@ -1,15 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchReleaseManifest, type ReleaseManifest } from "./manifest.js";
 
-export type ManifestState =
+type ManifestState<T> =
   | { status: "loading" }
-  | { status: "ready"; manifest: ReleaseManifest }
+  | { status: "ready"; data: T }
   /** retrying: "Try again" was pressed; the error stays on screen with a busy button. */
   | { status: "error"; retrying: boolean };
 
-/** Loads latest.json on mount. Network, timeout, HTTP and validation failures all become "error". */
-export function useReleaseManifest(load: typeof fetchReleaseManifest = fetchReleaseManifest) {
-  const [state, setState] = useState<ManifestState>({ status: "loading" });
+/** Loads public release metadata on mount. Fetch and validation failures all become "error". */
+export function useReleaseManifest<T>(load: (signal: AbortSignal) => Promise<T>) {
+  const [state, setState] = useState<ManifestState<T>>({ status: "loading" });
   const controller = useRef<AbortController | null>(null);
 
   const run = useCallback(() => {
@@ -17,7 +16,7 @@ export function useReleaseManifest(load: typeof fetchReleaseManifest = fetchRele
     const current = new AbortController();
     controller.current = current;
     load(current.signal).then(
-      (manifest) => { if (controller.current === current) setState({ status: "ready", manifest }); },
+      (data) => { if (controller.current === current) setState({ status: "ready", data }); },
       () => { if (controller.current === current) setState({ status: "error", retrying: false }); },
     );
   }, [load]);

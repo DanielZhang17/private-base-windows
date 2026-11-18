@@ -5,9 +5,10 @@ import type { CallEventPayload, Device, User } from "@e2ee-chat/shared";
 import UnlockedAppEffects from "./UnlockedAppEffects.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { createNotificationWebSocket } from "../../services/notifications.js";
-import { handleMessageDeletion, resetMessageSyncState, runUnlockSync, syncMessages } from "../../lib/message-sync.js";
+import { handleMessageDeletion, reconcileConversationEdits, resetMessageSyncState, runUnlockSync, syncMessages } from "../../lib/message-sync.js";
 import { requestNotificationPermission } from "../../lib/browser-notifications.js";
 import { api } from "../../services/api.js";
+import { refreshConversationList } from "../../lib/conversation-cache.js";
 import { commitAbandonedMessageHides, getAppDB, deletePendingCall, getPendingCall } from "../../db/index.js";
 import { useCallStore } from "../../stores/callStore.js";
 import { clearRegisteredLocalCallState } from "../../platform/session-cleanup.js";
@@ -19,7 +20,7 @@ vi.mock("../../stores/authStore.js", async () => {
 vi.mock("../../services/notifications.js", () => ({ createNotificationWebSocket: vi.fn() }));
 vi.mock("../../services/api.js", () => ({ api: { get: vi.fn() } }));
 vi.mock("../../db/index.js", () => ({ commitAbandonedMessageHides: vi.fn(), getAppDB: vi.fn(async () => ({})), cleanupExpiredFileCache: vi.fn(), cleanupExpiredPendingCalls: vi.fn(), deletePendingCall: vi.fn(), getPendingCall: vi.fn() }));
-vi.mock("../../lib/message-sync.js", () => ({ startLocalHiddenMessageSync: vi.fn(() => vi.fn()), handleMessageDeletion: vi.fn(), pruneExpiredPlaintext: vi.fn(), resetMessageSyncState: vi.fn(), syncMessages: vi.fn(), runUnlockSync: vi.fn() }));
+vi.mock("../../lib/message-sync.js", () => ({ startLocalHiddenMessageSync: vi.fn(() => vi.fn()), handleMessageDeletion: vi.fn(), pruneExpiredPlaintext: vi.fn(), reconcileConversationEdits: vi.fn(), resetMessageSyncState: vi.fn(), syncMessages: vi.fn(), runUnlockSync: vi.fn() }));
 vi.mock("../../lib/conversation-cache.js", () => ({ refreshConversationList: vi.fn() }));
 vi.mock("../../lib/browser-notifications.js", () => ({ requestNotificationPermission: vi.fn() }));
 
@@ -31,6 +32,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(getAppDB).mockResolvedValue({} as Awaited<ReturnType<typeof getAppDB>>);
   vi.mocked(syncMessages).mockResolvedValue(undefined);
+  vi.mocked(reconcileConversationEdits).mockResolvedValue(undefined);
+  vi.mocked(refreshConversationList).mockResolvedValue([]);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.useFakeTimers();
   vi.mocked(handleMessageDeletion).mockResolvedValue(undefined);
@@ -56,6 +59,11 @@ afterEach(async () => {
 const incoming: CallEventPayload = { event: "incoming", callId: "call-1", conversationId: "chat-1", callType: "audio", status: "ringing", fromUserId: "alice", initiatorId: "alice" };
 const conversation = { id: "chat-1", members: [{ userId: "alice", user: { displayName: "Alice" } }] };
 const emit = (payload: CallEventPayload) => vi.mocked(createNotificationWebSocket).mock.calls.at(-1)![0].onCallEvent(payload);
+it("reconciles cached edits when a conversation membership notification arrives", async () => {
+  await act(async () => root.render(<UnlockedAppEffects />));
+  await act(async () => vi.mocked(createNotificationWebSocket).mock.calls.at(-1)![0].onConversationEvent({ conversationId: "rejoined" }));
+  expect(reconcileConversationEdits).toHaveBeenCalledExactlyOnceWith("rejoined", true);
+});
 it.each(["ringing", "active", "starting"])("retains existing busy-call checks when %s", async (state) => {
   await act(async () => root.render(<UnlockedAppEffects />));
   if (state === "starting") useCallStore.getState().beginCallStart();
@@ -81,6 +89,16 @@ it("resolves the app-known caller name and marks only the current secure invite 
   await act(async () => root.render(<UnlockedAppEffects />));
   await act(async () => emit(incoming));
   expect(useCallStore.getState()).toMatchObject({ activeCallId: "call-1", callerName: "Alice", keyReady: true });
+});
+
+it("presents an already cached secure invite without waiting for the active message sync", async () => {
+  vi.mocked(api.get).mockResolvedValue(conversation);
+  vi.mocked(getPendingCall).mockResolvedValue({ expiresAt: Date.now() + 60_000 } as Awaited<ReturnType<typeof getPendingCall>>);
+  vi.mocked(syncMessages).mockReturnValue(new Promise(() => {}));
+  await act(async () => root.render(<UnlockedAppEffects />));
+  await act(async () => emit(incoming));
+  expect(useCallStore.getState()).toMatchObject({ activeCallId: "call-1", keyReady: true });
+  expect(syncMessages).not.toHaveBeenCalled();
 });
 
 it("keeps sync, sockets and timers alive across token and profile updates", async () => {

@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { expect, it, vi } from "vitest";
+import { getContrastRatio } from "../lib/ui-preferences.js";
 
 const { readFileSync } = await vi.importActual<{
   readFileSync: (url: URL, encoding: "utf8") => string;
@@ -10,6 +11,31 @@ const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
 // directly so colour tokens cannot overwrite DaisyUI's dimension/number tokens.
 const themeBlocks = Array.from(css.matchAll(/@plugin "daisyui\/theme"\s*\{([^}]+)\}/g), ([, block]) => block);
 const rawTokens = css.replace(/@plugin "daisyui\/theme"\s*\{[^}]+\}/g, "");
+
+it("keeps the composer placeholder at AA contrast on the sunken pill in every palette", () => {
+  const field = css.match(/\.sticker-composer-field\s*\{([^}]+)\}/)?.[1];
+  const placeholder = css.match(/\.sticker-composer-field\s*>\s*textarea::placeholder\s*\{([^}]+)\}/)?.[1];
+  expect(field).toMatch(/border-radius:\s*22px/);
+  expect(field).toMatch(/background-color:\s*var\(--surface-sunken\)/);
+  expect(placeholder).toMatch(/color:\s*var\(--text-muted\)/);
+  expect(placeholder).toMatch(/opacity:\s*1\b/);
+
+  const sunken = Array.from(rawTokens.matchAll(/--surface-sunken:\s*(#[0-9a-f]{6})/gi), ([, color]) => color);
+  const muted = Array.from(rawTokens.matchAll(/--text-muted:\s*(#[0-9a-f]{6})/gi), ([, color]) => color);
+  expect(sunken).toHaveLength(3);
+  expect(muted).toHaveLength(sunken.length);
+  for (const [index, background] of sunken.entries()) {
+    expect(getContrastRatio(muted[index], background)).toBeGreaterThanOrEqual(4.5);
+  }
+});
+
+it("scopes sticker hover fills to fine pointers and scales only the pressed artwork", () => {
+  const hover = css.match(/@media \(hover: hover\) and \(pointer: fine\)\s*\{\s*(\.sticker-strip[^{}]+,\s*\.sticker-tile:hover)\s*\{([^}]+)\}/);
+  expect(hover?.[1]).toContain(':not([aria-selected="true"]):hover');
+  expect(hover?.[2]).toMatch(/background:\s*var\(--surface-sunken\)/);
+  expect(css.match(/\.sticker-tile:hover/g)).toHaveLength(1);
+  expect(css).toMatch(/\.sticker-tile\[data-pressed\]\s*>\s*\.sticker-art\s*\{\s*transform:\s*scale\(/);
+});
 
 it("uses a background edge cue for overflowing bubble actions without reserving scrollbar width", () => {
   const strip = css.match(/\.call-bubble-actions\s*\{([^}]+)\}/)?.[1] ?? "";

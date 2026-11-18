@@ -25,16 +25,18 @@ export interface BadgeProps {
   tone?: BadgeTone;
   variant?: "soft" | "solid";
   icon?: IconName;
+  wrap?: boolean;
   className?: string;
   children: ReactNode;
 }
 
 /** Short status label. State is always carried by the text (and icon), never by colour alone. */
-export function Badge({ tone = "neutral", variant = "soft", icon, className, children }: BadgeProps) {
+export function Badge({ tone = "neutral", variant = "soft", icon, wrap = false, className, children }: BadgeProps) {
   return (
     <span
       className={cx(
-        "inline-flex h-6 items-center gap-1 rounded-full px-2 text-[0.75rem] font-semibold whitespace-nowrap",
+        "inline-flex items-center gap-1 rounded-full px-2 text-[0.75rem] font-semibold",
+        wrap ? "min-h-6 whitespace-normal [overflow-wrap:anywhere]" : "h-6 whitespace-nowrap",
         variant === "soft" ? SOFT[tone] : SOLID[tone],
         className,
       )}

@@ -1,3 +1,8 @@
+import { useState } from "react";
+import { useHistoryTransfer } from "../features/transfer/useHistoryTransfer.js";
+import { DeviceApproval } from "../features/settings/DeviceApproval.js";
+import { NewDeviceAlerts } from "../features/devices/NewDeviceAlert.js";
+import { UnlockSettings, useUnlockSettings } from "../features/settings/UnlockSettings.js";
 import { AboutUpdates } from "../features/updates/AboutUpdates.js";
 import { localized, type LocalizedMessage } from "../i18n/messages.js";
 import { LOCALES, type LocalePreference } from "../i18n/index.js";
@@ -32,8 +37,15 @@ function ColorField({ label, value, normalized, error, onChange }: { label: stri
 }
 
 function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
+  const vault = useUnlockSettings(s.section === "security");
+  const [addPassword, setAddPassword] = useState(false);
+  const [guardPasskey, setGuardPasskey] = useState(false);
+  const [removingUnlockPasskey, setRemovingUnlockPasskey] = useState(false);
   const locale = useLocale();
   const toast = useToast();
+  const transfer = useHistoryTransfer();
+  const [confirmTransferLock, setConfirmTransferLock] = useState(false);
+  const transferActive = ["transferring", "paused", "reconnecting"].includes(transfer.phase);
   function success(message: LocalizedMessage) { toast.show({ tone: "success", message }); }
   async function copyUsername() { try { await s.copyUsername(); success(localized("usernameCopied")); } catch { toast.show({ tone: "danger", message: localized("couldNotCopyUsername") }); } }
   const title = t(SETTINGS_SECTIONS.find(([key]) => key === s.section)?.[1] ?? "settings");
@@ -142,6 +154,8 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
         </label>}
 
         {s.section === "privacy" && <>
+          <NewDeviceAlerts placement="privacy" filter={alert => alert.kind === "approval_disabled"} />
+          <DeviceApproval privacy={s.privacy} />
           {s.privacy.loading && <Spinner label={t("loadingStatus")} />}
           {s.privacy.error && <Notice tone="danger">{s.privacy.error}
             <Button variant="ghost" onClick={s.privacy.retry}>{t("retry")}</Button>
@@ -268,11 +282,8 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
 
         {s.section === "security" && <>
 
-          <section className="space-y-3">
-            <h2 className="text-sm font-semibold">{t("deviceSecurity")}</h2>
-            <p className="text-sm text-ink-muted">{t("yourPrivateKeysStayEncryptedOnThisDevice")}</p>
-            <Button variant="secondary" onClick={s.handleLockNow}>{t("lockNow")}</Button>
-          </section>
+          <UnlockSettings vault={vault} passkeys={s.passkeysQuery.data ?? []} onLock={() => transferActive ? setConfirmTransferLock(true) : s.handleLockNow()}
+            addPassword={addPassword} closePassword={() => { setAddPassword(false); setGuardPasskey(false); }} openPassword={() => setAddPassword(true)} />
 
           <section className="space-y-4 border-t border-line pt-6">
             <div className="flex items-center justify-between gap-3">
@@ -295,7 +306,10 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
 
           {(s.capabilities.passkeys || s.capabilities.nativePasskeys) && <section className="space-y-4 border-t border-line pt-6">
             <h2 className="font-semibold">{t("passkeys")}</h2>
-            <p className="text-sm text-ink-muted">{t("signInWithYourDeviceLockBiometricsOr")}</p>
+            <p className="text-sm text-ink-muted">{t("security.passkeySignInBody")}</p>
+            {vault.methods.includes("password") && <p className="text-sm text-ink-muted">{t("security.passwordUnlockOn")}</p>}
+            {guardPasskey && <Notice tone="warning" action={<Button variant="secondary" onClick={() => setAddPassword(true)}>
+              {t("security.addPasswordAction")}</Button>}>{t("security.removeOnlyUnlockPasskey")}</Notice>}
             {s.passkeyError && <Notice tone="danger">
               {s.passkeyError}
             </Notice>}
@@ -303,18 +317,26 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
               {translateError(s.passkeysQuery.error)}
             </Notice>}
 
-            {s.passkeysQuery.isLoading ? <Spinner label={t("loadingPasskeys")} /> : <ul role="list">
+            {s.passkeysQuery.isLoading ? <Spinner label={t("loadingPasskeys")} /> : !!s.passkeysQuery.data?.length && <ul role="list" className="divide-y divide-line rounded-card border border-line">
               {(s.passkeysQuery.data ?? []).map((passkey) => <li key={passkey.id}>
                 <ListItem
                   leading={<Icon name="passkey" />}
                   title={passkey.friendlyName}
                   subtitle={t("passkeyAddedDate", { value: formatDate(passkey.createdAt) })}
-                  trailing={<IconButton
-                    icon="trash"
-                    variant="danger-ghost"
-                    label={t("removePasskeyNamed", { friendlyName: passkey.friendlyName })}
-                    onClick={() => s.requestDeletePasskey(passkey.id, passkey.friendlyName)}
-                  />}
+                  trailing={<div className="flex items-center justify-end gap-1 sm:gap-2">
+                    {vault.passkeyId === passkey.credentialId && <Badge tone="brand" wrap className="max-w-[32vw] sm:max-w-none">{t("security.unlocksThisDevice")}</Badge>}
+                    <IconButton
+                      icon="trash"
+                      variant="danger-ghost"
+                      className="shrink-0"
+                      label={t("removePasskeyNamed", { friendlyName: passkey.friendlyName })}
+                      onClick={() => {
+                        setRemovingUnlockPasskey(vault.passkeyId === passkey.credentialId);
+                        if (vault.passkeyId === passkey.credentialId && vault.isLastUsable("passkey")) { setGuardPasskey(true); return; }
+                        s.requestDeletePasskey(passkey.id, passkey.friendlyName);
+                      }}
+                    />
+                  </div>}
                 />
               </li>)}
             </ul>}
@@ -429,23 +451,27 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
     <ConfirmDialog
       open={!!s.confirmation}
       title={s.confirmation?.kind === "passkey" ? t("removeThisPasskey") : t("deleteEmojiConfirmTitle", { name: s.confirmation?.name })}
-      description={s.confirmation?.kind === "passkey" ? t("youCanAddItAgainLater") : t("olderMessagesWillStillShowIt")}
+      description={s.confirmation?.kind === "passkey" ? t(removingUnlockPasskey ? "security.removeUnlockPasskeyExtra" : "youCanAddItAgainLater") : t("olderMessagesWillStillShowIt")}
       confirmLabel={s.confirmation?.kind === "passkey" ? t("removePasskey") : t("deleteEmoji")}
       tone="danger"
       busy={!!s.deletingPasskeyId || !!s.emojiBusyId}
       error={s.confirmation?.kind === "passkey" ? s.passkeyError : s.emojiError}
       onCancel={s.closeConfirmation}
-      onConfirm={() => { if (s.confirmation?.kind === "passkey") void s.handleDeletePasskey(s.confirmation.id).then((saved) => { if (saved) success(localized("passkeyRemoved")); }); else if (s.confirmation) void s.handleDeleteEmoji(s.confirmation.id).then((saved) => { if (saved) success(localized("emojiDeleted")); }); }}
+      onConfirm={() => { if (s.confirmation?.kind === "passkey") void s.handleDeletePasskey(s.confirmation.id).then((saved) => { if (saved) { vault.refresh(); success(localized("passkeyRemoved")); } }); else if (s.confirmation) void s.handleDeleteEmoji(s.confirmation.id).then((saved) => { if (saved) success(localized("emojiDeleted")); }); }}
     />
 
     <ConfirmDialog
       open={s.showSignOut}
       title={t("signOut2")}
-      description={t("yourKeysStayOnThisDeviceLockedWith")}
+      description={transferActive ? t("transfer.signOutStops") : t("yourKeysStayOnThisDeviceLockedWith")}
       confirmLabel={t("signOut3")}
       onCancel={() => s.setShowSignOut(false)}
-      onConfirm={s.handleLogout}
+      onConfirm={() => { if (transferActive) transfer.stop(); void s.handleLogout(); }}
     />
+
+    <ConfirmDialog open={confirmTransferLock} title={t("transfer.lockAndStopTitle")}
+      description={t("transfer.lockStops")} confirmLabel={t("transfer.lockAndStop")} cancelLabel={t("transfer.keepGoing")}
+      onCancel={() => setConfirmTransferLock(false)} onConfirm={() => { transfer.stop(); s.handleLockNow(); }} />
 
     <ConfirmDialog
       open={s.showForgetKeys}
@@ -530,8 +556,9 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
 export default function SettingsPage() {
   useLocale();
   const settings = useSettings();
+  const transfer = useHistoryTransfer();
   return <SettingsFrame
-    onSignOut={settings.handleLogout}
+    onSignOut={() => ["transferring", "paused", "reconnecting"].includes(transfer.phase) ? settings.setShowSignOut(true) : void settings.handleLogout()}
     title={t("settings")}
     section={settings.selectedSection ?? undefined}
     detailActive={!!settings.selectedSection}

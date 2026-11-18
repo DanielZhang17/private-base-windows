@@ -1,6 +1,10 @@
+import { NewDeviceAlerts } from "../features/devices/NewDeviceAlert.js";
 import { localized, type LocalizedMessage } from "../i18n/messages.js";
 import { t, useLocale } from "../i18n/index.js";
+import { translateError } from "../features/shared/errors.js";
 import { useDevices } from "../features/devices/useDevices.js";
+import { LinkedDevicesTransfer } from "../features/transfer/HistoryTransferScreens.js";
+import { capabilities } from "../platform/capabilities.js";
 import { SettingsFrame } from "../features/settings/SettingsFrame.js";
 import { RecoveryKeyDialog } from "../features/settings/RecoveryKeyDialog.js";
 import { Badge, Button, ConfirmDialog, Icon, IconButton, ListItem, Notice, Spinner, TopBar, useToast } from "../ui/index.js";
@@ -8,6 +12,7 @@ import { Badge, Button, ConfirmDialog, Icon, IconButton, ListItem, Notice, Spinn
 function DevicesView({ d }: { d: ReturnType<typeof useDevices> }) {
   useLocale();
   const toast = useToast();
+  const newDevices = new Set(d.deviceAlerts?.alerts.filter(alert => alert.kind !== "approval_disabled").map(alert => alert.deviceId));
   async function announce(action: Promise<boolean>, message: LocalizedMessage) { if (await action) toast.show({ tone: "success", message }); }
   return <>
 
@@ -23,6 +28,9 @@ function DevicesView({ d }: { d: ReturnType<typeof useDevices> }) {
         {d.error && <Notice tone="danger" action={<Button variant="secondary" onClick={d.retry}>{t("retry")}</Button>}>
           {d.error}
         </Notice>}
+
+        {d.deviceAlerts?.error && <Notice tone="danger">{translateError(d.deviceAlerts.error)}</Notice>}
+        {d.deviceAlerts && <NewDeviceAlerts placement="devices" alerts={d.deviceAlerts} />}
 
         {d.requestsLoading && <Spinner label={t("loadingDeviceRequests")} />}
 
@@ -92,7 +100,7 @@ function DevicesView({ d }: { d: ReturnType<typeof useDevices> }) {
             {d.devices.map((device) => <li key={device.id}>
               <ListItem
                 leading={<Icon name={device.icon} size={24} />}
-                title={device.deviceName}
+                title={<span className="flex flex-wrap items-center gap-2">{device.deviceName}{newDevices.has(device.id) && <Badge tone="warning">{t("devices.newBadge")}</Badge>}</span>}
                 subtitle={<span title={device.activityTitle}>{device.activity} · {device.linkedBy}</span>}
                 trailing={device.id === d.currentDeviceId ? <Badge>{t("thisDevice")}</Badge> : <IconButton
                   icon="trash"
@@ -108,7 +116,10 @@ function DevicesView({ d }: { d: ReturnType<typeof useDevices> }) {
 
         </section>
 
-        <Notice title={t("newDevicesReceiveFutureMessagesOnly")} icon="info">{t("earlierHistoryStaysOnTheDevicesThatAlready")}</Notice>
+        <Notice title={t("devices.historyNoticeTitle")} icon="info">
+          {t(capabilities.historyTransfer ? "devices.historyNoticeBody" : "earlierHistoryStaysOnTheDevicesThatAlready")}
+        </Notice>
+        {capabilities.historyTransfer && <LinkedDevicesTransfer devices={d.devices} />}
 
         <ListItem
           leading={<Icon name="key" />}

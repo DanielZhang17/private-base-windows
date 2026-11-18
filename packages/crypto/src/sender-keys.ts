@@ -2,6 +2,7 @@ import { ensureSodium, toBase64Url, fromBase64Url, randomBytes } from "./utils.j
 import { hmacSha256 } from "./hkdf.js";
 import * as aesGcm from "./aes-gcm.js";
 import type { SenderKeyHeader } from "@e2ee-chat/shared";
+import { openEditKey, sealEditKey, type EditKeyToOpen, type EditKeyToSeal, type SealedEditKey } from "./message-edits.js";
 
 const SENDER_KEY_MSG_SEED = new TextEncoder().encode("SenderKeyMK");
 const SENDER_KEY_CHAIN_SEED = new TextEncoder().encode("SenderKeyCK");
@@ -63,11 +64,13 @@ export interface SenderKeyEncryptResult {
   header: SenderKeyHeader;
   ciphertext: Uint8Array;
   iv: Uint8Array;
+  sealedEditKey?: SealedEditKey;
 }
 
 export async function senderKeyEncrypt(
   state: SenderKeyState,
   plaintext: Uint8Array,
+  editKey?: EditKeyToSeal,
 ): Promise<SenderKeyEncryptResult> {
   const sodium = await ensureSodium();
 
@@ -87,7 +90,7 @@ export async function senderKeyEncrypt(
   };
   state.chainIndex++;
 
-  return { header, ciphertext, iv };
+  return { header, ciphertext, iv, ...(editKey && { sealedEditKey: await sealEditKey(messageKey, iv, ciphertext, editKey, state.signingPrivateKey) }) };
 }
 
 export async function senderKeyDecrypt(
@@ -95,6 +98,7 @@ export async function senderKeyDecrypt(
   header: SenderKeyHeader,
   ciphertext: Uint8Array,
   iv: Uint8Array,
+  editKey?: EditKeyToOpen,
 ): Promise<Uint8Array> {
   const sodium = await ensureSodium();
 
@@ -123,5 +127,7 @@ export async function senderKeyDecrypt(
   state.chainKey = nextChainKey;
   state.chainIndex = header.chainIndex + 1;
 
-  return aesGcm.decrypt(messageKey, iv, ciphertext);
+  const plaintext = await aesGcm.decrypt(messageKey, iv, ciphertext);
+  if (editKey) await openEditKey(messageKey, iv, ciphertext, editKey, state.signingPublicKey);
+  return plaintext;
 }

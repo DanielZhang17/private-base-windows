@@ -4,9 +4,9 @@ import { t, useLocale } from "../../i18n/index.js";
 import { useState } from "react";
 import { Button, Dialog, Notice, useToast } from "../../ui/index.js";
 
-export function RecoveryKeyDialog({ recoveryKey, onContinue, onCopy, onSave, canSave }: {
+export function RecoveryKeyDialog({ recoveryKey, onContinue, onCopy, onSave, canSave, onCancel, busy, saveError }: {
   recoveryKey: string | null; onContinue: () => void; onCopy: () => Promise<void>;
-  onSave: () => Promise<void>; canSave: boolean;
+  onSave: () => Promise<void>; canSave: boolean; onCancel?: () => void; busy?: boolean; saveError?: string;
 }) {
   useLocale();
   const [acknowledged, setAcknowledged] = useState(false);
@@ -18,13 +18,16 @@ export function RecoveryKeyDialog({ recoveryKey, onContinue, onCopy, onSave, can
   }
   return <Dialog
     open={!!recoveryKey}
-    onClose={() => { }}
-    dismissible={false}
+    onClose={() => { setAcknowledged(false); onCancel?.(); }}
+    dismissible={!!onCancel && !busy}
     title={t("saveYourRecoveryKey")}
 
     description={t("thisKeyIsTheOnlyWayBackInto")}
 
-    footer={<Button disabled={!acknowledged} onClick={() => { onContinue(); setAcknowledged(false); }}>{t("continue")}</Button>}
+    footer={<>
+      {onCancel && <Button variant="secondary" disabled={busy} onClick={() => { setAcknowledged(false); onCancel(); }}>{t("cancel")}</Button>}
+      <Button loading={busy} disabled={!acknowledged} onClick={() => { onContinue(); if (!onCancel) setAcknowledged(false); }}>{t("continue")}</Button>
+    </>}
   >
 
     <div className="space-y-4">
@@ -50,6 +53,7 @@ export function RecoveryKeyDialog({ recoveryKey, onContinue, onCopy, onSave, can
         >{t("saveAsFile")}</Button>}
       </div>
 
+      {saveError && <Notice tone="danger">{saveError}</Notice>}
       {error && <Notice tone="danger">
         {renderMessage(error)}
       </Notice>}

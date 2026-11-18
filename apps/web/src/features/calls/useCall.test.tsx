@@ -129,6 +129,30 @@ function configureVideoCall() {
     : { id: "chat", members: [] }) as never);
 }
 
+it("starts signaling when immediate acceptance precedes completion of a ringing call snapshot", async () => {
+  useCallStore.getState().setOutgoingCall({ callId: "call", conversationId: "chat", callType: "video", initiatorId: "alice" });
+  vi.mocked(api.get).mockImplementation(async (path) => (path.startsWith("/api/calls/")
+    ? { id: "call", conversationId: "chat", type: "video", status: "ringing", initiatorId: "alice" }
+    : { id: "chat", members: [] }) as never);
+  let finishKey!: () => void;
+  vi.mocked(deriveCallKey).mockReturnValueOnce(new Promise((resolve) => { finishKey = () => resolve({} as never); }));
+  const pc = { close, createOffer: vi.fn(async () => ({ type: "offer", sdp: "caller-offer" })), setLocalDescription: vi.fn(async () => {}) };
+  vi.mocked(createPeerConnection).mockResolvedValueOnce(pc as unknown as RTCPeerConnection);
+
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  expect(deriveCallKey).toHaveBeenCalledOnce();
+  expect(createPeerConnection).not.toHaveBeenCalled();
+  await act(async () => useCallStore.getState().updateCallStatus("call", "active"));
+  await act(async () => finishKey());
+
+  expect(useCallStore.getState().callStatus).toBe("active");
+  expect(state.stage).toBe("connecting");
+  expect(createPeerConnection).toHaveBeenCalledOnce();
+  expect(sockets).toHaveLength(1);
+  await act(async () => { await sockets[0].onopen?.(); });
+  expect(sendSignal).toHaveBeenCalledWith(sockets[0], { kind: "offer", sdp: "caller-offer", fromUserId: "alice" });
+});
+
 it.each(["audio", "video"] as const)("P1: applies ringing mute intent to every audio track before attaching %s media", async (callType) => {
   const microphones = [mediaTrack("audio"), mediaTrack("audio")];
   const camera = mediaTrack("video");

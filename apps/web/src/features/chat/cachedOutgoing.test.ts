@@ -1,7 +1,10 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { getAppDB, getMessageById, saveMessage, saveQueuedMessage, type LocalMessage } from "../../db/index.js";
+import { deleteOutgoing, getAppDB, getCachedConversationMessagesPage, getMessageById, guardMessageForPublish, saveMessage as writeOwnedMessage, saveQueuedMessage, type LocalMessage } from "../../db/index.js";
 import { loadOlderPersistedConversationMessages, loadPersistedConversationMessages, resetMessageSyncState } from "../../lib/message-sync.js";
 import { useChatStore } from "../../stores/chatStore.js";
+
+const saveMessage = (row: Parameters<typeof writeOwnedMessage>[0], current?: () => boolean, ownerId = row.ownerId ?? "alice") =>
+  writeOwnedMessage(row, current, ownerId);
 vi.mock("../../services/api.js", () => ({ api: { get: vi.fn() } }));
 vi.mock("../../stores/authStore.js", () => ({ useAuthStore: { getState: () => ({ user: { id: "alice" }, device: { id: "device" } }) } }));
 vi.mock("../../lib/message-processor.js", () => ({ decryptMessage: vi.fn(), decryptGroupText: vi.fn() }));
@@ -42,4 +45,11 @@ it("R3-F4: keeps the queued-expiry exception when loading older cached history",
   const page = await loadOlderPersistedConversationMessages("chat");
   expect(page.loadedCount).toBe(1);
   expect(useChatStore.getState().messages.get("chat")?.map((message) => message.id)).toEqual(["queued", ...recentIds]);
+});
+it("rechecks expiry eligibility if a queued entry was removed after reading the preview", async () => {
+  await queue("failed");
+  const { messages: [preview] } = await getCachedConversationMessagesPage("chat", { limit: 1, ownerId: "alice" });
+  expect(preview).toMatchObject({ id: "queued", hasOutgoingEntry: true });
+  await deleteOutgoing(preview.id);
+  expect(await guardMessageForPublish(preview)).toMatchObject({ id: "queued", hasOutgoingEntry: false });
 });

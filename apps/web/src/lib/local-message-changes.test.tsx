@@ -6,11 +6,15 @@ import { beforeEach, afterEach, expect, it, vi } from "vitest";
 import type { DecryptedMessage } from "@e2ee-chat/shared";
 import { createLocalMessageChannel, connectLocalMessageChannel } from "./local-message-changes.js";
 import { hideMessageWithUndo, reconcileLocalMessageChange, startLocalHiddenMessageSync, resetMessageSyncState, loadPersistedConversationMessages, loadOlderPersistedConversationMessages } from "./message-sync.js";
-import { getAppDB, saveMessage, finishMessageHide } from "../db/index.js";
+import { getAppDB, messageHideKey, saveMessage as writeOwnedMessage, finishMessageHide } from "../db/index.js";
+import { importHistoryTransferItem } from "../db/history-transfer.js";
 import { useChatStore } from "../stores/chatStore.js";
 import FilePreview from "../components/chat/FilePreview.js";
 import { ToastProvider } from "../ui/index.js";
 import { setupDom } from "../ui/test-utils.js";
+
+const saveMessage = (row: Parameters<typeof writeOwnedMessage>[0], current?: () => boolean, ownerId = row.ownerId ?? "alice") =>
+  writeOwnedMessage(row, current, ownerId);
 vi.mock("../stores/authStore.js", () => ({ useAuthStore: { getState: () => ({ user: { id: "alice" }, device: { id: "device" }, accessToken: "token" }) } }));
 vi.mock("../services/api.js", () => ({ ApiError: class extends Error {}, api: { get: vi.fn() }, resolveApiUrl: (url: string) => url }));
 vi.mock("./file-url-resolver.js", () => ({ fileUrlResolver: { resolve: async () => ({ downloadUrl: "/encrypted", expiresAt: Date.now() + 60000 }) } }));
@@ -61,10 +65,10 @@ it("reconciles hide, Undo and commit across two tabs sharing IndexedDB and revok
       await hideMessageWithUndo("conv", message.id);
       await waitFor(() => expect(tabB.getState().message).toBeNull());
       const db = await getAppDB();
-      const hidden = await db.get("syncState", "hidden-message:" + message.id);
-      await finishMessageHide(message.id, hidden.undoToken, false);
+      const hidden = await db.get("accountState", messageHideKey(message.id, "alice"));
+      await finishMessageHide(message.id, hidden.undoToken, false, undefined, "alice");
       await waitFor(() => expect(changes).toContain("commit"));
-      expect(await db.get("messages", message.id)).toBeUndefined();
+      expect(await db.get("displayMessages", ["alice", message.id])).toBeUndefined();
     });
     expect(URL.revokeObjectURL).toHaveBeenCalledTimes(4);
     expect(changes).toEqual(["hide", "undo", "hide", "commit"]);
@@ -92,16 +96,32 @@ it("supports storage-event fallback without sending plaintext and isolates accou
   } finally { a.close(); b.close(); c.close(); d.close(); }
 });
 
+it("refreshes another tab already showing a failed-decryption placeholder when import repairs it", async () => {
+  const row = { ownerId: "alice", id: "failed", conversationId: "conv", senderId: "peer", type: "text", content: "",
+    timestamp: Date.now(), expiresAt: Date.now() + 60_000, expiryKind: "retention", status: "failed" } as const;
+  await saveMessage(row);
+  const tab = createStore<{ row: DecryptedMessage }>(() => ({ row }));
+  const target = { addMessage: (_conversation: string, received: DecryptedMessage) => tab.setState({ row: received }), removeMessages: vi.fn() };
+  const local = connectLocalMessageChannel(scope, () => {});
+  const other = createLocalMessageChannel(scope, ({ id, kind }) => {
+    if (kind === "commit") void reconcileLocalMessageChange(id, target);
+  });
+  try {
+    await importHistoryTransferItem("alice", { entry: { kind: "message", message: { ...row, content: "Recovered text", status: "delivered" } } });
+    await vi.waitFor(() => expect(tab.getState().row).toMatchObject({ content: "Recovered text", status: "delivered" }));
+  } finally { other.close(); local(); }
+});
+
 it.each([
   ["initial", "peer"], ["older", "peer"], ["initial", "local"], ["older", "local"],
 ])("never republishes hidden attachment keys when a %s page races a %s hide during validation", async (page, origin) => {
   const { openDB } = await import("idb");
   const database = await import("../db/index.js");
   const db = await getAppDB(), tabB = await openDB(db.name);
-  const attachment = { id: "hidden-attachment", conversationId: "conv", senderId: "alice", type: "file", content: JSON.stringify({ fileId: "private-file", fileKey: "secret-file-key", iv: "secret-iv" }), timestamp: page === "older" ? 1 : 200, expiresAt: Date.now() + 60000, status: "sent" };
+  const attachment = { ownerId: "alice", id: "hidden-attachment", conversationId: "conv", senderId: "alice", type: "file", content: JSON.stringify({ fileId: "private-file", fileKey: "secret-file-key", iv: "secret-iv" }), timestamp: page === "older" ? 1 : 200, expiresAt: Date.now() + 60000, status: "sent" };
   await saveMessage(attachment);
   if (page === "older") {
-    const tx = db.transaction("messages", "readwrite");
+    const tx = db.transaction("displayMessages", "readwrite");
     await Promise.all(Array.from({ length: 100 }, (_, index) => tx.store.put({ ...attachment, id: `recent-${index}`, type: "text", content: "recent", timestamp: index + 2 })));
     await tx.done;
     await loadPersistedConversationMessages("conv");
@@ -112,10 +132,10 @@ it.each([
     const snapshot = await original(...args);
     if (origin === "peer") {
       // Another tab commits the durable hide after A validated its snapshot.
-      await tabB.put("syncState", { id: "hidden-message:" + attachment.id, undoToken: "peer-undo", undoDeadline: Date.now() + 5000 });
+      await tabB.put("accountState", { id: messageHideKey(attachment.id, "alice"), ownerId: "alice", undoToken: "peer-undo", undoDeadline: Date.now() + 5000 });
       peer.publish({ id: attachment.id, kind: "hide", conversationId: "conv" });
       await Promise.resolve(); // Deliver the cross-tab event before A resumes publication.
-    } else await database.beginMessageHide(attachment.id);
+    } else await database.beginMessageHide(attachment.id, undefined, "alice");
     return snapshot;
   });
   const publish = vi.spyOn(useChatStore.getState(), "prependMessages");

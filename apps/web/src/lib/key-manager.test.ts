@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { generateAESKey, toBase64Url } from "@e2ee-chat/crypto";
 import { OTP_KEY_POOL_SIZE } from "@e2ee-chat/shared";
+import { strictWebCrypto } from "../../../../packages/crypto/src/test/strict-webcrypto.js";
 
 vi.mock("../services/api.js", () => ({ api: { get: vi.fn(), post: vi.fn() } }));
 
@@ -20,8 +22,6 @@ async function reload() {
 
 beforeEach(async () => {
   vi.resetModules();
-  const { webcrypto } = await vi.importActual<{ webcrypto: Crypto }>("node:crypto");
-  vi.stubGlobal("crypto", webcrypto);
   keys = await import("./key-manager.js");
   db = await import("../db/index.js");
   api = (await import("../services/api.js")).api;
@@ -42,13 +42,202 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+it("erases offline history, cached attachments and the outbox only on full device reset", async () => {
+  const { Blob } = await vi.importActual<{ Blob: typeof globalThis.Blob }>("node:buffer");
+  vi.stubGlobal("Blob", Blob);
+  await keys.initializeKeys(password);
+  await db.saveQueuedMessage({
+    id: "message", conversationId: "chat", senderId: "user", type: "text", content: "cached plaintext",
+    timestamp: 1, expiresAt: null, status: "sending",
+  }, {
+    id: "message", queuedAt: 1, userId: "user", deviceId: "device", conversationId: "chat",
+    conversationType: "direct", ttlSeconds: null, steps: [], attempts: 0, status: "sending",
+    retryable: true, nextAttemptAt: null, error: null,
+  });
+  const sealed = await keys.sealCachedAttachment("user", "file", new Blob(["attachment"]));
+  const files = (await db.getAppDB()).transaction("accountFiles", "readwrite");
+  await db.writeCachedFile(files.store, { id: "file", ownerId: "user", cachedAt: 1, expiresAt: Date.now() + 60_000, sealed });
+  await files.done;
+  await keys.resetLocalCryptoState();
+  expect(await db.getMessageById("message")).toMatchObject({ content: "cached plaintext" });
+  expect(await db.getCachedFile("file", "user")).toBeDefined();
+  expect(await db.getOutgoing("message")).toBeDefined();
+
+  await keys.initializeKeys(password);
+  await keys.resetLocalDevice();
+  expect(keys.keysLoaded()).toBe(false);
+  expect(await keys.hasLocalKeyMaterial()).toBe(false);
+  expect(await db.getMessageById("message")).toBeUndefined();
+  expect(await db.getCachedFile("file", "user")).toBeUndefined();
+  expect(await db.getOutgoing("message")).toBeUndefined();
+});
+
+it("checks the captured vault inside the all-store reset transaction", async () => {
+  await keys.initializeKeys(password);
+  const captured = (await keys.getLocalVaultKey())!;
+  const appDb = await db.getAppDB();
+  await appDb.put("displayMessages", { id: "message", ownerId: "user", conversationId: "chat", senderId: "user", type: "text",
+    content: "cached plaintext", timestamp: 1, expiresAt: null, status: "received" });
+  const replacement = { ...captured, data: "other encrypted identity" };
+  const transaction = IDBDatabase.prototype.transaction;
+  const intercept = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+    this: IDBDatabase, stores, mode, options,
+  ) {
+    if (Array.isArray(stores) && stores.includes("legacyMessages") && stores.includes("deviceKeys") && mode === "readwrite") {
+      transaction.call(this, "deviceKeys", "readwrite").objectStore("deviceKeys").put(replacement);
+    }
+    return transaction.call(this, stores, mode, options);
+  });
+  await expect(keys.resetLocalDevice(captured)).resolves.toBe(false);
+  intercept.mockRestore();
+  expect(keys.keysLoaded()).toBe(true);
+  expect(await keys.getLocalVaultKey()).toEqual(replacement);
+  expect(await db.getMessageById("message")).toMatchObject({ content: "cached plaintext" });
+  await expect(keys.resetLocalDevice(replacement)).resolves.toBe(true);
+  expect(await db.getMessageById("message")).toBeUndefined();
+});
+
+it("persists a native key removal retry across reloads without keeping the slot usable", async () => {
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockResolvedValue();
+  await keys.initializeKeys(password);
+  await keys.enrollLocalUnlockMethod({ method: "native" });
+  const keyId = enroll.mock.calls[0][0];
+  const remove = vi.spyOn(biometricUnlock, "remove").mockImplementationOnce(async id => {
+    expect(id).toBe(keyId);
+    expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+    expect(await keys.hasPendingNativeUnlockRemoval()).toBe(true);
+    throw new Error("keystore unavailable");
+  });
+  await expect(keys.removeLocalUnlockMethod("native")).rejects.toThrow("keystore unavailable");
+  expect(remove).toHaveBeenCalledOnce();
+  await reload();
+  expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+  expect(await keys.hasPendingNativeUnlockRemoval()).toBe(true);
+  await expect(keys.enrollLocalUnlockMethod({ method: "native" })).rejects.toThrow("Finish removing");
+  const retry = vi.spyOn((await import("../platform/biometric-unlock.js")).biometricUnlock, "remove").mockResolvedValue();
+  await keys.removeLocalUnlockMethod("native");
+  expect(retry).toHaveBeenCalledExactlyOnceWith(keyId);
+  expect(await keys.hasPendingNativeUnlockRemoval()).toBe(false);
+  await keys.removeLocalUnlockMethod("native");
+  expect(retry).toHaveBeenCalledOnce();
+});
+
+it("journals native enrollment before IPC and protects an active enrollment from recovery", async () => {
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const remove = vi.spyOn(biometricUnlock, "remove").mockResolvedValue();
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockImplementation(async keyId => {
+    expect(await db.pendingResetNativeKeyIds()).toEqual([keyId]);
+    expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+    await keys.retryNativeKeyCleanup();
+    expect(remove).not.toHaveBeenCalled();
+  });
+  await keys.initializeKeys(password);
+  await keys.enrollLocalUnlockMethod({ method: "native" });
+  expect(enroll).toHaveBeenCalledOnce();
+  expect(await keys.listLocalUnlockMethods()).toEqual(["password", "native"]);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+  await keys.retryNativeKeyCleanup();
+  expect(remove).not.toHaveBeenCalled();
+});
+
+it.each(["existing vault", "fresh setup"])("recovers native enrollment after an aborted slot commit for %s", async mode => {
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockImplementation(async id => {
+    expect(await db.pendingResetNativeKeyIds()).toEqual([id]);
+  });
+  const remove = vi.spyOn(biometricUnlock, "remove").mockRejectedValue(new Error("keystore unavailable"));
+  const setup = { method: "native" } as const;
+  let commit: () => Promise<void>;
+  if (mode === "existing vault") {
+    await keys.initializeKeys(password);
+    commit = () => keys.enrollLocalUnlockMethod(setup);
+  } else {
+    const prepared = await keys.prepareDeviceKeySetup("Laptop", "web");
+    commit = () => prepared.commit(setup);
+  }
+  const before = await db.getKey("dbKey");
+  const originalDelete = IDBObjectStore.prototype.delete;
+  const interrupt = vi.spyOn(IDBObjectStore.prototype, "delete").mockImplementation(function (this: IDBObjectStore, id) {
+    const request = originalDelete.call(this, id);
+    if (typeof id === "string" && id.startsWith("native-unlock:remove:")) this.transaction.abort();
+    return request;
+  });
+  await expect(commit()).rejects.toThrow();
+  interrupt.mockRestore();
+  const keyId = enroll.mock.calls[0][0];
+  expect(remove).toHaveBeenCalledExactlyOnceWith(keyId);
+  expect(await db.getKey("dbKey")).toEqual(before);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([keyId]);
+
+  keys.lockLocalCryptoState();
+  (await db.getAppDB()).close();
+  vi.resetModules();
+  db = await import("../db/index.js");
+  keys = await import("./key-manager.js");
+  const retry = vi.spyOn((await import("../platform/biometric-unlock.js")).biometricUnlock, "remove").mockResolvedValue();
+  await keys.retryNativeKeyCleanup();
+  expect(retry).toHaveBeenCalledExactlyOnceWith(keyId);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+});
+
+it.each(["device reset", "crypto reset"])("keeps the native cleanup handle across %s and a restart", async mode => {
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockResolvedValue();
+  await keys.initializeKeys(password);
+  await keys.enrollLocalUnlockMethod({ method: "native" });
+  const keyId = enroll.mock.calls[0][0];
+  const remove = vi.spyOn(biometricUnlock, "remove").mockImplementation(async id => {
+    expect(await db.pendingResetNativeKeyIds()).toEqual([id]);
+    expect(await keys.hasLocalKeyMaterial()).toBe(false);
+    throw new Error("keystore unavailable");
+  });
+  const reset = mode === "device reset" ? keys.resetLocalDevice : keys.resetLocalCryptoState;
+  await expect(reset()).resolves.toBe(true);
+  expect(remove).toHaveBeenCalledExactlyOnceWith(keyId);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([keyId]);
+  await db.clearAll();
+  (await db.getAppDB()).close();
+  vi.resetModules();
+  db = await import("../db/index.js");
+  keys = await import("./key-manager.js");
+  expect(await db.pendingResetNativeKeyIds()).toEqual([keyId]);
+  const retry = vi.spyOn((await import("../platform/biometric-unlock.js")).biometricUnlock, "remove").mockResolvedValue();
+  await keys.retryNativeKeyCleanup();
+  expect(retry).toHaveBeenCalledExactlyOnceWith(keyId);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+});
+
+it("registers and reloads private keys and a wrapped edit key with strict BufferSources", async () => {
+  vi.stubGlobal("crypto", strictWebCrypto(crypto));
+  const publicIdentity = await keys.initializeKeys(password);
+  const editKey = toBase64Url(generateAESKey());
+  await db.saveMessage({
+    id: "original", ownerId: "bob", conversationId: "chat", senderId: "alice", type: "text", content: "original text",
+    timestamp: Date.now(), expiresAt: Date.now() + 60_000, status: "sent", editKey,
+    editKeyAccepted: true, editSigningKey: publicIdentity, editSenderDeviceId: "alice-device",
+  });
+  expect((await (await db.getAppDB()).get("accountState", 'message-edit-state:["bob","original"]')).wrappedKey)
+    .toMatchObject({ iv: expect.any(String), ciphertext: expect.any(String) });
+  await reload();
+  expect(toBase64Url(keys.getIdentityKeyPair().publicEd25519)).toBe(publicIdentity);
+  expect(await db.getMessageById("original", "bob", undefined, true)).toMatchObject({ editKey, editKeyAccepted: true });
+});
+
+it("unlocks local keys encrypted without AAD with strict BufferSources", async () => {
+  const publicIdentity = await keys.initializeKeys(password);
+  vi.stubGlobal("crypto", strictWebCrypto(crypto));
+  await reload();
+  expect(toBase64Url(keys.getIdentityKeyPair().publicEd25519)).toBe(publicIdentity);
+});
+
 describe("encrypted one-time pre-key persistence", () => {
   it("leaves no partial key records when the initialization transaction aborts", async () => {
     const originalPut = IDBObjectStore.prototype.put;
     let aborted = false;
     vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (this: IDBObjectStore, value, key) {
       const request = originalPut.call(this, value, key);
-      if (this.name === "localKeys" && value.id === "identity") {
+      if (this.name === "deviceKeys" && value.id === "identity") {
         request.addEventListener("success", () => {
           aborted = true;
           this.transaction.abort();
@@ -428,6 +617,35 @@ describe("local key ownership", () => {
 });
 
 describe("idle locking", () => {
+  it("holds only idle locking during a transfer and rearms it when paused", async () => {
+    await keys.initializeKeys(password);
+    vi.useFakeTimers();
+    keys.resetIdleTimer();
+    const release = keys.holdIdleLock();
+    vi.advanceTimersByTime(30 * 60_000);
+    expect(keys.keysLoaded()).toBe(true);
+    release();
+    vi.advanceTimersByTime(15 * 60_000);
+    expect(keys.keysLoaded()).toBe(false);
+  });
+
+  it("only opens device-sealed attachment bytes with the unlocked key and original context", async () => {
+    const { Blob } = await vi.importActual<{ Blob: typeof globalThis.Blob }>("node:buffer");
+    vi.stubGlobal("Blob", Blob);
+    await keys.initializeKeys(password);
+    const wire = new globalThis.Blob(["opaque uploaded bytes"]);
+    const sealed = await keys.sealCachedAttachment("alice", "file", wire);
+    const shared = new Uint8Array(new SharedArrayBuffer(14)).subarray(1, 13);
+    shared.set(sealed.iv);
+    expect(await (await keys.openCachedAttachment("alice", "file", { ...sealed, iv: shared })).text()).toBe("opaque uploaded bytes");
+    expect(await sealed.ciphertext.text()).not.toContain("opaque uploaded bytes");
+    expect(await (await keys.openCachedAttachment("alice", "file", sealed)).text()).toBe("opaque uploaded bytes");
+    await expect(keys.openCachedAttachment("bob", "file", sealed)).rejects.toThrow();
+    const release = keys.holdIdleLock();
+    keys.lockLocalCryptoState();
+    release();
+    await expect(keys.openCachedAttachment("alice", "file", sealed)).rejects.toMatchObject({ name: "KeysLockedError" });
+  });
   it("wipes in-memory keys, notifies subscribers, and removes activity listeners", async () => {
     await keys.initializeKeys(password);
     vi.useFakeTimers();
@@ -487,4 +705,698 @@ describe("idle locking", () => {
     vi.advanceTimersByTime(13 * 60_000);
     expect(keys.keysLoaded()).toBe(false);
   });
+});
+
+describe("device KEK and unlock slots", () => {
+  it("atomically migrates a legacy password vault and its already-wrapped edit keys", async () => {
+    const { Blob } = await vi.importActual<{ Blob: typeof globalThis.Blob }>("node:buffer");
+    vi.stubGlobal("Blob", Blob);
+    const { fromBase64Url, toBase64Url, serializeIdentityKeyPair } = await import("@e2ee-chat/crypto");
+    const { deriveEncryptionKey, unwrapUnlockSlot, readVault } = await import("./device-key-vault.js");
+    const { encryptData, decryptData, setLocalEncryptionKey } = await import("./local-key-encryption.js");
+    await keys.initializeKeys(password);
+    await keys.setLocalKeyOwner({ userId: "user", username: "alice", deviceId: "device" });
+    await keys.consumeOneTimePreKey(1);
+    const identity = serializeIdentityKeyPair(keys.getIdentityKeyPair());
+    const before = keys.buildDeviceLinkPublicBundle("Laptop");
+    keys.lockLocalCryptoState();
+
+    const vault = readVault(await db.getKey("dbKey"))!;
+    const modern = await unwrapUnlockSlot(vault.slots[0], password);
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const legacy = await deriveEncryptionKey(password, salt);
+    const blobIds = ["identity", "signedPreKey", "otpKeys"];
+    const legacyRecords = await Promise.all(blobIds.map(async (id) => {
+      const record = (await db.getKey(id))!;
+      const { iv, ciphertext } = JSON.parse(record.data);
+      return { ...record, data: JSON.stringify(await encryptData(legacy, await decryptData(modern, iv, ciphertext))) };
+    }));
+    await db.saveKeys([{ id: "dbKey", type: "salt", data: toBase64Url(salt) }, ...legacyRecords]);
+    const editKey = toBase64Url(generateAESKey());
+    const appDb = await db.getAppDB();
+    setLocalEncryptionKey(legacy);
+    const sealed = await keys.sealCachedAttachment("user", "file", new Blob(["offline bytes"]));
+    const files = appDb.transaction("accountFiles", "readwrite");
+    await db.writeCachedFile(files.store, { id: "file", ownerId: "user", cachedAt: Date.now(), expiresAt: Date.now() + 60_000, sealed });
+    await files.done;
+    await db.saveMessage({
+      id: "original", ownerId: "user", conversationId: "chat", senderId: "user", type: "text", content: "original",
+      timestamp: Date.now(), expiresAt: Date.now() + 60_000, status: "sent", editKey,
+      editKeyAccepted: true, editSigningKey: before.identityKey, editSenderDeviceId: "device",
+    });
+    await appDb.put("accountState", { id: "message-edit-key-wrap-v1" });
+    const editId = 'message-edit-state:["user","original"]';
+    const oldEdit = await appDb.get("accountState", editId);
+    const beforeMetadata = await Promise.all(["owner", "otpNextId", "otpPendingIds"].map(db.getKey));
+    await expect(keys.loadKeys("wrong")).rejects.toMatchObject({ name: "OperationError" });
+    expect((await db.getKey("dbKey"))?.type).toBe("salt");
+    expect(await Promise.all(blobIds.map(db.getKey))).toEqual(legacyRecords);
+    expect(keys.keysLoaded()).toBe(false);
+
+    const originalPut = IDBObjectStore.prototype.put;
+    const interrupt = vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (this: IDBObjectStore, value, key) {
+      const request = originalPut.call(this, value, key);
+      if (this.name === "deviceKeys" && value.id === "dbKey") {
+        request.addEventListener("success", () => this.transaction.abort(), { once: true });
+      }
+      return request;
+    });
+    await expect(keys.loadKeys(password)).rejects.toMatchObject({ name: "AbortError" });
+    interrupt.mockRestore();
+    expect((await db.getKey("dbKey"))?.type).toBe("salt");
+    expect(await appDb.get("accountState", editId)).toEqual(oldEdit);
+    expect(Array.from((await db.getCachedFile("file", "user"))!.sealed!.iv)).toEqual(Array.from(sealed.iv));
+
+    await keys.loadKeys(password);
+    const migrated = (await db.getKey("dbKey"))!;
+    const wrapper = readVault(migrated)!.slots[0];
+    expect(migrated.type).toBe("device-kek-v1");
+    expect(wrapper.method).toBe("password");
+    expect(serializeIdentityKeyPair(keys.getIdentityKeyPair())).toEqual(identity);
+    expect(keys.buildDeviceLinkPublicBundle("Laptop")).toEqual(before);
+    expect(await Promise.all(["owner", "otpNextId", "otpPendingIds"].map(db.getKey))).toEqual(beforeMetadata);
+    const newIdentity = JSON.parse((await db.getKey("identity"))!.data);
+    await expect(decryptData(legacy, newIdentity.iv, newIdentity.ciphertext)).rejects.toMatchObject({ name: "OperationError" });
+    const newEdit = await appDb.get("accountState", editId);
+    const aad = new TextEncoder().encode(JSON.stringify([editId, "chat", "user", "device", before.identityKey]));
+    await expect(decryptData(legacy, newEdit.wrappedKey.iv, newEdit.wrappedKey.ciphertext, aad))
+      .rejects.toMatchObject({ name: "OperationError" });
+    expect(await db.getMessageById("original", "user", undefined, true)).toMatchObject({ editKey, editKeyAccepted: true });
+    const migratedFile = (await db.getCachedFile("file", "user"))!.sealed!;
+    expect(Array.from(migratedFile.iv)).not.toEqual(Array.from(sealed.iv));
+    expect(await (await keys.openCachedAttachment("user", "file", migratedFile)).text()).toBe("offline bytes");
+    if (wrapper.method !== "password") throw new Error("Expected a password slot");
+    const wrapKey = await deriveEncryptionKey(password, fromBase64Url(wrapper.salt));
+    const raw = await decryptData(wrapKey, wrapper.iv, wrapper.ciphertext);
+    expect(raw).toHaveLength(32);
+    expect(migrated.data).not.toContain(toBase64Url(raw));
+    raw.fill(0);
+    await reload();
+    expect(keys.buildDeviceLinkPublicBundle("Laptop")).toEqual(before);
+    expect(await db.getMessageById("original", "user", undefined, true)).toMatchObject({ editKey });
+  });
+
+  it("locks and unlocks the same vault with password, PRF and the native adapter", async () => {
+    const invoke = vi.fn(async (command: string, args: { vaultId: string; key?: string }) => {
+      if (command === "biometric_unlock_enroll") {
+        keystore.set(args.vaultId, args.key!);
+      } else if (command === "biometric_unlock_remove") {
+        keystore.delete(args.vaultId);
+      } else if (keystore.has(args.vaultId)) {
+        return keystore.get(args.vaultId);
+      } else {
+        throw "invalidated";
+      }
+    });
+    const keystore = new Map<string, string>();
+    vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
+    const bytes = new Uint8Array([1, 2, 3]).buffer;
+    const get = vi.fn(async () => ({
+      id: "AQID", rawId: bytes,
+      response: { clientDataJSON: bytes, authenticatorData: bytes, signature: bytes },
+      getClientExtensionResults: () => ({ prf: { results: { first: new Uint8Array(32).fill(35).buffer } } }),
+    }));
+    const create = vi.fn();
+    vi.stubGlobal("navigator", { credentials: { get, create } });
+    vi.stubGlobal("PublicKeyCredential", class {});
+    try {
+      await keys.initializeKeys(password);
+      const identity = keys.buildDeviceLinkPublicBundle("Laptop").identityKey;
+      const editKey = toBase64Url(generateAESKey());
+      await db.saveMessage({
+        id: "original", ownerId: "user", conversationId: "chat", senderId: "user", type: "text", content: "original",
+        timestamp: Date.now(), expiresAt: Date.now() + 60_000, status: "sent", editKey,
+        editKeyAccepted: true, editSigningKey: identity, editSenderDeviceId: "device",
+      });
+      await keys.enrollLocalUnlockMethod({ method: "passkey", credentialId: "AQID", rpId: "localhost" });
+      window.__PRIVATEBASE_NATIVE_CAPABILITIES__ = { biometricUnlock: "touchid" };
+      Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+      await keys.enrollLocalUnlockMethod({ method: "native" });
+      expect(await keys.listLocalUnlockMethods()).toEqual(["password", "passkey", "native"]);
+      expect(keystore.size).toBe(1);
+      expect((await db.getKey("dbKey"))!.data).not.toContain([...keystore.values()][0]);
+
+      keys.lockLocalCryptoState();
+      expect((await db.getMessageById("original", "user", undefined, true))?.editKey).toBeUndefined();
+      await keys.unlockLocalKeys("native");
+      expect(keys.buildDeviceLinkPublicBundle("Laptop").identityKey).toBe(identity);
+      expect(await db.getMessageById("original", "user", undefined, true)).toMatchObject({ editKey });
+      keystore.clear();
+      keys.lockLocalCryptoState();
+      await expect(keys.unlockLocalKeys("native")).rejects.toMatchObject({ code: "invalidated" });
+      expect(keys.keysLoaded()).toBe(false);
+
+      await keys.loadKeys(password);
+      await keys.removeLocalUnlockMethod("native");
+      expect(invoke).toHaveBeenCalledWith("biometric_unlock_remove", expect.objectContaining({ vaultId: expect.any(String) }));
+      delete window.__PRIVATEBASE_NATIVE_CAPABILITIES__;
+      Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+      keys.lockLocalCryptoState();
+      await keys.unlockLocalKeys("passkey");
+      expect(keys.buildDeviceLinkPublicBundle("Laptop").identityKey).toBe(identity);
+      expect(await db.getMessageById("original", "user", undefined, true)).toMatchObject({ editKey });
+      await keys.removeLocalUnlockMethod("password");
+      expect(get).toHaveBeenCalledTimes(3);
+      await expect(keys.removeLocalUnlockMethod("passkey")).rejects.toThrow("Keep at least one unlock method");
+      keys.lockLocalCryptoState();
+      await expect(keys.loadKeys(password)).rejects.toThrow();
+      expect(keys.keysLoaded()).toBe(false);
+    } finally {
+      delete window.__PRIVATEBASE_NATIVE_CAPABILITIES__;
+      Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+      vi.doUnmock("@tauri-apps/api/core");
+    }
+  });
+
+  it("prepares a fresh bundle in memory until the unlock slot commits, without overwriting another vault", async () => {
+    const first = await keys.prepareDeviceKeySetup("New browser", "web");
+    const second = await keys.prepareDeviceKeySetup("Other tab", "web");
+    expect(await keys.hasLocalKeyMaterial()).toBe(false);
+    expect(first.bundle.bundleSignature).toMatch(/^[A-Za-z0-9_-]{86}$/);
+    await first.commit({ method: "password", password });
+    await expect(second.commit({ method: "password", password })).rejects.toThrow(/changed/);
+    expect(keys.buildDeviceLinkPublicBundle("New browser").identityKey).toBe(first.bundle.identityKey);
+    await reload();
+    expect(keys.buildDeviceLinkPublicBundle("New browser").identityKey).toBe(first.bundle.identityKey);
+  });
+});
+
+it("notifies mounted consumers after saving or removing an unlock slot", async () => {
+  const { subscribeToUnlockMethodChanges } = await import("./unlock-method-changes.js");
+  await keys.initializeKeys(password);
+  const changes: Promise<Awaited<ReturnType<typeof keys.listLocalUnlockMethods>>>[] = [];
+  const unsubscribe = subscribeToUnlockMethodChanges(() => { changes.push(keys.listLocalUnlockMethods()); });
+  try {
+    await keys.enrollLocalUnlockMethod({ method: "passkey", credentialId: "AQID", rpId: "localhost",
+      salt: new Uint8Array(32), output: new Uint8Array(32).fill(23) });
+    await expect(Promise.all(changes)).resolves.toEqual([["password", "passkey"]]);
+    await keys.removeLocalUnlockMethod("passkey");
+    await expect(Promise.all(changes)).resolves.toEqual([["password", "passkey"], ["password"]]);
+  } finally { unsubscribe(); }
+});
+
+it.each(["prf", "prf-autofill", "resumed-prf-add", "resumed-prf-skip", "resumed-prf-legacy", "resumed-prf-chosen", "resumed-prf-stale", "resumed-prf-saved-password",
+  "resumed-prf-idle-locked", "resumed-prf-reopened", "resumed-prf-lock-during-complete", "resumed-prf-activation-retry",
+  "password", "approval_required", "approval-at-completion", "lost-complete", "forgotten-checkpoint", "changed-checkpoint",
+  "resumed-replacement", "locked-after-save", "activated-expiry"] as const)("runs the fresh web setup with %s", async (mode) => {
+  const { beginPasskeyDeviceSetup, preparePasskeyDeviceSetup, resumePasskeyDeviceSetup, DeviceApprovalRequiredError } = await import("./passkey-provision.js");
+  const { readVault } = await import("./device-key-vault.js");
+  const resumePrf = mode.startsWith("resumed-prf-");
+  const hasPrf = mode === "prf" || mode === "prf-autofill" || resumePrf;
+  const addBackup = mode === "resumed-prf-add" || mode === "resumed-prf-activation-retry";
+  const bytes = new Uint8Array([1, 2, 3]).buffer;
+  const prfBytes = new Uint8Array(32).fill(23);
+  const get = vi.fn(async (_options: CredentialRequestOptions) => ({
+    id: "AQID", rawId: bytes,
+    response: { clientDataJSON: bytes, authenticatorData: bytes, signature: bytes },
+    getClientExtensionResults: () => hasPrf ? { prf: { enabled: false, results: { first: prfBytes.slice().buffer } } }
+      : mode === "password" ? { prf: { enabled: true } } : {},
+  }));
+  vi.stubGlobal("navigator", { credentials: { create: vi.fn(), get } });
+  vi.stubGlobal("PublicKeyCredential", class {});
+  const setupToken = "setup-token";
+  const pending = (setupId: string) => ({ setupId, user: { id: "user", username: "alice" }, deviceId: "linked",
+    deviceName: "Laptop", platform: "web", setupToken });
+  const replacement = { limitTicket: "limit-ticket", revokeDeviceId: "old-device", recoveryKeyProof: "recovery-proof" };
+  let originalBundle: unknown;
+  let finishCount = 0;
+  let verified = false;
+  vi.mocked(api.post).mockImplementation(async (path, body, options) => {
+    if (path === "/auth/passkey/provision-options") {
+      expect(body).toEqual({ bundleHash: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/) });
+      return { challengeId: "challenge", options: {
+        challenge: "AQID", timeout: 60_000, rpId: "localhost", allowCredentials: [], userVerification: "required",
+      } } as never;
+    }
+    const record = (await db.readPendingSetupRecord())!;
+    if (path === "/auth/passkey/provision") {
+      expect(await keys.hasLocalKeyMaterial()).toBe(false);
+      expect(record.stage).toBe("prepared");
+      expect(body).toEqual({ setupId: record.setupId, challengeId: "challenge", bundle: expect.objectContaining({
+        bundleSignature: expect.any(String), identityKey: expect.any(String),
+      }), credential: expect.objectContaining({ id: "AQID" }) });
+      expect(JSON.stringify(body)).not.toMatch(/"(password|prf|privateKey)"\s*:/);
+      originalBundle = (body as { bundle: unknown }).bundle;
+      if (mode === "approval_required") throw Object.assign(new Error(), { status: 403, body: { error: mode } });
+      return pending(record.setupId) as never;
+    }
+    if (path === "/auth/password/verify") {
+      expect(await keys.hasLocalKeyMaterial()).toBe(hasPrf);
+      expect(options).toEqual({ bearerToken: setupToken });
+      if ((body as { password: string }).password !== password) throw Object.assign(new Error(), { status: 401, body: { error: "invalid_password" } });
+      verified = true;
+      return { verified: true } as never;
+    }
+    if (path === "/auth/passkey/provision/resume-options") return { challengeId: "proof-challenge" } as never;
+    if (path === "/auth/passkey/provision/resume") {
+      expect(body).toEqual({ setupId: record.setupId, challengeId: "proof-challenge", signature: expect.stringMatching(/^[A-Za-z0-9_-]{86}$/) });
+      return pending(record.setupId) as never;
+    }
+    if (path === "/auth/passkey/provision/replace") {
+      expect(body).toEqual({ ...replacement, setupId: record.setupId, bundle: originalBundle });
+      return pending(record.setupId) as never;
+    }
+    expect(path).toBe("/auth/passkey/provision/complete");
+    expect(options).toEqual({ bearerToken: setupToken });
+    expect(await keys.hasLocalKeyMaterial()).toBe(true);
+    expect(record.stage).toBe("unlockReady");
+    expect(record.backupPending).toBe(false);
+    expect(JSON.stringify(record)).not.toContain(setupToken);
+    expect(verified).toBe(!hasPrf || addBackup || mode === "resumed-prf-saved-password");
+    if (mode === "approval-at-completion") throw { status: 403, body: { error: "approval_required" } };
+    if (mode === "activated-expiry" && finishCount++ > 0) throw Object.assign(new Error("Already active"), { status: 409, body: { error: "setup_already_active" } });
+    if (mode === "activated-expiry") throw new Error("network read failed");
+    if (mode === "lost-complete" && finishCount++ === 0) throw new Error("network read failed");
+    if (mode === "resumed-prf-activation-retry" && finishCount++ === 0) throw new Error("network read failed");
+    if (mode === "resumed-prf-lock-during-complete" && finishCount++ === 0) keys.lockLocalCryptoState();
+    if (mode === "resumed-replacement" && finishCount++ === 0) {
+      throw Object.assign(new Error(), { status: 409, body: { error: "device_limit", limitTicket: replacement.limitTicket } });
+    }
+    if (mode === "forgotten-checkpoint") await keys.resetLocalCryptoState(record.setupId);
+    if (mode === "changed-checkpoint") await db.updatePendingSetupRecord({ ...record, deviceId: "other-device" }, record);
+
+    return { user: { id: "user", username: "alice" }, device: { id: "linked" } } as never;
+  });
+
+  const setupPromise = mode === "prf-autofill" ? (async () => {
+    const prepared = await preparePasskeyDeviceSetup("Laptop");
+    const assertion = await prepared.requestAutofill(new AbortController().signal);
+    return prepared.authorize({ assertion });
+  })() : beginPasskeyDeviceSetup("Laptop");
+  if (mode === "approval_required") {
+    await expect(setupPromise).rejects.toBeInstanceOf(DeviceApprovalRequiredError);
+    expect(await keys.hasLocalKeyMaterial()).toBe(false);
+    expect(await db.readPendingSetupRecord()).toBeUndefined();
+    return;
+  }
+  const setup = await setupPromise;
+  expect(await keys.hasLocalKeyMaterial()).toBe(false);
+  expect(setup.method).toBe(hasPrf ? "passkey" : "password");
+  expect(get).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    publicKey: expect.objectContaining({
+      userVerification: "required", extensions: { prf: { eval: { first: expect.any(ArrayBuffer) } } },
+    }),
+    ...(mode === "prf-autofill" ? { mediation: "conditional" } : {}),
+  }));
+  if (hasPrf) {
+    await setup.persistUnlock();
+    expect(await db.readPendingSetupRecord()).toMatchObject({ stage: "unlockReady", backupPending: "passkey" });
+    const salt = get.mock.calls[0][0].publicKey?.extensions?.prf?.eval?.first as ArrayBuffer;
+    const vault = readVault(await (await db.getAppDB()).get("deviceKeys", "dbKey"));
+    expect(vault?.slots).toEqual([expect.objectContaining({ method: "passkey", credentialId: "AQID", salt: toBase64Url(new Uint8Array(salt)) })]);
+    if (mode === "prf") await expect(setup.complete()).rejects.toThrow("Choose whether to add password unlock");
+    if (!resumePrf || mode === "resumed-prf-chosen") await setup.chooseBackupPassword();
+  }
+  if (resumePrf) {
+    if (mode === "resumed-prf-saved-password") {
+      // Simulate a reload between saving a verified backup and recording the choice.
+      verified = true;
+      await keys.enrollLocalUnlockMethod({ method: "password", password });
+    }
+    setup.discard();
+    keys.lockLocalCryptoState();
+    if (mode === "resumed-prf-legacy") {
+      const record = (await db.readPendingSetupRecord())!;
+      await db.updatePendingSetupRecord({ ...record, backupPending: undefined }, record);
+    }
+    const result = await resumePasskeyDeviceSetup("passkey");
+    if (mode === "resumed-prf-chosen" || mode === "resumed-prf-saved-password") {
+      expect(result).toMatchObject({ device: { id: "linked" } });
+    } else {
+      expect(result).toMatchObject({ setupId: setup.setupId, backupMethod: "passkey" });
+      if (!("backupMethod" in result)) throw new Error("Expected the backup decision");
+      const record = (await db.readPendingSetupRecord())!;
+      const finishCalls = () => vi.mocked(api.post).mock.calls.filter(([path]) => path === "/auth/passkey/provision/complete");
+      expect(finishCalls()).toHaveLength(0);
+      if (mode === "resumed-prf-idle-locked" || mode === "resumed-prf-reopened") {
+        vi.useFakeTimers();
+        keys.resetIdleTimer();
+        vi.advanceTimersByTime(15 * 60_000);
+        vi.useRealTimers();
+        expect(keys.keysLoaded()).toBe(false);
+        if (mode === "resumed-prf-reopened") await keys.unlockLocalKeys("passkey");
+        await expect(result.chooseBackupPassword()).rejects.toMatchObject({ name: "KeysLockedError" });
+        await expect(result.chooseBackupPassword(password)).rejects.toMatchObject({ name: "KeysLockedError" });
+        expect(await db.readPendingSetupRecord()).toEqual(record);
+        expect(await keys.listLocalUnlockMethods()).toEqual(["passkey"]);
+        expect(vi.mocked(api.post).mock.calls.some(([path]) => path === "/auth/password/verify")).toBe(false);
+        expect(finishCalls()).toHaveLength(0);
+        return;
+      }
+      if (mode === "resumed-prf-stale") {
+        await db.updatePendingSetupRecord({ ...record, backupPending: false }, record);
+        await expect(result.chooseBackupPassword()).rejects.toThrow("Device setup changed");
+        expect(finishCalls()).toHaveLength(0);
+        return;
+      }
+      if (mode === "resumed-prf-add") {
+        await expect(result.chooseBackupPassword("wrong-password")).rejects.toMatchObject({ body: { error: "invalid_password" } });
+        expect(await db.readPendingSetupRecord()).toEqual(record);
+      }
+      await result.chooseBackupPassword(addBackup ? password : undefined);
+      expect(await db.readPendingSetupRecord()).toMatchObject({ stage: "unlockReady", backupPending: false });
+      if (mode === "resumed-prf-lock-during-complete") {
+        await expect(result.complete()).rejects.toMatchObject({ name: "KeysLockedError" });
+        await expect(result.complete()).rejects.toMatchObject({ name: "KeysLockedError" });
+        expect(finishCalls()).toHaveLength(1);
+        expect(await db.readPendingSetupRecord()).toMatchObject({ stage: "unlockReady", backupPending: false });
+        await expect(resumePasskeyDeviceSetup("passkey")).resolves.toMatchObject({ device: { id: "linked" } });
+        expect(finishCalls()).toHaveLength(2);
+        return;
+      }
+      if (mode === "resumed-prf-activation-retry") {
+        await expect(result.complete()).rejects.toThrow("network read failed");
+        expect(await keys.listLocalUnlockMethods()).toEqual(["passkey", "password"]);
+        expect(await db.readPendingSetupRecord()).toMatchObject({ stage: "unlockReady", backupPending: false });
+      }
+      await expect(result.complete()).resolves.toMatchObject({ device: { id: "linked" } });
+      expect(finishCalls()).toHaveLength(mode === "resumed-prf-activation-retry" ? 2 : 1);
+      if (mode === "resumed-prf-activation-retry") {
+        expect(vi.mocked(api.post).mock.calls.filter(([path]) => path === "/auth/password/verify")).toHaveLength(1);
+      }
+    }
+    expect(await keys.listLocalUnlockMethods()).toEqual(addBackup || mode === "resumed-prf-saved-password"
+      ? ["passkey", "password"] : ["passkey"]);
+    expect(await db.readPendingSetupRecord()).toMatchObject({ stage: "complete", backupPending: false });
+    expect(get).toHaveBeenCalledTimes(2);
+    return;
+  }
+  if (mode === "password") {
+    await expect(setup.complete("mistyped-password")).rejects.toMatchObject({ body: { error: "invalid_password" } });
+    expect(await keys.hasLocalKeyMaterial()).toBe(false);
+  }
+  if (mode === "approval-at-completion") {
+    await expect(setup.complete(password)).rejects.toMatchObject({ name: "DeviceApprovalRequiredError", username: "alice" });
+    setup.discard();
+    expect(await keys.hasLocalKeyMaterial()).toBe(true);
+    expect(await db.readPendingSetupRecord()).toMatchObject({ setupId: setup.setupId, stage: "unlockReady" });
+    return;
+  }
+  if (mode === "locked-after-save") {
+    const put = IDBObjectStore.prototype.put;
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (this: IDBObjectStore, value, key) {
+      if (this.name === "accountState" && value.id === "setup:pending" && value.stage === "unlockReady") {
+        this.transaction.addEventListener("complete", () => keys.lockLocalCryptoState(), { once: true });
+      }
+      return put.call(this, value, key);
+    });
+    await expect(setup.complete(password)).rejects.toMatchObject({ name: "KeysLockedError" });
+    expect(setup.canUsePasswordFallback()).toBe(false);
+    await expect(setup.abandon()).rejects.toThrow("Finish or revoke this device");
+    expect((await db.readPendingSetupRecord())?.stage).toBe("unlockReady");
+    setup.discard();
+    return;
+  }
+  const completion = setup.complete(hasPrf ? undefined : password);
+  if (mode === "forgotten-checkpoint" || mode === "changed-checkpoint") {
+    await expect(completion).rejects.toThrow("Device setup changed");
+    expect(setup.closed).toBe(true);
+    expect((await db.readPendingSetupRecord())?.deviceId).toBe(mode === "changed-checkpoint" ? "other-device" : undefined);
+    return;
+  }
+  if (mode === "activated-expiry") {
+    await expect(completion).rejects.toThrow("network read failed");
+    setup.discard();
+    keys.lockLocalCryptoState();
+    await expect(resumePasskeyDeviceSetup("password", password)).rejects.toMatchObject({ body: { error: "setup_already_active" } });
+    expect(await db.readPendingSetupRecord()).toBeUndefined();
+    expect(await keys.hasLocalKeyMaterial()).toBe(true);
+    return;
+  }
+  if (mode === "lost-complete" || mode === "resumed-replacement") {
+    if (mode === "lost-complete") await expect(completion).rejects.toThrow("network read failed");
+    else await expect(completion).rejects.toMatchObject({ body: { error: "device_limit" } });
+    expect((await db.readPendingSetupRecord())?.stage).toBe("unlockReady");
+    setup.discard();
+    keys.lockLocalCryptoState();
+    await expect(resumePasskeyDeviceSetup("password", password, mode === "resumed-replacement" ? replacement : undefined))
+      .resolves.toMatchObject({ device: { id: "linked" } });
+  } else {
+    await expect(completion).resolves.toMatchObject({ device: { id: "linked" } });
+  }
+  expect(await keys.getLocalKeyOwner()).toEqual({ userId: "user", username: "alice", deviceId: "linked" });
+  expect(await keys.listLocalUnlockMethods()).toEqual([hasPrf ? "passkey" : "password"]);
+  expect(get).toHaveBeenCalledTimes(1);
+});
+
+it("holds setup ownership through preparation and allows a new attempt after discard", async () => {
+  const { preparePasskeyDeviceSetup } = await import("./passkey-provision.js");
+  vi.stubGlobal("navigator", { credentials: { create: vi.fn(), get: vi.fn() } });
+  vi.stubGlobal("PublicKeyCredential", class {});
+  vi.mocked(api.post).mockResolvedValue({ challengeId: "challenge", options: {} });
+  const first = await preparePasskeyDeviceSetup("Laptop");
+  await expect(preparePasskeyDeviceSetup("Other tab")).rejects.toThrow("already running");
+  expect((await db.readPendingSetupRecord())?.setupId).toBe(first.setupId);
+  await first.discard();
+  const second = await preparePasskeyDeviceSetup("Laptop");
+  expect(second.setupId).not.toBe(first.setupId);
+  await second.discard();
+  expect(await db.readPendingSetupRecord()).toBeUndefined();
+});
+
+it("keeps another tab's live setup checkpoint when Web Locks is unavailable", async () => {
+  const { clearInterruptedPasskeySetup, preparePasskeyDeviceSetup, PasskeySetupBusyError } = await import("./passkey-provision.js");
+  vi.stubGlobal("navigator", { credentials: { create: vi.fn(), get: vi.fn() } });
+  vi.stubGlobal("PublicKeyCredential", class {});
+  const current = { id: "setup:pending" as const, setupId: "other-tab", deviceId: "pending", bundleHash: "digest",
+    stage: "provisioned" as const, createdAt: Date.now() };
+  await db.updatePendingSetupRecord(current);
+  expect(await db.claimPasskeySetupLease("other-owner", 60_000)).toBe(true);
+  await expect(clearInterruptedPasskeySetup()).rejects.toBeInstanceOf(PasskeySetupBusyError);
+  await expect(preparePasskeyDeviceSetup("Laptop")).rejects.toBeInstanceOf(PasskeySetupBusyError);
+  expect(await db.readPendingSetupRecord()).toEqual(current);
+  await db.releasePasskeySetupLease("other-owner");
+  await expect(clearInterruptedPasskeySetup()).resolves.toBe(true);
+  expect(await db.readPendingSetupRecord()).toBeUndefined();
+});
+
+it("clears an interrupted attempt only if the whole checkpoint still matches", async () => {
+  const { clearInterruptedPasskeySetup } = await import("./passkey-provision.js");
+  const current = { id: "setup:pending" as const, setupId: "incomplete", deviceId: "pending", bundleHash: "digest",
+    stage: "provisioned" as const, createdAt: Date.now() };
+  const saved = { ...current, stage: "unlockReady" as const };
+  await db.updatePendingSetupRecord(current);
+  const transaction = IDBDatabase.prototype.transaction;
+  let read = false;
+  const intercept = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+    this: IDBDatabase, stores, mode, options,
+  ) {
+    if (stores === "accountState" && read && mode === "readwrite") {
+      read = false;
+      transaction.call(this, "accountState", "readwrite").objectStore("accountState").put(saved);
+    }
+    if (stores === "accountState" && mode !== "readwrite") read = true;
+    return transaction.call(this, stores, mode, options);
+  });
+  await expect(clearInterruptedPasskeySetup()).resolves.toBe(false);
+  intercept.mockRestore();
+  expect(await db.readPendingSetupRecord()).toEqual(saved);
+});
+
+it("aborts the web provisioning POST and releases setup ownership for another attempt", async () => {
+  const { preparePasskeyDeviceSetup } = await import("./passkey-provision.js");
+  vi.stubGlobal("navigator", { credentials: { create: vi.fn(), get: vi.fn() } });
+  vi.stubGlobal("PublicKeyCredential", class {});
+  const controller = new AbortController();
+  let posted!: () => void;
+  const submitted = new Promise<void>(resolve => { posted = resolve; });
+  vi.mocked(api.post).mockImplementation(async (path, _, options) => {
+    if (path.endsWith("-options")) return { challengeId: "challenge", options: {} } as never;
+    posted();
+    expect(path).toBe("/auth/passkey/provision");
+    expect(options?.signal).toBe(controller.signal);
+    return new Promise((_, reject) => controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true }));
+  });
+  const setup = await preparePasskeyDeviceSetup("Laptop");
+  const authorization = setup.authorize({ signal: controller.signal, assertion: { credential: { id: "AQID" } as never } });
+  const cancelled = expect(authorization).rejects.toMatchObject({ name: "AbortError" });
+  await submitted;
+  controller.abort();
+  await cancelled;
+  expect(await db.readPendingSetupRecord()).toBeUndefined();
+  const next = await preparePasskeyDeviceSetup("Next");
+  await next.discard();
+});
+
+it("verifies a backup account password while unlocked and protects a sole PRF passkey", async () => {
+  const { addAccountPasswordUnlock } = await import("./passkey-provision.js");
+  await signInForUnlockEnrollment();
+  const prepared = await keys.prepareDeviceKeySetup("Laptop", "web");
+  await prepared.commit({ method: "passkey", credentialId: "AQID", rpId: "localhost",
+    salt: new Uint8Array(32).fill(12), output: new Uint8Array(32).fill(24) });
+  expect(await keys.isOnlyLocalPasskeyUnlock("AQID")).toBe(true);
+  vi.mocked(api.post).mockRejectedValueOnce(new Error("invalid_password"));
+  await expect(addAccountPasswordUnlock("mistyped")).rejects.toThrow("invalid_password");
+  expect(await keys.listLocalUnlockMethods()).toEqual(["passkey"]);
+  vi.mocked(api.post).mockResolvedValueOnce({ verified: true });
+  await addAccountPasswordUnlock(password);
+  expect(await keys.isOnlyLocalPasskeyUnlock("AQID")).toBe(false);
+  keys.lockLocalCryptoState();
+  await expect(keys.loadKeys(password)).resolves.toBeUndefined();
+});
+
+it("clears pending setup metadata only when forgetting the matching local vault", async () => {
+  const { forgetSavedPasskeySetup } = await import("./passkey-provision.js");
+  const setupId = crypto.randomUUID();
+  await keys.initializeKeys(password);
+  await db.updatePendingSetupRecord({ id: "setup:pending", setupId, bundleHash: "digest", deviceId: "device",
+    createdAt: Date.now(), stage: "unlockReady" });
+  expect(await forgetSavedPasskeySetup(crypto.randomUUID())).toBe(false);
+  expect(await keys.hasLocalKeyMaterial()).toBe(true);
+  expect((await db.readPendingSetupRecord())?.setupId).toBe(setupId);
+  expect(await forgetSavedPasskeySetup(setupId)).toBe(true);
+  expect(await keys.hasLocalKeyMaterial()).toBe(false);
+  expect(await db.readPendingSetupRecord()).toBeUndefined();
+});
+
+it.each(["unknown_credential", "uv_required", "network-then-expired"])("allows a new ceremony after %s", async (failure) => {
+  const { beginPasskeyDeviceSetup } = await import("./passkey-provision.js");
+  const rawId = new Uint8Array([1, 2, 3]).buffer;
+  const get = vi.fn(async () => ({
+    id: "AQID", rawId, response: { clientDataJSON: rawId, authenticatorData: rawId, signature: rawId },
+    getClientExtensionResults: () => ({}),
+  }));
+  vi.stubGlobal("navigator", { credentials: { create: vi.fn(), get } });
+  vi.stubGlobal("PublicKeyCredential", class {});
+  const requests: unknown[] = [];
+  let optionsCount = 0;
+  vi.mocked(api.post).mockImplementation(async (path, body) => {
+    if (path === "/auth/passkey/provision-options") return { challengeId: `challenge-${++optionsCount}`, options: {
+      challenge: "AQID", timeout: 60_000, rpId: "localhost", allowCredentials: [], userVerification: "required",
+    } } as never;
+    requests.push(body);
+    if (optionsCount === 1) {
+      if (failure === "network-then-expired" && requests.length === 1) throw new TypeError("Failed to fetch");
+      throw Object.assign(new Error("Rejected"), { status: failure === "uv_required" ? 400 : 401, body: { error: failure } });
+    }
+    return { deviceId: "linked", setupToken: "token" } as never;
+  });
+  if (failure === "network-then-expired") {
+    const attempt = await beginPasskeyDeviceSetup("Laptop");
+    expect(attempt.authorizationError).toBeInstanceOf(TypeError);
+    await expect(attempt.retryAuthorization()).rejects.toThrow("Rejected");
+    expect(attempt.closed).toBe(true);
+    expect(requests[1]).toEqual(requests[0]);
+    expect(get).toHaveBeenCalledTimes(1);
+  } else {
+    await expect(beginPasskeyDeviceSetup("Laptop")).rejects.toThrow("Rejected");
+  }
+  expect(await db.readPendingSetupRecord()).toBeUndefined();
+  const fresh = await beginPasskeyDeviceSetup("Laptop");
+  expect(fresh.pending?.deviceId).toBe("linked");
+  expect(get).toHaveBeenCalledTimes(2);
+  expect(requests[0]).not.toEqual(requests.at(-1));
+  fresh.discard();
+});
+
+it("a losing registration cannot replace or clear a passkey vault committed by another setup", async () => {
+  const prepared = await keys.prepareDeviceKeySetup("Laptop", "web");
+  const setupId = crypto.randomUUID();
+  const vaultId = crypto.randomUUID();
+  const checkpoint = { id: "setup:pending" as const, setupId, bundleHash: "digest", stage: "unlockReady" as const,
+    deviceId: "passkey-device", createdAt: Date.now() };
+  await db.updatePendingSetupRecord({ ...checkpoint, stage: "provisioned" });
+  await prepared.commit({ method: "password", password }, {
+    record: checkpoint, owner: { userId: "alice-id", username: "alice", deviceId: "passkey-device" },
+  });
+  await expect(keys.initializeKeys("registration-password", vaultId)).rejects.toThrow("Local keys changed");
+  expect(await keys.resetLocalCryptoState(undefined, vaultId)).toBe(false);
+  expect(await db.readPendingSetupRecord()).toEqual(checkpoint);
+  await keys.loadKeys(password);
+  expect(keys.buildDeviceLinkPublicBundle("Laptop").identityKey).toBe(prepared.bundle.identityKey);
+});
+
+async function signInForUnlockEnrollment() {
+  const { useAuthStore } = await import("../stores/authStore.js");
+  useAuthStore.setState({ accessToken: "current-token", sessionId: "initial-session",
+    user: { id: "account", username: "alice" } as never, device: { id: "device" } as never });
+  return useAuthStore;
+}
+
+it("keeps the password slot until a supported alternative proves it can open the actual vault", async () => {
+  const { capabilities } = await import("../platform/capabilities.js");
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const native = vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("touchid");
+  let raw!: Uint8Array;
+  vi.spyOn(biometricUnlock, "enroll").mockImplementation(async (_, key) => { raw = new Uint8Array(key); });
+  const unlock = vi.spyOn(biometricUnlock, "unlock").mockResolvedValue(new Uint8Array(32).fill(9));
+  const identity = await keys.initializeKeys(password);
+  await keys.enrollLocalUnlockMethod({ method: "native" });
+  const record = await db.getKey("dbKey");
+
+  native.mockReturnValue(undefined);
+  await expect(keys.removeLocalUnlockMethod("password")).rejects.toThrow("Keep at least one unlock method");
+  expect(unlock).not.toHaveBeenCalled();
+  expect(await db.getKey("dbKey")).toEqual(record);
+
+  native.mockReturnValue("touchid");
+  await expect(keys.removeLocalUnlockMethod("password")).rejects.toMatchObject({ name: "OperationError" });
+  expect(await db.getKey("dbKey")).toEqual(record);
+  unlock.mockImplementation(async () => new Uint8Array(raw));
+  await keys.removeLocalUnlockMethod("password");
+  expect(await keys.listLocalUnlockMethods()).toEqual(["native"]);
+  keys.lockLocalCryptoState();
+  await keys.unlockLocalKeys("native");
+  expect(keys.buildDeviceLinkPublicBundle("Laptop").identityKey).toBe(identity);
+});
+
+it("binds password enrollment to the initiating account session even if its vault remains unlocked", async () => {
+  const store = await signInForUnlockEnrollment();
+  const { addAccountPasswordUnlock } = await import("./passkey-provision.js");
+  await keys.initializeKeys(password);
+  const previous = await db.getKey("dbKey");
+  let verified!: (response: { verified: boolean }) => void;
+  vi.mocked(api.post).mockReturnValueOnce(new Promise(resolve => { verified = resolve; }));
+  const enrollment = addAccountPasswordUnlock("another password");
+  store.setState({ sessionId: "other-session", user: { id: "another-account" } as never });
+  verified({ verified: true });
+  await expect(enrollment).rejects.toMatchObject({ name: "KeysLockedError" });
+  expect(await db.getKey("dbKey")).toEqual(previous);
+});
+
+it("does not enroll a credential in another vault opened while the settings PRF prompt was pending", async () => {
+  await signInForUnlockEnrollment();
+  const { capabilities } = await import("../platform/capabilities.js");
+  const { enrollPasskeyUnlock } = await import("../features/settings/UnlockSettings.js");
+  vi.spyOn(capabilities, "passkeys", "get").mockReturnValue(true);
+  let answer!: (credential: object) => void;
+  vi.stubGlobal("navigator", { credentials: { get: () => new Promise(resolve => { answer = resolve; }) } });
+  await keys.initializeKeys(password);
+  const enrollment = enrollPasskeyUnlock("AQID", "localhost");
+  await keys.resetLocalCryptoState();
+  await keys.initializeKeys("new owner password");
+  const replacement = await db.getKey("dbKey");
+  const bytes = Uint8Array.of(1, 2, 3).buffer;
+  answer({ id: "AQID", rawId: bytes, response: { clientDataJSON: bytes, authenticatorData: bytes, signature: bytes },
+    getClientExtensionResults: () => ({ prf: { results: { first: new Uint8Array(32).fill(5).buffer } } }),
+  });
+  await expect(enrollment).rejects.toMatchObject({ name: "KeysLockedError" });
+  expect(await db.getKey("dbKey")).toEqual(replacement);
+  expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+});
+
+it("wraps and opens a PRF vault with offset salts and PRF output from shared storage", async () => {
+  function sharedBytes(fill: number) {
+    const bytes = new Uint8Array(new SharedArrayBuffer(35));
+    bytes.fill(fill, 1, 33);
+    return bytes.subarray(1, 33);
+  }
+  const salt = sharedBytes(12);
+  const { capabilities } = await import("../platform/capabilities.js");
+  vi.spyOn(capabilities, "passkeys", "get").mockReturnValue(true);
+  const get = vi.fn(async ({ publicKey }: CredentialRequestOptions) => {
+    const challenge = publicKey?.extensions?.prf?.eval?.first;
+    expect(challenge).toBeInstanceOf(ArrayBuffer);
+    expect(new Uint8Array(challenge as ArrayBuffer)).toEqual(new Uint8Array(32).fill(12));
+    const bytes = Uint8Array.of(1, 2, 3).buffer;
+    return { id: "AQID", rawId: bytes, response: { clientDataJSON: bytes, authenticatorData: bytes, signature: bytes },
+      getClientExtensionResults: () => ({ prf: { results: { first: sharedBytes(24) } } }),
+    };
+  });
+  vi.stubGlobal("navigator", { credentials: { get } });
+  const prepared = await keys.prepareDeviceKeySetup("Laptop", "web");
+  await prepared.commit({ method: "passkey", credentialId: "AQID", rpId: "localhost", salt, output: sharedBytes(24) });
+  keys.lockLocalCryptoState();
+  await keys.unlockLocalKeys("passkey");
+  expect(keys.buildDeviceLinkPublicBundle("Laptop").identityKey).toBe(prepared.bundle.identityKey);
 });

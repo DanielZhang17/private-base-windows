@@ -1,12 +1,16 @@
 import { act } from "react";
+import { getByRole, queryByRole } from "@testing-library/dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ToastProvider } from "../ui/index.js";
 import ChatPage from "./ChatPage.js";
 import { useConversation } from "../features/chat/useConversation.js";
+import { useAuthStore } from "../stores/authStore.js";
+import { capabilities } from "../platform/capabilities.js";
 vi.mock("../features/chat/useConversation.js", () => ({ useConversation: vi.fn() }));
-vi.mock("../components/chat/MessageInput.js", () => ({ default: () => <div data-testid="message-composer" /> }));
+vi.mock("../components/chat/MessageInput.js", () => ({ default: ({ editing, editConflict }: { editing?: { id: string; content: string }; editConflict?: boolean }) =>
+  <div data-testid="message-composer" data-editing={editing?.id} data-content={editing?.content} data-conflict={editConflict} /> }));
 let root: Root;
 let container: HTMLDivElement;
 beforeEach(() => {
@@ -33,6 +37,107 @@ const renderFlow = async (state: Record<string, unknown>) => {
   vi.mocked(useConversation).mockReturnValue({ conversationMessages: [], outgoing: [], conversationName: "Mara", user: { id: "alice" }, ...state } as never);
   await act(async () => root.render(<QueryClientProvider client={new QueryClient()}><ToastProvider><ChatPage /></ToastProvider></QueryClientProvider>));
 };
+it.each([false, true])("shows local history guidance in an older empty conversation, with transfer gated (%s)", async historyTransfer => {
+  const previous = capabilities.historyTransfer;
+  capabilities.historyTransfer = historyTransfer;
+  const navigate = vi.fn();
+  try {
+    await renderFlow({ showHistoryGuidance: true, navigate });
+    const log = getByRole(container, "log", { name: "Messages" });
+    expect(getByRole(log, "heading", { name: "No messages on this device yet" })).toBeTruthy();
+    expect(log.textContent).toContain("Earlier messages stay on your other devices.");
+    if (historyTransfer) {
+      await act(async () => getByRole<HTMLButtonElement>(log, "button", { name: "Transfer history" }).click());
+      expect(navigate).toHaveBeenCalledWith("/devices/transfer?mode=receive");
+    } else expect(queryByRole(log, "button", { name: "Transfer history" })).toBeNull();
+  } finally { capabilities.historyTransfer = previous; }
+});
+
+it("keeps the ordinary empty message view for a new conversation", async () => {
+  await renderFlow({ showHistoryGuidance: false });
+  expect(getByRole(container, "log").textContent).toContain("No messages yet. Say hello!");
+  expect(container.textContent).not.toContain("Earlier messages stay on your other devices.");
+});
+it("attaches Retry and Discard for rejected edits to their respective bubbles", async () => {
+  const discard = vi.fn();
+  const retry = vi.fn();
+  const edits = [{ id: "first", content: "First pending revision" }, { id: "second", content: "Second pending revision" }];
+  await renderFlow({
+    conversationMessages: edits.map((edit, i) => ({ ...edit, senderId: "alice", type: "text", timestamp: 100 + i, status: "sent" })),
+    // Deliberately reverse the queue order relative to the bubbles.
+    outgoing: edits.slice().reverse().map(({ id }) => ({ id: `edit-${id}`, editTargetId: id, status: "failed", retryable: false, sendDispatched: true })),
+    retry, discard,
+  });
+  for (const { content } of edits) {
+    const bubble = [...container.querySelectorAll("article")].find((article) => article.textContent?.includes(content));
+    const actions = [...(bubble?.parentElement?.querySelector('[role="alert"]')?.querySelectorAll("button") ?? [])];
+    expect(actions.map((button) => button.textContent)).toEqual(["Discard", "Retry"]);
+    await act(async () => { actions[0].click(); actions[1].click(); });
+  }
+  expect(discard.mock.calls).toEqual([["edit-first"], ["edit-second"]]);
+  expect(retry.mock.calls).toEqual([["edit-first"], ["edit-second"]]);
+});
+it.each([[1, "key", true], [null, "key", false], [1, undefined, false]])("checks membership (%s) and edit key (%s) before offering Edit", async (acceptedAt, editKey, editable) => {
+  const owned = { id: "mine", conversationId: "chat", senderId: "alice", type: "text", content: "old text", timestamp: 1000,
+    editKey, editSenderDeviceId: "alice-device", editKeyAccepted: !!editKey,
+    expiresAt: Date.now() + 60000, expiryKind: "retention", status: "sent" };
+  await renderFlow({
+    deviceId: "alice-device",
+    conversationId: "chat", conversation: { id: "chat", type: "direct", members: [{ userId: "alice", acceptedAt, user: { displayName: "Alice", username: "alice" } }] },
+    conversationMessages: [owned, { ...owned, id: "peer", senderId: "bob", editedAt: 1001 }],
+  });
+  const buttons = [...container.querySelectorAll<HTMLButtonElement>('[aria-label="Message actions"]')];
+  await act(async () => buttons[1].click());
+  expect(document.body.querySelector('[aria-label="Edit message"]')).toBeNull();
+  expect(container.textContent).toContain("Edited");
+  const close = new KeyboardEvent("keydown", { key: "Escape", bubbles: true });
+  await act(async () => document.body.querySelector('[role="menu"]')!.dispatchEvent(close));
+  await act(async () => buttons[0].click());
+  const item = document.body.querySelector<HTMLButtonElement>('[aria-label="Edit message"]');
+  if (!editable) {
+    expect(item).toBeNull();
+  } else {
+    expect(item).not.toBeNull();
+    await act(async () => item!.click());
+    expect(container.querySelector('[data-testid="message-composer"]')?.getAttribute("data-editing")).toBe("mine");
+  }
+});
+it("keeps the opened revision in the composer when sync updates its bubble", async () => {
+  const owned = { id: "mine", conversationId: "chat", senderId: "alice", type: "text", content: "opened revision", timestamp: 1000,
+    editSequence: 1, editSenderDeviceId: "alice-device", editKeyAccepted: true, status: "sent", expiresAt: Date.now() + 60000 };
+  const state = {
+    deviceId: "alice-device", conversationId: "chat",
+    conversation: { id: "chat", type: "direct", members: [{ userId: "alice", acceptedAt: 1, user: { displayName: "Alice", username: "alice" } }] },
+  };
+  await renderFlow({ ...state, conversationMessages: [owned] });
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Message actions"]')!.click());
+  await act(async () => document.body.querySelector<HTMLButtonElement>('[aria-label="Edit message"]')!.click());
+  await renderFlow({ ...state, conversationMessages: [{ ...owned, content: "latest revision", editSequence: 2 }] });
+  const composer = container.querySelector('[data-testid="message-composer"]')!;
+  expect(composer.getAttribute("data-editing")).toBe("mine");
+  expect(composer.getAttribute("data-content")).toBe("opened revision");
+  expect(composer.getAttribute("data-conflict")).toBe("true");
+  expect(container.querySelector('[role="log"]')?.textContent).toContain("latest revision");
+});
+
+it("preserves the chat viewport and its scroll listener when the unlocked identity is repaired", async () => {
+  const original = useAuthStore.getState();
+  const messageListRef = { current: null as HTMLDivElement | null };
+  const scroll = vi.fn();
+  try {
+    await act(async () => useAuthStore.setState({ user: null, device: { id: "device" }, sessionId: "session" } as never));
+    await renderFlow({ messageListRef });
+    const log = messageListRef.current!;
+    log.scrollTop = 260;
+    log.addEventListener("scroll", scroll);
+    await act(async () => useAuthStore.setState({ user: { id: "alice" } } as never));
+    expect(messageListRef.current).toBe(log);
+    expect(log.scrollTop).toBe(260);
+    messageListRef.current?.dispatchEvent(new Event("scroll"));
+    expect(scroll).toHaveBeenCalledOnce();
+  } finally { await act(async () => useAuthStore.setState(original)); }
+});
+
 it("keeps failed messages in the log with one-tap retry and queue discard", async () => {
   const retry = vi.fn(); const discard = vi.fn();
   await renderFlow({

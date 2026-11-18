@@ -1,3 +1,4 @@
+import { createPasskeyEnrollmentPayload } from "@e2ee-chat/shared";
 import { localized, renderMessage, type LocalizedMessage } from "../../i18n/messages.js";
 import { toErrorMessage } from "../shared/errors.js";
 import { t, useLocale } from "../../i18n/index.js";
@@ -10,7 +11,8 @@ import { useAuthStore } from "../../stores/authStore.js";
 import { useUiPreferencesStore } from "../../stores/uiPreferencesStore.js";
 
 import { clearAll } from "../../db/index.js";
-import { lockLocalCryptoState, resetLocalCryptoState } from "../../lib/key-manager.js";
+import { addAccountPasswordUnlock, bindAccountUnlockEnrollment } from "../../lib/passkey-provision.js";
+import { signWithIdentityKey, isOnlyLocalPasskeyUnlock, localPasskeyUnlockId, listLocalUnlockMethods, enrollLocalUnlockMethod, removeLocalUnlockMethod, lockLocalCryptoState, resetLocalCryptoState } from "../../lib/key-manager.js";
 import { generateRecoveryKey } from "../../lib/device-link.js";
 import { addNativePasskey } from "../../lib/native-passkeys.js";
 import { createPasskeyCredential, PasskeyUnsupportedError } from "../../lib/webauthn.js";
@@ -220,11 +222,12 @@ export function useSettings() {
       setPasskeyError(localized("giveYourPasskeyAName"));
       return;
     }
+    if (!device?.id) return false;
     setRegisteringPasskey(true);
     setPasskeyError(null);
     try {
       if (capabilities.nativePasskeys) {
-        await addNativePasskey(passkeyName.trim());
+        await addNativePasskey(passkeyName.trim(), device.id);
         setPasskeyName("");
         await queryClient.invalidateQueries({ queryKey: ["passkeys"] });
         return true;
@@ -235,8 +238,13 @@ export function useSettings() {
           : await loadFreshPasskeyOptions();
       const { challengeId, options } = registerOptions;
       const credential = await createPasskeyCredential(options);
+      const { clientDataJSON, attestationObject } = credential.response;
+      const deviceSignature = await signWithIdentityKey(createPasskeyEnrollmentPayload(device.id, {
+        kind: "web", challengeId, clientDataJSON, attestationObject,
+      }));
       await api.post("/api/passkeys/register", {
         challengeId,
+        deviceSignature,
         credential,
         friendlyName: passkeyName.trim(),
       });
@@ -258,10 +266,16 @@ export function useSettings() {
 
   const handleDeletePasskey = async (passkeyId: string) => {
 
+    const credential = passkeysQuery.data?.find(passkey => passkey.id === passkeyId);
+    if (credential && await isOnlyLocalPasskeyUnlock(credential.credentialId)) {
+      setPasskeyError(localized("addBackupUnlockBeforeRemovingPasskey"));
+      return false;
+    }
     setDeletingPasskeyId(passkeyId);
     setPasskeyError(null);
     try {
       await api.delete(`/api/passkeys/${passkeyId}`);
+      if (credential && await localPasskeyUnlockId() === credential.credentialId) await removeLocalUnlockMethod("passkey").catch(() => undefined);
       await queryClient.invalidateQueries({ queryKey: ["passkeys"] });
       setConfirmation(null);
       return true;
@@ -412,8 +426,8 @@ export function useSettings() {
         password: deletePassword,
         confirmationText: deleteConfirmation,
       });
-      await clearAll();
       await resetLocalCryptoState().catch(() => undefined);
+      await clearAll();
       clearPreferencesForUser(user.id);
       queryClient.clear();
       logout({ forgetDevice: true });
@@ -462,6 +476,14 @@ export function useSettings() {
 
   return {
     privacy,
+    localUnlock: {
+      list: () => listLocalUnlockMethods(),
+      enroll: (setup: Parameters<typeof enrollLocalUnlockMethod>[0]) =>
+        setup.method === "password" ? addAccountPasswordUnlock(setup.password) : bindAccountUnlockEnrollment()(setup),
+      remove: (method: Parameters<typeof removeLocalUnlockMethod>[0]) => removeLocalUnlockMethod(method),
+      addAccountPassword: addAccountPasswordUnlock,
+      isOnlyPasskey: (credentialId: string) => isOnlyLocalPasskeyUnlock(credentialId),
+    },
     selectedSection, section: selectedSection ?? "appearance",
     compressAttachments: storedPreferences.compressAttachments ?? false,
     setCompressAttachments: (enabled: boolean) => {

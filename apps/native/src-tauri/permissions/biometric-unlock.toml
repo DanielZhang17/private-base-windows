@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "allow-biometric-unlock-enroll"
+description = "Enroll a local biometric unlock slot on a supported keystore."
+commands.allow = ["biometric_unlock_enroll"]
+
+[[permission]]
+identifier = "allow-biometric-unlock"
+description = "Unlock a local biometric slot on a supported keystore."
+commands.allow = ["biometric_unlock"]
+
+[[permission]]
+identifier = "allow-biometric-unlock-remove"
+description = "Remove a local biometric unlock slot."
+commands.allow = ["biometric_unlock_remove"]

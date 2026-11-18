@@ -22,14 +22,20 @@ tauri-plugin-notification = "=2.8.1"
 tauri-plugin-opener = "=2.7.3"
 
 [target.'cfg(windows)'.dependencies]
+base64 = "=0.22.1"
+ring = "=0.17.14"
 tauri-plugin-deep-link = "=2.6.3"
 tauri-plugin-single-instance = "=2.5.5"
 tempfile = "=3.27.0"
 tokio = { version = "=1.54.1", features = ["sync", "time"] }
-windows = { version = "=0.62.2", features = ["Wdk_System_SystemServices", "Win32_Security_Cryptography", "Win32_System_Com", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "=0.62.2", features = ["Security_Credentials", "Security_Cryptography_Core", "Storage_Streams", "Wdk_System_SystemServices", "Win32_Security_Cryptography", "Win32_System_Com", "Win32_System_SystemInformation", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+zeroize = "=1.9.1"
 
 [dev-dependencies]
+base64 = "=0.22.1"
+ring = "=0.17.14"
 tempfile = "=3.27.0"
+zeroize = "=1.9.1"
 # Type-check the Windows command/wiring in host tests without a Windows SDK.
 tauri-plugin-deep-link = "=2.6.3"
 tauri-plugin-single-instance = "=2.5.5"

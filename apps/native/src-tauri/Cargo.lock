@@ -976,8 +976,10 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "e2ee-chat-native"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "getrandom 0.4.3",
  "reqwest",
+ "ring",
  "rustls",
  "semver",
  "serde",
@@ -997,6 +999,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows",
+ "zeroize",
 ]
 
 [[package]]

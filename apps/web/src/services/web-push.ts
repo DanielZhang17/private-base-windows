@@ -38,10 +38,10 @@ export function supportsWebPush(): boolean {
   return !isNative() && window.isSecureContext && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window && !iosPushHint();
 }
 export function showWebPushSettings(): boolean { return supportsWebPush() || iosPushHint(); }
-export async function storePushLocale(locale: string, message: string, call: string): Promise<void> {
+export async function storePushLocale(locale: string, message: string, call: string, deviceAdded?: string, approvalDisabled?: string): Promise<void> {
   if (isNative() || !("caches" in window)) return;
   const cache = await caches.open(PUSH_CACHE);
-  await cache.put("/__push_locale", new Response(JSON.stringify({ locale, message, call })));
+  await cache.put("/__push_locale", new Response(JSON.stringify({ locale, message, call, deviceAdded, approvalDisabled })));
 }
 async function setDeliveryEnabled(enabled: boolean): Promise<void> {
   const cache = await caches.open(PUSH_CACHE);

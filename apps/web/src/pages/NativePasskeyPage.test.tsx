@@ -60,3 +60,33 @@ it("keeps errors free of response secrets and offers no callback on failure", as
   expect(document.body.textContent).not.toContain("secret-ticket");
   expect(document.querySelector("a")).toBeNull();
 });
+
+it("explains the device activation consequence before requesting the provisioning assertion", async () => {
+  const hash = "h".repeat(43);
+  fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ challengeId: "id", options: {} })))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ code: "code" })));
+  await show("sign-in", `challenge=${secret}&state=${state}&mode=provision&bundleHash=${hash}`);
+  expect(document.body.textContent).toContain("Once set up, it can receive new encrypted messages.");
+  expect(getPasskeyAssertion).not.toHaveBeenCalled();
+  await click(document.querySelector("button")!);
+  expect(fetchMock.mock.calls[0][0]).toContain("/auth/passkey/provision-options");
+  expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ bundleHash: hash, handoff: { codeChallenge: secret } });
+});
+
+it("retries provisioning options with the retained parameters after stripping browser history", async () => {
+  const hash = "h".repeat(43);
+  fetchMock.mockRejectedValueOnce(new Error("offline"))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ challengeId: "retry-id", options: {} })))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ code: "code" })));
+  await show("sign-in", `challenge=${secret}&state=${state}&mode=provision&bundleHash=${hash}`);
+  expect(window.location.search).toBe("");
+  const find = (name: string) => [...document.querySelectorAll("button")].find(button => button.textContent === name)!;
+  expect(find("Continue with passkey").disabled).toBe(true);
+  await click(find("Retry"));
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(fetchMock.mock.calls[1][1].body).toBe(fetchMock.mock.calls[0][1].body);
+  expect(getPasskeyAssertion).not.toHaveBeenCalled();
+  await click(find("Continue with passkey"));
+  expect(getPasskeyAssertion).toHaveBeenCalledOnce();
+  expect(document.querySelector("a")).toBeTruthy();
+});

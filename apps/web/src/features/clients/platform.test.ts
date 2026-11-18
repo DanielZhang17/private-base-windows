@@ -61,6 +61,14 @@ describe("platformLayout ordering", () => {
 it("recognises the public route", () => {
   expect(isClientsPath("/clients")).toBe(true);
   expect(isClientsPath("/clients/")).toBe(true);
+  expect(isClientsPath("/clients/releases")).toBe(true);
+  expect(isClientsPath("/clients/releases/")).toBe(true);
+  expect(isClientsPath("/Clients/Releases//")).toBe(true);
+  expect(isClientsPath("/clients/%72eleases")).toBe(true);
+  expect(isClientsPath("/%63lients/%72eleases")).toBe(true);
+  expect(isClientsPath("/CLIENTS//")).toBe(true);
   expect(isClientsPath("/clients/x")).toBe(false);
+  expect(isClientsPath("/clients/releases/extra")).toBe(false);
+  expect(isClientsPath("/clients%2Freleases")).toBe(false);
   expect(isClientsPath("/login")).toBe(false);
 });

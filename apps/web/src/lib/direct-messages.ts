@@ -7,6 +7,7 @@ import type {
 import { api } from "../services/api.js";
 import { useAuthStore } from "../stores/authStore.js";
 import { encryptMessage } from "./message-processor.js";
+import type { EditKeyToSeal } from "@e2ee-chat/crypto";
 
 interface DirectTargetDevice {
   userId: string;
@@ -68,6 +69,7 @@ export async function prepareDirectPayloadFanout(
   options?: {
     ttlSeconds?: number | null;
     fileId?: string | null;
+    editKey?: EditKeyToSeal;
   },
 ): Promise<SendDirectBatchRequest> {
   const user = useAuthStore.getState().user;
@@ -77,7 +79,9 @@ export async function prepareDirectPayloadFanout(
   const targets = await resolveDirectTargetDevices(conversation);
   const prepared = await Promise.allSettled(
     targets.map(async (target, index) => {
-      const encrypted = await encryptMessage("direct", plaintext, target.userId, target.deviceId);
+      const encrypted = options?.editKey
+        ? await encryptMessage("direct", plaintext, target.userId, target.deviceId, options.editKey)
+        : await encryptMessage("direct", plaintext, target.userId, target.deviceId);
       const preparedMessage: PreparedDirectMessage = {
         ...target,
         id: fanoutMessageId(localMessageId, target, index),

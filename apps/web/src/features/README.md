@@ -15,7 +15,7 @@ Keep these browser-test contracts:
 
 State: `username`, `password`, `recoveryKey`, their `set*` setters; `error`, `loading`; `blockedOwner` (`undefined` means no prompt, `null` means keys with unknown ownership); `pendingLink` (`deviceName`, `linkRequestId`, `shortCode`, `expiresAt`, `mode`); `linkCompleting`; `capabilities` from `platform/capabilities.ts`, including `capabilities.passkeys`; `passkeysSupported` (compatibility alias); `recoveryRetry`. Bind `usernameInput` to the username input so autofill/passkey prefetch continues to work.
 
-Actions: `handleSubmit(event)`, `handlePasskeyLogin()`, `prefetchPasskeyOptions(username)`, `signInAsOwner()`, `forgetLocalKeys()`, `cancelLink()`. `handleSubmit` prevents default and coalesces simultaneous submissions. Hide passkey actions when `capabilities.passkeys` is false; prefetch then does nothing and login reports the unsupported error without requesting options or invoking WebAuthn, even with cached options. Passkey sign-in leaves local keys locked, as before.
+Actions: `handleSubmit(event)`, `preparePasskeyEntry()`, `handlePasskeyEntry()`, `signInAsOwner()`, `forgetLocalKeys()`, `cancelLink()`. Login prepares passkey options before the gesture and aborts conditional autofill when an explicit sign-in starts. New-device provisioning saves an encrypted unlock method before activating the device. Existing-device passkey sign-in still leaves local keys locked. See [passkey setup](../../../../docs/passkey-setup.md).
 
 W3b step order: `step` starts at `sign-in` (Username and Password only). `handleSubmit` signs in with existing keys or, after the owner/device checks, sets `step="setup"` without generating or deleting keys. `setupMethod` starts null. `useRecoveryKey()` reveals the recovery textarea; its form uses `handleSubmit`. `approveFromAnotherDevice()` starts an approval request. Both setup actions repeat the owner/device checks before replacing any keys. `backToSignIn()` clears the recovery input. The existing API verifies new-device credentials when the chosen start/recover request runs; the local setup transition does not authenticate a session. Cancel returns to setup; `retryLink()` checks the same pending request immediately and shares the poll/completion lock.
 
@@ -352,13 +352,41 @@ The presentational `ui/ActionMenu` handles desktop pointer placement and keyboar
 navigation, or the existing bottom Sheet on phones. Failed messages retain one-tap
 Retry and also offer Retry/Discard inside the common menu.
 
+Accepted senders can select Edit message on live text sent with an edit key from
+the current device. The composer
+keeps the unsent draft and timer while editing, and saves a versioned text operation
+through the existing v5 outbox. The pending edit appears in the bubble and chat
+preview. An edit receipt replaces the committed text and clears the pending change
+atomically. Plaintext lives in the v5 message record. A side record in `syncState`
+keeps the AES-GCM-wrapped edit key, sequence and latest encrypted revision through
+legacy-tab writes. Only the password-derived local key can unwrap it.
+The outbox can recover pending text after a legacy rewrite. Temporary hide blocks
+publication while edits can continue to apply. Undo restores the current text and
+any pending edit. Permanent hide, deletion and expiry clear the side record, with
+cache cleanup reconciling removals by legacy tabs. The menu keeps delete available
+during an outstanding edit. Delete for me leaves a retryable signed edit in the
+outbox for delivery until the original expires or is deleted for everyone.
+
 `message-sync` handles deletion events and sync tombstones before decryption/dedupe.
 A separate `mutationSince` / `mutationSeq` cursor consumes commit-ordered deletion
 log pages, even when the message page is empty. It persists under
 `message-mutations:<account>:<device>` after application; conversation backfills
 never advance this global cursor. Legacy sync omits the mutation stream and preserves
-original server-timestamp/id ordering. Guarded cached history is merged into the
-current store atomically, with local/live entries winning id collisions. Durable hidden/deleted markers prevent delayed ACKs, frames and persistence
+original server-timestamp/id ordering. Edit-aware sync sends `edits=1` and `editSince` and advances the
+`message-mutations-edits:<account>:<device>` key only on an edit-aware server response. Live and offline
+edits authenticate the original logical message ID, conversation, sender, device
+and edit sequence. The original send delivers the edit key under its ordinary
+encryption. Recipients use that key and the original device signature to apply
+revisions without changing any receive chain. The client ignores edit hints for
+missing originals. When an original arrives with a newer `latestEditSeq`, it
+pulls the latest revision by logical message ID. Opening a conversation and
+membership notifications reconcile cached originals in bounded batches. Edits
+received during lock are queued as ciphertext and retried after unlock.
+The highest authenticated edit sequence wins. Hidden or deleted originals suppress
+edits.
+Guarded cached history merges into the current store. Tombstones and higher
+edit sequences take precedence, and other conflicts prefer local/live entries.
+Durable hidden/deleted markers prevent delayed ACKs, frames and persistence
 from restoring content. Deletion clears legacy decrypted `fileCache` entries and local
 file keys; unmount clears active preview blobs/URLs. Conversation previews derive from
 the updated store. `useFilePreview` exposes `handleOpen`/`handleDownload`, plus action
@@ -431,3 +459,49 @@ roots are never materialized. Exact-ID deletion guards reject mismatched owners 
 Undo continuations. IDB mutations can receive that current-session guard and roll
 back stale continuations. Five-second Undo toast subscriptions survive bubble removal
 but clear on identity change or unlocked-session teardown.
+
+## History transfer integration
+
+`HistoryTransferOwner` mounts in the unlocked branch of `App.tsx` beside
+`UnlockedAppEffects`, above the route outlets. Linked devices opens
+`/devices/transfer` and its sender and receiver modes. The passkey setup
+offer can link to `/setup/history-transfer` after activation and unlock.
+The screens and shell banner share the tab-local `useHistoryTransfer` controller.
+
+`continueInBackground()` leaves an active or paused transfer running.
+`stop()` cancels it, and `resume()` retries the open transfer after a drop.
+When `requiresPairing` is true, the screens start a new pairing. The durable
+receiver checkpoint preselects unfinished chats after both devices compare
+the fresh code. `canFinalize` allows an empty manifest to acknowledge an
+entirely copied checkpoint. Prepared archives are invalidated by selected-chat
+removals and committed text edits, and a durable revision check covers delayed
+cross-tab hints.
+
+The catalog estimates local bytes before preparation. Receiver free space and
+mobile-data status travel as encrypted peer metadata. The sender measures the
+link with an encrypted 2 MiB probe, and the progress deadline advances only as
+data records are received or acknowledged. A stall drops the idle-lock hold.
+Pre-upgrade rows are eligible when the server verifies the exact envelope was
+sent by or addressed to this active device. Unverifiable message counts appear
+in the picker before sending.
+
+A transfer includes the latest committed decrypted text and its edited marker.
+Pending edits, edit keys, and signed edit envelopes stay on the source device.
+An imported message can show the edited text immediately. Editing it or
+decrypting later revisions requires an edit key the receiving device obtained
+independently through the original send. Authorship still belongs to the
+original sending device. Stickers use the same canonical rows and transfer as
+encrypted message content.
+
+The fenced IndexedDB v7 upgrade keeps wrapped keys and pending edit ciphertext
+from main's v5 layout. Edit keys for quarantined rows become available only
+after verified legacy promotion. The upgrade retains edit cursors and repair
+jobs and rebuilds the edit outbox's account-scoped indexes.
+
+QR dependencies are pinned in the web manifest. The web camera path uses
+`BarcodeDetector` when available and uses `jsqr` as its fallback. The app can
+always enter the eight English words on the sending device.
+
+## Sticker packs
+
+The chat-scoped sticker provider shares picker preferences, favourites, recents, and a timer-aware composer send callback with the picker, pack sheet, and message actions. The storage module writes per-account and device `accountState` transactions and keeps the local favourite mutation separate from any future encrypted sync. The strict token parser and synchronous `isSticker` helper also work before the lazy catalog loads. See [the sticker runtime documentation](../../../../docs/stickers.md).

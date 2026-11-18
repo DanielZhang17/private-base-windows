@@ -7,7 +7,6 @@ const { webcrypto } = await vi.importActual<{ webcrypto: Crypto }>("node:crypto"
 const state = "s".repeat(43);
 const url = `https://chat.718788.xyz/native/passkey/sign-in?state=${state}&challenge=${"c".repeat(43)}`;
 beforeEach(() => {
-  vi.stubGlobal("crypto", webcrypto);
   vi.stubGlobal("window", { __TAURI_INTERNALS__: {}, __PRIVATEBASE_NATIVE_CAPABILITIES__: { passkeyHandoff: true } });
   invoke.mockReset();
 });
@@ -63,4 +62,39 @@ it("disables a launcher whose advertised command is unavailable", async () => {
   invoke.mockRejectedValue("Command passkey_handoff_start not found");
   await expect(startPasskeyHandoff(url)).rejects.toMatchObject({ localizedMessage: { key: "nativePasskeyUnsupported" } });
   expect(capabilities.nativePasskeys).toBe(false);
+});
+
+it("gates provision URLs separately and keeps legacy sign-in after a launcher's provision rejection", async () => {
+  const provisionUrl = `${url}&mode=provision&bundleHash=${"h".repeat(43)}`;
+  expect(capabilities.nativePasskeyProvisioning).toBe(false);
+  await expect(startPasskeyHandoff(provisionUrl)).rejects.toMatchObject({ localizedMessage: { key: "nativePasskeyUnsupported" } });
+  expect(invoke).not.toHaveBeenCalled();
+  window.__PRIVATEBASE_NATIVE_CAPABILITIES__!.passkeyProvisionHandoff = true;
+  expect(capabilities.nativePasskeyProvisioning).toBe(true);
+  invoke.mockRejectedValueOnce("unsupported");
+  await expect(startPasskeyHandoff(provisionUrl)).rejects.toMatchObject({ localizedMessage: { key: "nativePasskeyUnsupported" } });
+  expect(capabilities.nativePasskeyProvisioning).toBe(false);
+  expect(capabilities.nativePasskeys).toBe(true);
+  invoke.mockResolvedValue(`privatebase://passkey?code=code&state=${state}`);
+  expect((await startPasskeyHandoff(url)).searchParams.get("code")).toBe("code");
+});
+
+it("ignores the aborted callback and releases the native command before starting again", async () => {
+  const first = new AbortController();
+  let stale!: (value: string) => void;
+  invoke.mockReturnValueOnce(new Promise<string>(resolve => { stale = resolve; }));
+  const previous = startPasskeyHandoff(url, first.signal);
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+  const closed = expect(previous).rejects.toMatchObject({ name: "AbortError" });
+  first.abort();
+  await closed;
+  const next = "n".repeat(43);
+  invoke.mockResolvedValueOnce(`privatebase://passkey?code=new&state=${next}`);
+  const restarted = startPasskeyHandoff(url.replace(state, next));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(invoke).toHaveBeenCalledOnce();
+  stale(`privatebase://passkey?code=stale&state=${state}`);
+  expect((await restarted).searchParams.get("code")).toBe("new");
+  expect(invoke).toHaveBeenCalledTimes(2);
+  expect(capabilities.nativePasskeys).toBe(true);
 });

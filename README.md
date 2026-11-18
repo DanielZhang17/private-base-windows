@@ -1,5 +1,3 @@
-> **Build mirror.** This repository is a source snapshot used only to build the Windows desktop client of Private Base on GitHub Actions. It contains the web client, the crypto packages and the Tauri shell; the server is not included. It is regenerated from the private repository and has no history.
-
 # E2EE Chat
 
 A browser-based, end-to-end encrypted chat application built on Cloudflare infrastructure. It supports 1:1 chat, group chat, encrypted file sharing, and voice/video calls with end-to-end encryption.

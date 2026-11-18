@@ -27,6 +27,21 @@ export function setupDom() {
 
 export const click = (element: Element) => act(async () => (element as HTMLElement).click());
 
+export function mockCloseRequests() {
+  let active: EventTarget | undefined;
+  class TestCloseWatcher extends EventTarget {
+    constructor() { super(); active = this; }
+    destroy() { if (active === this) active = undefined; }
+  }
+  vi.stubGlobal("CloseWatcher", TestCloseWatcher);
+  return () => act(async () => {
+    if (!active) throw new Error("No active close watcher");
+    const watcher = active;
+    active = undefined;
+    watcher.dispatchEvent(new Event("close"));
+  });
+}
+
 export const press = (key: string, init: KeyboardEventInit = {}) =>
   act(async () => {
     (document.activeElement ?? document.body).dispatchEvent(

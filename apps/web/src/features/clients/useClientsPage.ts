@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
-import { t, useLocale } from "../../i18n/index.js";
+import { useCallback, useMemo, useState, type MouseEvent } from "react";
+import { useLocale } from "../../i18n/index.js";
 import { formatDate, formatMegabytes } from "../../i18n/format.js";
 import { localized } from "../../i18n/messages.js";
 // Direct adapter imports keep the public page free of session/store modules.
@@ -60,7 +60,7 @@ export interface ClientsPageOptions {
 }
 
 /** All logic of the public /clients page: detection, manifest, formatting, copy and links. */
-export function useClientsPage({ environment, loadManifest }: ClientsPageOptions = {}) {
+export function useClientsPage({ environment, loadManifest = fetchReleaseManifest }: ClientsPageOptions = {}) {
   const { locale } = useLocale();
   const toast = useToast();
   // Evaluated once on mount (spec 2).
@@ -68,9 +68,7 @@ export function useClientsPage({ environment, loadManifest }: ClientsPageOptions
   const layout = useMemo(() => platformLayout(detected), [detected]);
   const { state, retry } = useReleaseManifest(loadManifest);
 
-  useEffect(() => { document.title = t("clients.documentTitle"); }, [locale]);
-
-  const manifest = state.status === "ready" ? state.manifest : null;
+  const manifest = state.status === "ready" ? state.data : null;
   const cards = useMemo(() => (manifest ? buildPlatformCards(manifest) : null), [manifest, locale]);
   const footer = useMemo(
     () => (manifest ? { version: manifest.version, date: formatDate(manifest.published, { dateStyle: "long" }) } : null),
@@ -107,6 +105,5 @@ export function useClientsPage({ environment, loadManifest }: ClientsPageOptions
     copyChecksum,
     onDownloadClick,
     webAppHref: WEB_APP_HREF,
-    homeHref: HOME_HREF,
   };
 }

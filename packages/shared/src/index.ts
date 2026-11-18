@@ -8,6 +8,7 @@ export * from "./types/api.js";
 export * from "./constants.js";
 export * from "./protocol.js";
 export * from "./device-links.js";
+export * from "./history-transfer.js";
 export * from "./validation.js";
 export {
   passkeyLoginOptionsSchema,

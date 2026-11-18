@@ -6,8 +6,13 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { DeviceLinkRequestSummary } from "@e2ee-chat/shared";
 import { useDevices } from "./useDevices.js";
 import { api } from "../../services/api.js";
+import { signWithIdentityKey } from "../../lib/key-manager.js";
 vi.mock("../../services/api.js", () => ({ api: { get: vi.fn(), post: vi.fn(), delete: vi.fn() } }));
-vi.mock("../../stores/authStore.js", () => ({ useAuthStore: (select: (state: unknown) => unknown) => select({ device: { id: "this-device" } }) }));
+vi.mock("../../stores/authStore.js", async () => {
+  const { create } = await import("zustand");
+  return { useAuthStore: create(() => ({ device: { id: "this-device" } })) };
+});
+vi.mock("../../lib/key-manager.js", () => ({ signWithIdentityKey: vi.fn(async () => "device-signature") }));
 vi.mock("../../lib/device-link.js", () => ({ generateRecoveryKey: () => "secret", signDeviceLinkApproval: vi.fn(async () => "signature") }));
 let root: Root;
 let state: ReturnType<typeof useDevices>;
@@ -52,4 +57,20 @@ it("requires removal confirmation and retains the target after failure", async (
   vi.mocked(api.delete).mockRejectedValueOnce(new Error("Still linked")); await act(async () => { await state.confirmRemoveDevice(); });
   expect(state.removeError).toBe("Failed to remove device\nStill linked"); expect(state.removalTarget?.id).toBe("other");
   await act(async () => { await state.confirmRemoveDevice(); }); expect(state.removalTarget).toBeNull();
+});
+
+it("signs a new challenge for the selected device before every removal attempt", async () => {
+  await render();
+  await act(async () => state.handleRemoveDevice("other"));
+  expect(api.post).not.toHaveBeenCalled();
+  vi.mocked(api.post).mockResolvedValueOnce({ challengeId: "first" }).mockResolvedValueOnce({ challengeId: "second" });
+  vi.mocked(api.delete).mockRejectedValueOnce(new Error("lost response"));
+  await act(async () => { expect(await state.confirmRemoveDevice()).toBe(false); });
+  await act(async () => { expect(await state.confirmRemoveDevice()).toBe(true); });
+  expect(api.post).toHaveBeenNthCalledWith(1, "/api/devices/other/remove-options");
+  expect(api.post).toHaveBeenNthCalledWith(2, "/api/devices/other/remove-options");
+  expect(signWithIdentityKey).toHaveBeenLastCalledWith(JSON.stringify([
+    "privatebase-device-action-v1", "remove_device", JSON.stringify(["this-device", "other"]), "second",
+  ]));
+  expect(api.delete).toHaveBeenLastCalledWith("/api/devices/other", { challengeId: "second", signature: "device-signature" });
 });

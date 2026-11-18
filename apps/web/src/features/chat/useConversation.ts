@@ -30,16 +30,21 @@ import {
   ingestMessageFrame,
   handleMessageDeletion,
   loadOlderPersistedConversationMessages,
-  loadPersistedConversationMessages,
+  loadPersistedConversationMessages, refreshImportedConversationMessages, restoreVerifiedLegacyHistory,
   syncConversationMessages,
+  ingestMessageEdit,
 } from "../../lib/message-sync.js";
 
 import { supportsE2EECalling } from "../../services/webrtc.js";
 import { E2EECallUnsupportedError } from "../../platform/calls.js";
+import { subscribeHistoryImports } from "../../lib/local-message-changes.js";
+import { messageVisibleToAccount } from "../../lib/message-account.js";
+import { linkedDeviceTime, predatesDeviceLink } from "./presentation.js";
 
-function persistMessage(message: DecryptedMessage): Promise<void> {
+function persistMessage(message: DecryptedMessage, ownerId?: string): Promise<void> {
   return saveMessage({
     id: message.id,
+    ownerId: message.ownerId,
     conversationId: message.conversationId,
     senderId: message.senderId,
     type: message.type,
@@ -50,7 +55,7 @@ function persistMessage(message: DecryptedMessage): Promise<void> {
     status: message.status,
     deletedAt: message.deletedAt,
     deletedByUserId: message.deletedByUserId,
-  });
+  }, undefined, ownerId);
 }
 
 function getConversationName(conversation: ConversationWithMembers | undefined, localUserId: string | undefined): string {
@@ -76,6 +81,8 @@ export function useConversation() {
   const { conversationId } = useParams<{ conversationId: string }>();
   const navigate = useNavigate();
   const user = useAuthStore((state) => state.user);
+  const deviceId = useAuthStore((state) => state.device?.id);
+  const linkedAt = useAuthStore(({ device }) => linkedDeviceTime(device));
   const messages = useChatStore((state) => state.messages);
   const outgoingRemoved = useChatStore((state) => !!conversationId && state.outgoingRemovalNotices.has(conversationId));
   const dismissOutgoingRemoval = () => {
@@ -108,6 +115,7 @@ export function useConversation() {
   const [updatingInvitePolicy, setUpdatingInvitePolicy] = useState(false);
   const [deletingConversation, setDeletingConversation] = useState(false);
   const [hasOlderCachedMessages, setHasOlderCachedMessages] = useState(false);
+  const [legacyHistoryNotice, setLegacyHistoryNotice] = useState<{ conversationId: string; userId: string; pending: number }>();
   const [loadingOlderCachedMessages, setLoadingOlderCachedMessages] = useState(false);
   const queryClient = useQueryClient();
   const conversationEpoch = useRef(0);
@@ -151,6 +159,19 @@ export function useConversation() {
     }
   }, [conversation]);
 
+  useEffect(() => {
+    if (!conversation || !user?.id) return;
+    const userId = user.id;
+    let current = true;
+    void restoreVerifiedLegacyHistory(conversation, () => current).then(async (pending) => {
+      if (!current || pending === undefined) return;
+      setLegacyHistoryNotice({ conversationId: conversation.id, userId, pending });
+      const refreshed = await refreshImportedConversationMessages(conversation.id);
+      if (current) setHasOlderCachedMessages(refreshed.hasOlder);
+    }).catch(() => undefined);
+    return () => { current = false; };
+  }, [conversation, user?.id]);
+
   const clearUnread = useChatStore((s) => s.clearUnread);
 
   useEffect(() => {
@@ -163,13 +184,23 @@ export function useConversation() {
     previousLastMessageIdRef.current = null;
 
     let cancelled = false;
+    let pageLoads = Promise.resolve();
+    const reloadCachedPage = (imported = false) => {
+      const next = pageLoads.then(async () => {
+        if (cancelled) return;
+        const persisted = await (imported ? refreshImportedConversationMessages : loadPersistedConversationMessages)(conversationId);
+        if (!cancelled) setHasOlderCachedMessages(persisted.hasOlder);
+      });
+      pageLoads = next.catch(() => undefined);
+      return next;
+    };
+    const unsubscribe = subscribeHistoryImports(conversationId, () => {
+      void reloadCachedPage(true).catch((error) => console.error("Failed to refresh imported history", error));
+    });
     void (async () => {
       try {
-        const persisted = await loadPersistedConversationMessages(conversationId);
-        if (!cancelled) {
-          setHasOlderCachedMessages(persisted.hasOlder);
-        }
-        await syncConversationMessages(conversationId);
+        await reloadCachedPage();
+        if (!cancelled) await syncConversationMessages(conversationId);
       } catch (error) {
         console.error("Failed to initialize conversation messages", error);
       }
@@ -191,6 +222,7 @@ export function useConversation() {
 
     return () => {
       cancelled = true;
+      unsubscribe();
       conversationEpoch.current += 1;
       if (scrollFrame.current !== null) window.cancelAnimationFrame(scrollFrame.current);
       viewport?.removeEventListener("scroll", handleMessagesScroll);
@@ -198,7 +230,7 @@ export function useConversation() {
       setLoadingOlderCachedMessages(false);
       setActiveConversation(null);
     };
-  }, [conversationId, setActiveConversation, clearUnread]);
+  }, [conversationId, setActiveConversation, clearUnread, user?.id]);
 
   useEffect(() => {
     if (!conversationId) return;
@@ -209,11 +241,14 @@ export function useConversation() {
     try {
       ws = createChatWebSocket(conversationId, (frame) => {
         if (frame.type === "message") {
-          void ingestMessageFrame({ ...frame, conversationId });
+          void ingestMessageFrame({ ...frame, conversationId }).catch(() => syncConversationMessages(conversationId).catch(() => undefined));
           return;
         }
         if (frame.type === "message_event") {
           void handleMessageDeletion(frame.payload);
+          if (frame.payload.edit?.conversationId === conversationId) {
+            void ingestMessageEdit(frame.payload.edit).catch(() => syncConversationMessages(conversationId).catch(() => undefined));
+          }
           return;
         }
         if (frame.type === "typing") {
@@ -229,10 +264,10 @@ export function useConversation() {
               timestamp: frame.serverTimestamp,
               status: "sent",
             };
-            void guardMessageForPublish(normalizedMessage).then((visible) => {
+            void guardMessageForPublish(normalizedMessage, session.user?.id ?? null).then((visible) => {
               const current = useAuthStore.getState();
               if (disposed || current.user?.id !== session.user?.id || current.device?.id !== session.device?.id || current.sessionId !== session.sessionId) return;
-              if (visible) { addMessage(conversationId, visible); void persistMessage(visible); }
+              if (visible) { addMessage(conversationId, visible); void persistMessage(visible, session.user?.id); }
               else useChatStore.getState().removeMessages([frame.messageId]);
             }).catch(() => undefined);
           } else {
@@ -256,7 +291,10 @@ export function useConversation() {
     };
   }, [conversationId, removeConnection, setConnection, updateMessageStatus]);
 
-  const conversationMessages = conversationId ? messages.get(conversationId) || [] : [];
+  const conversationMessages = useMemo(() => {
+    const cached = conversationId ? messages.get(conversationId) : undefined;
+    return cached?.filter((message) => messageVisibleToAccount(message, user?.id ?? null)) ?? [];
+  }, [conversationId, messages, user?.id]);
   const typingUsers = useChatStore((state) => conversationId ? state.typingUsers.get(conversationId) : undefined);
   const typingNames = useMemo(() => {
     if (!typingUsers || typingUsers.size === 0 || !conversation) return null;
@@ -301,6 +339,8 @@ export function useConversation() {
   const isGroupAdmin = conversation?.type === "group" && conversation.members.find((m) => m.userId === user?.id)?.role === "admin";
   const myMembership = conversation?.members.find((m) => m.userId === user?.id);
   const isPendingRequest = myMembership?.acceptedAt === null;
+  // Pending group members can receive messages before accepting the invitation.
+  const showHistoryGuidance = linkedAt !== undefined && !!conversation && predatesDeviceLink(conversation, linkedAt, myMembership?.joinedAt);
   const existingMemberIds = useMemo(
     () => new Set(conversation?.members.map((m) => m.userId) ?? []),
     [conversation?.members],
@@ -409,7 +449,7 @@ export function useConversation() {
     } catch (error: any) { setNotice(toErrorMessage(error, "failedToDeclineRequest")); }
   };
 
-  const { handleSend, handleSendFile, outgoing, retry, discard, sendError } = useSendMessage(conversation);
+  const { handleSend, handleSendFile, handleEdit, outgoing, retry, discard, sendError } = useSendMessage(conversation);
 
   const handleStartCall = async (callType: "audio" | "video") => {
     if (!conversationId || !conversation || !user || conversation.type !== "direct") return;
@@ -533,6 +573,8 @@ export function useConversation() {
   const handleMembersAdded = () => { void queryClient.invalidateQueries({ queryKey: ["conversation", conversationId] }); };
 
   return {
+    deviceId,
+    showHistoryGuidance,
     conversationLoading,
     conversationError: (conversationError ? translateError(conversationError) : undefined),
     outgoing,
@@ -572,6 +614,8 @@ export function useConversation() {
     updatingInvitePolicy,
     deletingConversation,
     hasOlderCachedMessages,
+    hasUnverifiedLegacyHistory: legacyHistoryNotice?.conversationId === conversationId
+      && legacyHistoryNotice?.userId === user?.id && (legacyHistoryNotice?.pending ?? 0) > 0,
     loadingOlderCachedMessages,
     handleMembersAdded,
     handleUpdateInvitePolicy,
@@ -595,6 +639,7 @@ export function useConversation() {
     handleDeclineRequest,
     handleSend,
     handleSendFile,
+    handleEdit,
     handleStartCall
   };
 }

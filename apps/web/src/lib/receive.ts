@@ -1,4 +1,5 @@
 import type { SenderKeyHeader } from "@e2ee-chat/shared";
+import type { EditKeyToOpen } from "@e2ee-chat/crypto";
 import { commitReceivedMessage, type LocalSession, type ReceiveEffects, type LocalSenderKey } from "../db/index.js";
 
 export interface ReceiveState {
@@ -9,10 +10,13 @@ export interface ReceiveState {
 
 export interface ReceiveContext {
   messageId: string;
+  ownerId?: string;
+  deviceId?: string;
   /** Ingestion owns this peer lock through classification and commit. */
   lockedSession?: string;
   stage?: (state: ReceiveState) => void;
   beforeGroupDecrypt?: (header: SenderKeyHeader) => Promise<void>;
+  editKey?: EditKeyToOpen;
   prepare: (plaintext: Uint8Array) => Promise<ReceiveEffects>;
 }
 
@@ -62,7 +66,7 @@ export async function finishReceive(
 ): Promise<Uint8Array | null> {
   receive.stage?.(state);
   const effects = await receive.prepare(plaintext);
-  return await commitReceivedMessage(receive.messageId, effects, state) ? plaintext : null;
+  return await commitReceivedMessage(receive.messageId, { ...effects, ownerId: effects.ownerId ?? receive.ownerId, deviceId: receive.deviceId }, state) ? plaintext : null;
 }
 
 const sessionLocks = new Map<string, Promise<unknown>>();

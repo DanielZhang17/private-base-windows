@@ -128,3 +128,33 @@ it.each([false, true])("stops reconnecting on 4403 (opened=%s)", async (opened) 
   expect(vi.getTimerCount()).toBe(0);
   socket.dispose();
 });
+
+it.each(["passkey_signin", "recovery_signin", "approval_disabled"] as const)("exposes %s to the app-shell alert subscriber", (kind) => {
+  const onDeviceAlert = vi.fn();
+  const socket = createNotificationWebSocket({ ...callbacks(), onDeviceAlert });
+  const payload = { alertId: "alert", deviceId: "device", deviceName: "Laptop", platform: "web", kind, at: 1 };
+  latest().onmessage?.({ data: JSON.stringify({ type: "device.alert", payload }) });
+  expect(onDeviceAlert).toHaveBeenCalledExactlyOnceWith(payload);
+  socket.dispose();
+});
+
+it("delivers the scoped device revocation frame", async () => {
+  const onDeviceRevoked = vi.fn();
+  const socket = createNotificationWebSocket({ onCallEvent: vi.fn(), onConversationEvent: vi.fn(), onMessageEvent: vi.fn(),
+    onProfileEvent: vi.fn(), onDeviceRevoked });
+  const frame = { type: "device.revoked", deviceId: "old", replacementDeviceName: "New laptop" };
+  latest().onmessage?.({ data: JSON.stringify(frame) });
+  expect(onDeviceRevoked).toHaveBeenCalledOnce();
+  expect(onDeviceRevoked).toHaveBeenCalledWith(frame);
+  socket.dispose();
+});
+
+it("routes acknowledgement as a refresh without delivering another device alert", () => {
+  const onDeviceAlert = vi.fn();
+  const onDeviceAlertAcknowledged = vi.fn();
+  const socket = createNotificationWebSocket({ ...callbacks(), onDeviceAlert, onDeviceAlertAcknowledged });
+  latest().onmessage?.({ data: JSON.stringify({ type: "device.alert.acknowledged", alertId: "alert" }) });
+  expect(onDeviceAlertAcknowledged).toHaveBeenCalledOnce();
+  expect(onDeviceAlert).not.toHaveBeenCalled();
+  socket.dispose();
+});

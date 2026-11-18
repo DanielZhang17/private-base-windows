@@ -155,6 +155,7 @@ export interface SendDirectBatchRequest {
 }
 
 export interface SendMessageResponse {
+  editKeyAccepted?: boolean;
   deleted?: boolean;
   deletedAt?: number;
   deletedByUserId?: string;
@@ -165,6 +166,7 @@ export interface SendMessageResponse {
 }
 
 export interface SendDirectBatchResponse {
+  editKeyAccepted?: boolean;
   deleted?: boolean;
   deletedAt?: number;
   deletedByUserId?: string;
@@ -295,19 +297,20 @@ export interface PasskeyRegistrationOptionsResponse {
       requireResidentKey?: boolean;
       userVerification: string;
     };
-    extensions?: { credProps: boolean };
+    extensions?: { credProps?: boolean };
     excludeCredentials: { id: string; type: "public-key"; transports?: string[] }[];
   };
 }
 
 export interface PasskeyRegisterRequest {
+  deviceSignature: string;
   challengeId: string;
   credential: unknown;
   friendlyName: string;
 }
 
 export type PasskeyLoginOptionsRequest =
-  | { username: string; deviceId: string }
+  | { username?: string; deviceId: string }
   | { handoff: { codeChallenge: string } };
 
 export interface PasskeyLoginOptionsResponse {

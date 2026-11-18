@@ -1,27 +1,37 @@
 import { act, useImperativeHandle } from "react";
-import { getByRole, queryByRole, waitFor } from "@testing-library/dom";
+import { createPortal } from "react-dom";
+import { getAllByRole, getByRole, queryByRole, waitFor } from "@testing-library/dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { DecryptedMessage } from "@e2ee-chat/shared";
 import MessageBubble from "./MessageBubble.js";
 import { ToastProvider } from "../../ui/index.js";
 import { click, press, setupDom } from "../../ui/test-utils.js";
-import { getAppDB, getMessageById, saveMessage } from "../../db/index.js";
+import { getAppDB, messageHideKey, getMessageById, saveMessage as writeOwnedMessage } from "../../db/index.js";
 import { useChatStore } from "../../stores/chatStore.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { api } from "../../services/api.js";
 import { discardOutgoing } from "../../features/chat/outgoingQueue.js";
 import type { FilePreviewActions } from "./FilePreview.js";
 import type { Ref } from "react";
+import { mockSpriteIO, spriteBase, spriteResponse } from "../../features/stickers/pack-assets.test-utils.js";
+import { StickerProvider, useStickerPicker } from "../../features/stickers/useStickerPicker.js";
 import { capabilities } from "../../platform/capabilities.js";
+import * as format from "../../i18n/format.js";
+
+const saveMessage = (row: Parameters<typeof writeOwnedMessage>[0], current?: () => boolean, ownerId = row.ownerId ?? "alice") =>
+  writeOwnedMessage(row, current, ownerId);
 
 vi.mock("./InlineEmojiText.js", () => ({ default: ({ content }: { content: string }) => <span>{content}</span> }));
 const openFile = vi.fn();
 const saveFile = vi.fn();
+let showFilePortal = false;
 let reportSaveUnsupported: ((unsupported: boolean) => void) | undefined;
 vi.mock("./FilePreview.js", () => ({ default: ({ actionsRef, onSaveUnsupportedChange }: { actionsRef: Ref<FilePreviewActions>; onSaveUnsupportedChange?: (unsupported: boolean) => void }) => {
   reportSaveUnsupported = onSaveUnsupportedChange;
   useImperativeHandle(actionsRef, () => ({ open: openFile, save: saveFile }));
-  return <button onClick={openFile}>Attachment</button>;
+  return <><button onClick={openFile}>Attachment</button>
+    {showFilePortal && createPortal(<button type="button">File viewer control</button>, document.body)}
+  </>;
 } }));
 vi.mock("../../services/api.js", () => ({ api: { delete: vi.fn() } }));
 vi.mock("../../features/chat/outgoingQueue.js", () => ({ discardOutgoing: vi.fn() }));
@@ -30,11 +40,30 @@ vi.mock("../../stores/authStore.js", async () => {
   return { useAuthStore: create(() => ({ user: { id: "alice" }, device: { id: "device" }, sessionId: "session" })) };
 });
 const dom = setupDom();
+let spriteIO: ReturnType<typeof mockSpriteIO>;
+beforeEach(() => { spriteIO = mockSpriteIO({ catalog: true }); });
 const message: DecryptedMessage = { id: "message", conversationId: "conv", senderId: "alice", type: "text", content: "Private text", timestamp: 100, expiresAt: Date.now() + 60_000, expiryKind: "retention", status: "sent" };
 const fileContent = JSON.stringify({ fileId: "file", fileName: "notes.txt", mimeType: "text/plain", fileKey: "secret", iv: "secret-iv" });
 async function render(overrides: Partial<DecryptedMessage> = {}, own = true) {
   await dom.render(<ToastProvider><MessageBubble message={{ ...message, ...overrides }} isOwn={own} onRetry={vi.fn()} onDiscard={overrides.status === "sending" || overrides.status === "failed" ? vi.fn() : undefined} /></ToastProvider>);
 }
+
+it.each([true, false])("marks optimistic edits as pending until committed, including grouped bubbles (showMeta=%s)", async (showMeta) => {
+  const update = (pendingEdit: DecryptedMessage["pendingEdit"], content: string) =>
+    dom.render(<ToastProvider><MessageBubble message={{ ...message, status: "delivered", editedAt: 10, pendingEdit, content }} isOwn showMeta={showMeta} /></ToastProvider>);
+  await update({ id: "edit", content: "Next revision" }, "Prior revision");
+  const article = () => getByRole(dom.container(), "article");
+  expect(article().textContent).toContain("Next revision");
+  expect(article().textContent).toContain("Edit pending");
+  expect(article().textContent).not.toContain("Edited");
+  expect(article().textContent).not.toContain("Delivered");
+  expect(article().getAttribute("aria-label")).toContain("Edit pending");
+
+  await update(null, "Next revision");
+  expect(article().textContent).toContain("Edited");
+  expect(article().textContent).not.toContain("Edit pending");
+  expect(article().textContent?.includes("Delivered")).toBe(showMeta);
+});
 function pointer(type: string, x = 10, y = 10) {
   return act(async () => {
     const event = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y });
@@ -233,7 +262,7 @@ it("deletes sent messages without a dialog and offers a five-second Undo", async
   await click(getByRole(document.body, "button", { name: "Message actions" }));
   await click(getByRole(document.body, "menuitem", { name: "Delete for me" }));
   expect(queryByRole(document.body, "alertdialog")).toBeNull();
-  await act(async () => { await waitFor(async () => expect(await (await getAppDB()).get("syncState", "hidden-message:" + message.id)).toHaveProperty("undoToken")); });
+  await act(async () => { await waitFor(async () => expect(await (await getAppDB()).get("accountState", messageHideKey(message.id, "alice"))).toHaveProperty("undoToken")); });
   expect(document.body.textContent).toContain("Message deleted for you");
   expect(useChatStore.getState().messages.get("conv")).toEqual([]);
   expect(await getMessageById(message.id)).toBeDefined();
@@ -361,14 +390,14 @@ it.each(["outbox-read", "save", "hide"])("rejects an account switch during the d
     useAuthStore.setState({ user: { id: "bob" }, device: { id: "bob-device" }, sessionId: "new-login" } as never);
     const db = await getAppDB();
     for (const name of Array.from(db.objectStoreNames)) await db.clear(name);
-    const newAccountMessage = { ...message, senderId: "bob", content: "new account private" };
+    const newAccountMessage = { ...message, ownerId: "bob", senderId: "bob", content: "new account private" };
     await database.saveMessage(newAccountMessage);
     useChatStore.setState({ messages: new Map([["conv", [newAccountMessage]]]) });
     resume();
     await pendingDelete;
   });
   expect(await getMessageById(message.id)).toMatchObject({ senderId: "bob", content: "new account private" });
-  expect(await (await getAppDB()).get("syncState", "hidden-message:" + message.id)).toBeUndefined();
+  expect(await (await getAppDB()).get("accountState", messageHideKey(message.id, "alice"))).toBeUndefined();
   expect(queryByRole(document.body, "button", { name: "Undo" })).toBeNull();
   expect(useChatStore.getState().messages.get("conv")?.[0]).toMatchObject({ senderId: "bob", content: "new account private" });
 });
@@ -390,7 +419,7 @@ it.each(["sign-out", "account", "device", "session"])("clears pending Undo toast
   await saveMessage(message);
   await render(); await click(getByRole(document.body, "button", { name: "Message actions" }));
   await click(getByRole(document.body, "menuitem", { name: "Delete for me" }));
-  await act(async () => { await waitFor(async () => expect(await (await getAppDB()).get("syncState", "hidden-message:" + message.id)).toHaveProperty("undoToken")); });
+  await act(async () => { await waitFor(async () => expect(await (await getAppDB()).get("accountState", messageHideKey(message.id, "alice"))).toHaveProperty("undoToken")); });
   expect(getByRole(document.body, "button", { name: "Undo" })).toBeDefined();
   // Keep a second Undo closure to exercise the DB restore guard directly.
   await saveMessage({ ...message, id: "second" });
@@ -403,7 +432,7 @@ it.each(["sign-out", "account", "device", "session"])("clears pending Undo toast
   });
   expect(queryByRole(document.body, "button", { name: "Undo" })).toBeNull();
   expect(await undo!()).toBe(false);
-  expect(await (await getAppDB()).get("syncState", "hidden-message:second")).toBeDefined();
+  expect(await (await getAppDB()).get("accountState", messageHideKey("second", "alice"))).toBeDefined();
 });
 it("rejects an identity change while Undo's DB restore is awaiting", async () => {
   const database = await import("../../db/index.js");
@@ -419,7 +448,7 @@ it("rejects an identity change while Undo's DB restore is awaiting", async () =>
   useAuthStore.setState({ sessionId: "changed-during-undo" } as never);
   resume();
   expect(await restoring).toBe(false);
-  expect(await (await getAppDB()).get("syncState", "hidden-message:" + message.id)).toBeDefined();
+  expect(await (await getAppDB()).get("accountState", messageHideKey(message.id, "alice"))).toBeDefined();
   expect(useChatStore.getState().messages.get("conv") ?? []).toEqual([]);
 });
 
@@ -439,5 +468,150 @@ it("rejects a stale queued-message confirmation during its outbox read", async (
   await act(async () => { useAuthStore.setState({ sessionId: "changed-during-discard" } as never); resume(); await gate; });
   expect(discardOutgoing).not.toHaveBeenCalled();
   expect((await getMessageById(message.id))?.content).toBe(message.content);
-  expect(await (await getAppDB()).get("syncState", "hidden-message:" + message.id)).toBeUndefined();
+  expect(await (await getAppDB()).get("accountState", messageHideKey(message.id, "alice"))).toBeUndefined();
+});
+
+const stickerBody = "[[sticker:genshin:genshin_hoyolab_21]]";
+
+it("restores both mounted sticker messages after retrying their shared catalog", async () => {
+  const unavailable = vi.fn(() => { throw new Error("Catalog chunk unavailable"); });
+  vi.doMock("../../features/stickers/catalog.runtime.json", unavailable);
+  try {
+    await dom.render(<ToastProvider>
+      <MessageBubble message={{ ...message, content: stickerBody }} isOwn={false} />
+      <MessageBubble message={{ ...message, id: "second", content: "[[sticker:genshin:genshin_hoyolab_22]]" }} isOwn={false} />
+    </ToastProvider>);
+    const name = "Sticker did not load. Select to try again.";
+    const retries = await waitFor(() => {
+      const buttons = getAllByRole(dom.container(), "button", { name });
+      expect(buttons).toHaveLength(2);
+      return buttons;
+    });
+    expect(unavailable).toHaveBeenCalledOnce();
+    expect(spriteIO.network).not.toHaveBeenCalled();
+    vi.doUnmock("../../features/stickers/catalog.runtime.json");
+    await click(retries[0]);
+    await waitFor(() => expect(dom.container().querySelectorAll(".sticker-message .sticker-art[style]")).toHaveLength(2));
+    expect(queryByRole(dom.container(), "button", { name })).toBeNull();
+    expect(spriteIO.network).toHaveBeenCalledOnce();
+  } finally { vi.doUnmock("../../features/stickers/catalog.runtime.json"); }
+});
+
+it("does not rerender text, file, or sticker bubbles when the picker page and tab change", async () => {
+  function PickerControls() {
+    const picker = useStickerPicker()!;
+    return <>
+      <button onClick={() => void picker.change((state) => ({ ...state, page: "genshin-2", tab: "stickers" }))}>Browse next pack</button>
+      <button onClick={() => void picker.change((state) => ({ ...state, tab: "custom" }))}>Switch picker tab</button>
+      <output>{picker.state.page} {picker.state.tab}</output>
+    </>;
+  }
+  const formatTime = vi.spyOn(format, "formatTime");
+  await dom.render(<ToastProvider><StickerProvider>
+    <MessageBubble message={message} isOwn={false} />
+    <MessageBubble message={{ ...message, id: "file", timestamp: 200, type: "file", content: fileContent }} isOwn={false} />
+    <MessageBubble message={{ ...message, id: "sticker", timestamp: 300, content: stickerBody }} isOwn={false} />
+    <PickerControls />
+  </StickerProvider></ToastProvider>);
+  await waitFor(() => expect(dom.container().querySelector(".sticker-message .sticker-art[style]")).toBeTruthy());
+  for (const timestamp of [message.timestamp, 200, 300]) expect(formatTime).toHaveBeenCalledWith(timestamp);
+  formatTime.mockClear();
+  await click(getByRole(dom.container(), "button", { name: "Browse next pack" }));
+  await waitFor(() => expect(dom.container().querySelector("output")?.textContent).toBe("genshin-2 stickers"));
+  await click(getByRole(dom.container(), "button", { name: "Switch picker tab" }));
+  await waitFor(() => expect(dom.container().querySelector("output")?.textContent).toBe("genshin-2 custom"));
+  expect(formatTime).not.toHaveBeenCalled();
+
+  const sticker = dom.container().querySelector(".sticker-message")!.closest("article")!;
+  const more = getByRole(sticker, "button", { name: "Message actions" });
+  await click(more);
+  await click(getByRole(document.body, "menuitem", { name: "Add to favourites" }));
+  await waitFor(() => expect(getByRole(document.body, "region", { name: "Notifications" }).textContent).toContain("Added to favourites"));
+  await click(more);
+  expect(getByRole(document.body, "menuitem", { name: "Remove from favourites" })).toBeTruthy();
+});
+
+it("shows a known sticker outside the bubble with a full-size pack sprite and delivery pill", async () => {
+  const content = "[[sticker:genshin:genshin_hoyolab_26]]";
+  await dom.render(<ToastProvider><MessageBubble message={{ ...message, content, status: "read" }} isOwn onEdit={vi.fn()} /></ToastProvider>);
+  const image = await waitFor(() => {
+    const art = dom.container().querySelector<HTMLElement>(".sticker-message .sticker-art[style]");
+    expect(art).not.toBeNull();
+    return art!;
+  });
+  expect(image.style.backgroundImage).toContain("blob:sticker-full");
+  expect(image.style.backgroundPosition).toBe("33.333333333333336% 33.333333333333336%");
+  expect(spriteIO.network).toHaveBeenCalledExactlyOnceWith(`${spriteBase}/packs/full/genshin-1.webp`, expect.objectContaining({
+    mode: "cors", credentials: "omit", referrerPolicy: "no-referrer",
+  }));
+  const alt = "Sticker 6 of 16, Paimon's Paintings 1";
+  expect(image.getAttribute("aria-label")).toBe(alt);
+  expect(dom.container().querySelector(".bubble")).toBeNull();
+  expect(dom.container().querySelector(".sticker-meta")?.textContent).toContain("Read");
+  expect(dom.container().querySelector("article")?.getAttribute("aria-label")).toContain(alt);
+  await click(getByRole(document.body, "button", { name: /open sticker pack/i }));
+  const pack = getByRole(document.body, "dialog", { name: "Paimon's Paintings 1" });
+  expect(queryByRole(pack, "button", { name: "Send sticker" })).toBeNull();
+  await press("Escape");
+  await click(getByRole(document.body, "button", { name: "Message actions" }));
+  expect(getByRole(document.body, "menuitem", { name: "View sticker pack" })).toBeDefined();
+  expect(queryByRole(document.body, "menuitem", { name: "Edit message" })).toBeNull();
+  expect(queryByRole(document.body, "menuitem", { name: "Copy text" })).toBeNull();
+});
+
+it("keeps artwork reload and failed delivery retry separate and counts down mid-run", async () => {
+  const retry = vi.fn();
+  spriteIO.network.mockResolvedValueOnce(new Response(null, { status: 503 }));
+  const expiresAt = Date.now() + 50_000;
+  await dom.render(<ToastProvider><MessageBubble message={{ ...message, content: stickerBody, status: "failed", expiryKind: "timed", expiresAt }}
+    isOwn showMeta={false} onRetry={retry} /></ToastProvider>);
+  const reload = await waitFor(() => getByRole(document.body, "button", { name: "Sticker did not load. Select to try again." }));
+  await act(async () => window.dispatchEvent(new Event("online")));
+  expect(spriteIO.network.mock.calls.map(([url]) => url)).toEqual([`${spriteBase}/packs/full/genshin-1.webp`]);
+  expect(reload.querySelector(".sticker-art[style]")).toBeNull();
+  expect(dom.container().querySelector("[aria-label^='Expires in']")).toBeTruthy();
+  expect(dom.container().querySelector(".sticker-send-failed")?.textContent).toContain("Not sent·Retry");
+  await click(reload);
+  expect(retry).not.toHaveBeenCalled();
+  expect(spriteIO.network.mock.calls.map(([url]) => url)).toEqual(Array(2).fill(`${spriteBase}/packs/full/genshin-1.webp`));
+  await click(getByRole(document.body, "button", { name: /^Retry$/ }));
+  expect(retry).toHaveBeenCalledTimes(1);
+});
+
+it("renders a timed countdown mid-run for a successfully sent sticker", async () => {
+  await dom.render(<ToastProvider><MessageBubble isOwn showMeta={false}
+    message={{ ...message, content: stickerBody, expiryKind: "timed", expiresAt: Date.now() + 20_000 }} /></ToastProvider>);
+  expect(dom.container().querySelector(".sticker-meta [aria-label^='Expires in']")).toBeTruthy();
+  expect(dom.container().querySelector(".sticker-meta time")).toBeNull();
+});
+
+it("renders unknown sticker IDs as legacy text", async () => {
+  const unknown = "[[sticker:genshin:genshin_hoyolab_999999]]";
+  await render({ content: unknown });
+  expect(dom.container().querySelector(".bubble")?.textContent).toBe(unknown);
+  expect(dom.container().querySelector(".sticker-message")).toBeNull();
+});
+
+it.each(["undecodable bytes", "a different pack"])("shows the retry placeholder for %s without a thumbnail or per-sticker request", async (failure) => {
+  if (failure === "a different pack") spriteIO.network.mockResolvedValueOnce(spriteResponse(`${spriteBase}/packs/full/genshin-2.webp`));
+  else spriteIO.decode.mockRejectedValueOnce(new Error("Invalid sprite"));
+  await render({ content: stickerBody });
+  const placeholder = await waitFor(() => getByRole(document.body, "button", { name: "Sticker did not load. Select to try again." }));
+  expect(placeholder.querySelector(".sticker-art[style], img[src]")).toBeNull();
+  expect(spriteIO.network.mock.calls.map(([url]) => url)).toEqual([`${spriteBase}/packs/full/genshin-1.webp`]);
+  await click(placeholder);
+  await waitFor(() => expect(dom.container().querySelector(".sticker-message .sticker-art[style]")).toBeTruthy());
+});
+
+it("ignores context-menu keyboard events from a file viewer portal", async () => {
+  showFilePortal = true;
+  try {
+    await render({ type: "file", content: fileContent });
+    getByRole(document.body, "button", { name: "File viewer control" }).focus();
+    await press("F10", { shiftKey: true });
+    expect(queryByRole(document.body, "menu")).toBeNull();
+    getByRole(dom.container(), "button", { name: "Attachment" }).focus();
+    await press("F10", { shiftKey: true });
+    expect(getByRole(document.body, "menu")).toBeTruthy();
+  } finally { showFilePortal = false; }
 });

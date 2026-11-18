@@ -4,8 +4,12 @@ import type { CallEventPayload, ConversationWithMembers } from "@e2ee-chat/share
 import { api } from "../../services/api.js";
 import { createNotificationWebSocket } from "../../services/notifications.js";
 import { commitAbandonedMessageHides, getAppDB, cleanupExpiredFileCache, cleanupExpiredPendingCalls, deletePendingCall, getPendingCall } from "../../db/index.js";
-import { startLocalHiddenMessageSync, handleMessageDeletion, pruneExpiredPlaintext, resetMessageSyncState, syncMessages, runUnlockSync } from "../../lib/message-sync.js";
+import { startLocalHiddenMessageSync, handleMessageDeletion, pruneExpiredPlaintext, reconcileConversationEdits, resetMessageSyncState, syncMessages, runUnlockSync } from "../../lib/message-sync.js";
 import { requestNotificationPermission } from "../../lib/browser-notifications.js";
+import { notify } from "../../platform/notifications.js";
+import { navigate } from "../../platform/navigation.js";
+import { endRevokedDeviceSession } from "../../services/device-session.js";
+import { deviceAlertDestination, publishDeviceAlertsChanged } from "../../services/device-alerts.js";
 import { isNative } from "../../platform/environment.js";
 import { refreshConversationList } from "../../lib/conversation-cache.js";
 import { useAuthStore } from "../../stores/authStore.js";
@@ -15,6 +19,7 @@ import { useChatStore } from "../../stores/chatStore.js";
 import { useConnectionStore } from "../../stores/connectionStore.js";
 import { startBackgroundSession } from "../../platform/android-background-service.js";
 import { registerUnlockedSessionCleanup } from "../../platform/session-cleanup.js";
+import { refreshOutgoingQueue } from "../../features/chat/outgoingQueue.js";
 
 function getConversationName(conversation: ConversationWithMembers, localUserId: string): string {
   if (conversation.name) return conversation.name;
@@ -54,7 +59,7 @@ export default function UnlockedAppEffects() {
     };
     const stopBackground = startBackgroundSession(userId, current);
     const sweepMessageHides = () => { void getAppDB().then(commitAbandonedMessageHides).catch(() => undefined); };
-    const stopLocalMessageSync = startLocalHiddenMessageSync();
+    const stopLocalMessageSync = startLocalHiddenMessageSync(refreshOutgoingQueue);
     const unregister = registerUnlockedSessionCleanup(() => { disposed = true; stopLocalMessageSync(); sweepMessageHides(); });
     sweepMessageHides();
     const retiredCallIds = new Set<string>();
@@ -90,10 +95,13 @@ export default function UnlockedAppEffects() {
 
           const conversation = await api.get<ConversationWithMembers>(`/api/conversations/${payload.conversationId}`);
           if (!current() || retiredCallIds.has(payload.callId)) return;
+          const offer = await getPendingCall(payload.callId);
+          if (!current() || retiredCallIds.has(payload.callId)) return;
           const latest = useCallStore.getState();
           if (latest.pendingCallStart || (latest.activeCallId &&
               (latest.callStatus === "ringing" || latest.callStatus === "active"))) return;
           const caller = conversation.members.find((member) => member.userId === payload.fromUserId);
+          const offerReady = !!offer && offer.expiresAt > Date.now();
 
           useCallStore.getState().setIncomingCall({
             callId: payload.callId,
@@ -104,8 +112,9 @@ export default function UnlockedAppEffects() {
             callerName: caller?.user.displayName ?? t("unknownCaller"),
             callerAvatarUrl: caller?.user.avatarUrl ?? null,
             conversationName: getConversationName(conversation, userId),
-            keyReady: false,
+            keyReady: offerReady,
           });
+          if (offerReady) return;
 
           const keyReady = await waitForCallOffer(payload.callId, () => current() && !retiredCallIds.has(payload.callId) &&
             useCallStore.getState().activeCallId === payload.callId && useCallStore.getState().callStatus === "ringing");
@@ -150,8 +159,9 @@ export default function UnlockedAppEffects() {
         onCallEvent: (payload) => {
           void handleCallEvent(payload);
         },
-        onConversationEvent: () => {
+        onConversationEvent: ({ conversationId }) => {
           void refreshConversationList().catch(() => undefined);
+          if (current()) void reconcileConversationEdits(conversationId, true).catch(() => undefined);
         },
         onMessageEvent: (payload) => {
           if (payload.deletion) void handleMessageDeletion(payload).catch(scheduleMessageSync);
@@ -159,8 +169,25 @@ export default function UnlockedAppEffects() {
           const isVisibleActiveConversation =
             document.visibilityState === "visible" &&
             activeConversationId === payload.conversationId;
-          if (!isVisibleActiveConversation) {
+          if (payload.editAvailable || !isVisibleActiveConversation) {
             scheduleMessageSync();
+          }
+        },
+        onDeviceRevoked: (frame) => {
+          if (current() && frame.deviceId === deviceId) endRevokedDeviceSession(frame.replacementDeviceName);
+        },
+        onDeviceAlertAcknowledged: () => {
+          if (current()) publishDeviceAlertsChanged(deviceId);
+        },
+        onDeviceAlert: (alert) => {
+          if (!current()) return;
+          publishDeviceAlertsChanged(deviceId, alert.kind);
+          if (isNative()) {
+            void notify({
+              title: "Private Base",
+              body: alert.kind === "approval_disabled" ? t("deviceApprovalChangedPush") : t("deviceSignInPush"),
+              onClick: () => { if (current()) navigate(deviceAlertDestination(alert.kind)); },
+            }).catch(() => undefined);
           }
         },
         onProfileEvent: () => {
@@ -174,9 +201,13 @@ export default function UnlockedAppEffects() {
           }
         },
         onOpen: () => {
+          publishDeviceAlertsChanged(deviceId);
           void Promise.all([
             syncMessages(),
             refreshConversationList(),
+            api.get<CallEventPayload | null>("/api/calls/incoming").then(invite => {
+              if (invite) return handleCallEvent(invite);
+            }),
           ]).catch(() => undefined);
         },
       });

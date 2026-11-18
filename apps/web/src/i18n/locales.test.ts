@@ -21,6 +21,10 @@ describe.each(LOCALES)("$code resources", ({ code }) => {
       if (source.includes("Private Base")) expect(value).toContain("Private Base");
     }
   });
+  it("gives the system settings path and limits the Finder override to macOS 14 and earlier", () => {
+    const note = resources[`./locales/${code}.json`]["clients.macosNote"];
+    expect(note).toMatch(/›.+macOS 14/u);
+  });
 });
 
 it.each([
@@ -41,4 +45,16 @@ it("preserves region-specific Portuguese UI vocabulary", () => {
   expect(pt.fileTypeLabel).toBe("Ficheiro");
   expect(br.shareScreen).toBe("Compartilhar tela");
   expect(pt.shareScreen).toBe("Partilhar ecrã");
+});
+
+it("localizes the new setup, approval, replacement and permanent-loss copy in each supported locale", () => {
+  const keys = ["passkeySetup.passkeyHelp", "passkeySetup.skipPasswordBody", "replace.body",
+    "deviceAlert.warning", "privacy.requireApprovalHelp", "unlock.invalidatedNoBackup",
+    "security.passkeySignInBody", "security.passwordUnlockOn", "unlock.bodyPasskey",
+    "devices.clientOnPlatform", "passkeySetup.otherDevicesWillSee", "passkeySetup.receiptTime",
+    "passkeySetup.passwordOnceBody", "passkeySetup.choosePasswordBody", "chats.emptyLinkedConversation", "chats.historyOnOtherDevices"] as const;
+  for (const { code } of LOCALES) {
+    if (code === "en") continue;
+    for (const key of keys) expect(resources[`./locales/${code}.json`][key], `${code}: ${key}`).not.toBe(en[key]);
+  }
 });

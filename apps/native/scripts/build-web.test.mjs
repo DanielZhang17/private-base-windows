@@ -250,13 +250,13 @@ describe("native workspace wiring", () => {
     }
   });
 
-  it("allows only the exact connection and avatar image sources in the CSP", () => {
+  it("allows only the exact connection and image sources in the CSP", () => {
     const config = JSON.parse(read("../src-tauri/tauri.conf.json"));
     expect(config.app.security.csp["connect-src"]).toBe(
       "'self' ipc: http://ipc.localhost https://chat.718788.xyz wss://chat.718788.xyz https://chat-api.718788.xyz wss://chat-api.718788.xyz https://dist.718788.xyz http://localhost:8787 ws://localhost:8787",
     );
     expect(config.app.security.csp["img-src"]).toBe(
-      "'self' blob: data: https://chat.718788.xyz https://chat-api.718788.xyz https://genshin.jmp.blue https://api.dicebear.com",
+      "'self' blob: data: https://chat.718788.xyz https://chat-api.718788.xyz https://dist.718788.xyz https://genshin.jmp.blue https://api.dicebear.com",
     );
   });
 

@@ -16,9 +16,13 @@ const keyState = vi.hoisted(() => {
 vi.mock("../lib/key-manager.js", () => ({
   keysLoaded: () => keyState.loaded,
   hasLocalKeyMaterial: async () => true,
+  getLocalKeyOwner: async () => null,
   lockLocalCryptoState: vi.fn(() => { keyState.loaded = false; }),
   // Manual locking does not notify these listeners in the real key manager.
   onKeysLocked: () => () => {},
+}));
+vi.mock("../db/index.js", async original => ({
+  ...await original<typeof import("../db/index.js")>(), readPendingSetupRecord: async () => undefined,
 }));
 vi.mock("../pages/LoginPage.js", () => ({ default: () => <div>Login</div> }));
 vi.mock("../pages/RegisterPage.js", () => ({ default: () => null }));

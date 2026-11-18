@@ -64,7 +64,8 @@ subscribeToTopOverlay((topOverlay) => {
 export function presentSaveFeedback(notice: SaveResult, viewer?: string): void {
   const { notice: current, announcement } = useSaveFeedbackStore.getState();
   const topOverlay = getTopOverlay();
-  if (current !== notice || topOverlay?.kind === "modal" || topOverlay?.id !== viewer) return;
+  const activeViewer = topOverlay?.kind === "viewer" ? topOverlay.id : undefined;
+  if (current !== notice || topOverlay?.kind === "modal" || activeViewer !== viewer) return;
   startTimer(notice);
   if (!announcement) {
     const text = t(notice.key);

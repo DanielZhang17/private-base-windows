@@ -18,6 +18,6 @@ export default function IncomingCallModal() {
     {call.callUnsupported && <Notice tone="warning">{t("encryptedCallsArenTSupportedOnThisDevice")}</Notice>}
     {call.error && <Notice tone="danger">{call.error}</Notice>}
     <div className="flex gap-4 pb-4"><Button variant="danger" leadingIcon="phone-off" size="lg" onClick={() => void call.respond("decline")} loading={call.loadingAction === "decline"} disabled={!!call.loadingAction}>{t("decline")}</Button>
-      <Button leadingIcon="phone" size="lg" className="bg-ok text-on-ok hover:not-disabled:bg-ok" onClick={() => void call.respond("accept")} loading={call.loadingAction === "accept"} disabled={!!call.loadingAction || !call.keyReady || call.callUnsupported}>{t("accept")}</Button></div>
+      <Button leadingIcon="phone" size="lg" className="bg-ok text-on-ok hover:not-disabled:bg-ok" onClick={() => void call.respond("accept")} loading={call.loadingAction === "accept"} disabled={!!call.loadingAction || call.callUnsupported}>{t("accept")}</Button></div>
   </section>;
 }

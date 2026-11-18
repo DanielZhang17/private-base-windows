@@ -12,6 +12,9 @@ import { generateRecoveryKey, signDeviceLinkApproval } from "../../lib/device-li
 import { copyText } from "../../platform/clipboard.js";
 import { capabilities } from "../../platform/capabilities.js";
 import { saveFile } from "../../platform/files.js";
+import { deviceIcon, linkMethodLabel } from "./devicePresentation.js";
+import { useDeviceAlerts } from "./useDeviceAlerts.js";
+import { removeLinkedDevice } from "./removeLinkedDevice.js";
 import { useSettingsBack } from "../settings/useSettingsBack.js";
 
 export function relativeActivity(timestamp: number | null): string {
@@ -23,6 +26,7 @@ export function useDevices() {
   useLocale();
   const navigate = useNavigate();
   const goBack = useSettingsBack();
+  const deviceAlerts = useDeviceAlerts();
   const currentDeviceId = useAuthStore((state) => state.device?.id);
   const [removalTarget, setRemovalTarget] = useState<Device | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
@@ -47,7 +51,7 @@ export function useDevices() {
     inFlight.current = true;
     setRemoving(removalTarget.id); setRemoveError(null);
     try {
-      await api.delete(`/api/devices/${removalTarget.id}`);
+      await removeLinkedDevice(removalTarget.id);
       await devicesQuery.refetch(); setRemovalTarget(null);
       return true;
     } catch (failure: any) { setRemoveError(toErrorMessage(failure, "failedToRemoveDevice")); return false; }
@@ -87,11 +91,11 @@ export function useDevices() {
   const devices = (devicesQuery.data ?? []).map((device) => ({
     ...device,
     activity: relativeActivity(device.lastSeenAt), activityTitle: device.lastSeenAt ? formatDateTime(device.lastSeenAt) : undefined,
-    icon: /phone|android|iphone|ipad/i.test(device.deviceName) ? "device-phone" as const : "device-desktop" as const,
-    linkedBy: device.linkMethod === "recovery" ? t("linkedWithARecoveryKey") : device.linkMethod === "approved_link" ? t("approvedByALinkedDevice") : t("originalDevice"),
+    icon: device.platform ? deviceIcon(device.platform) : /phone|android|iphone|ipad/i.test(device.deviceName) ? "device-phone" as const : "device-desktop" as const,
+    linkedBy: linkMethodLabel(device.linkMethod),
   })).sort((a, b) => Number(b.id === currentDeviceId) - Number(a.id === currentDeviceId));
   return {
-    navigate, goBack, currentDeviceId, removing, pendingActionId, generatedRecoveryKey, enrollingRecovery,
+    navigate, goBack, deviceAlerts, currentDeviceId, removing, pendingActionId, generatedRecoveryKey, enrollingRecovery,
     removalTarget, removeError: removeError ? renderMessage(removeError) : null, handleRemoveDevice, confirmRemoveDevice,
     cancelRemoveDevice: () => { if (!inFlight.current) setRemovalTarget(null); },
     error: (error ? renderMessage(error) : null) || (devicesQuery.error ? translateError(devicesQuery.error) : undefined) || (pendingRequestsQuery.error ? translateError(pendingRequestsQuery.error) : undefined) || (recoveryStatusQuery.error ? translateError(recoveryStatusQuery.error) : undefined),

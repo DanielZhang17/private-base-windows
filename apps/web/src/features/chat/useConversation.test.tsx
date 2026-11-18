@@ -6,7 +6,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useConversation } from "./useConversation.js";
 import { api } from "../../services/api.js";
-import { loadOlderPersistedConversationMessages } from "../../lib/message-sync.js";
+import { loadOlderPersistedConversationMessages, loadPersistedConversationMessages, refreshImportedConversationMessages, restoreVerifiedLegacyHistory, syncConversationMessages } from "../../lib/message-sync.js";
+import { publishLocalMessageChange } from "../../lib/local-message-changes.js";
 import { createChatWebSocket } from "../../services/ws.js";
 import { supportsE2EECalling } from "../../services/webrtc.js";
 import { E2EECallUnsupportedError } from "../../platform/calls.js";
@@ -21,7 +22,7 @@ vi.mock("../../stores/authStore.js", async () => { const { create } = await impo
 vi.mock("../../services/api.js", () => ({ api: { get: vi.fn(), post: vi.fn(), delete: vi.fn(), patch: vi.fn() } }));
 vi.mock("../../services/ws.js", () => ({ createChatWebSocket: vi.fn() }));
 vi.mock("../../services/webrtc.js", () => ({ supportsE2EECalling: vi.fn(() => true) }));
-vi.mock("../../lib/message-sync.js", () => ({ loadPersistedConversationMessages: async () => ({ hasOlder: false }), syncConversationMessages: vi.fn(), ingestMessageFrame: vi.fn(), loadOlderPersistedConversationMessages: vi.fn() }));
+vi.mock("../../lib/message-sync.js", () => ({ loadPersistedConversationMessages: vi.fn(async () => ({ loadedCount: 0, hasOlder: false })), refreshImportedConversationMessages: vi.fn(), restoreVerifiedLegacyHistory: vi.fn(async () => undefined), syncConversationMessages: vi.fn(), ingestMessageFrame: vi.fn(), loadOlderPersistedConversationMessages: vi.fn() }));
 vi.mock("../../lib/conversation-cache.js", () => ({ upsertConversationInCache: vi.fn(), refreshConversationList: vi.fn() }));
 vi.mock("../../db/index.js", () => ({ guardMessageForPublish: vi.fn(async (message) => message), saveMessage: vi.fn(), getPendingCall: vi.fn(async () => ({})), savePendingCall: vi.fn(async () => {}), deletePendingCall: vi.fn(async () => {}) }));
 vi.mock("../../lib/direct-messages.js", () => ({ sendDirectPayloadFanout: vi.fn(async () => {}) }));
@@ -49,6 +50,63 @@ async function render() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
   await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/chat/chat"]}><LocationProbe /><Routes><Route path="/chat/:conversationId" element={<Probe />} /><Route path="/call/:callId" element={null} /></Routes></MemoryRouter></QueryClientProvider>));
 }
+it("reloads the bounded cache page and pagination for an open empty chat when import commits", async () => {
+  await render();
+  expect(state.hasOlderCachedMessages).toBe(false);
+  expect(loadPersistedConversationMessages).toHaveBeenCalledOnce();
+  vi.mocked(refreshImportedConversationMessages).mockResolvedValueOnce({ loadedCount: 100, hasOlder: true });
+  await act(async () => { publishLocalMessageChange("other-chat", "history", "other-chat"); });
+  expect(loadPersistedConversationMessages).toHaveBeenCalledOnce();
+  await act(async () => { publishLocalMessageChange("chat", "history", "chat"); });
+  expect(refreshImportedConversationMessages).toHaveBeenCalledExactlyOnceWith("chat");
+  expect(syncConversationMessages).toHaveBeenCalledOnce();
+  expect(state.hasOlderCachedMessages).toBe(true);
+});
+
+it("discloses unresolved older history after exact-envelope verification and refreshes the visible page", async () => {
+  vi.mocked(restoreVerifiedLegacyHistory).mockResolvedValueOnce(2);
+  vi.mocked(refreshImportedConversationMessages).mockResolvedValueOnce({ loadedCount: 1, hasOlder: false });
+  await render();
+  await vi.waitFor(() => expect(state.hasUnverifiedLegacyHistory).toBe(true));
+  expect(restoreVerifiedLegacyHistory).toHaveBeenCalledWith(expect.objectContaining({ id: "chat" }), expect.any(Function));
+  expect(refreshImportedConversationMessages).toHaveBeenCalledWith("chat");
+});
+
+it("hides imported rows from a previous account even if they are still in memory", async () => {
+  const row = { conversationId: "chat", senderId: "peer", type: "text", status: "delivered", expiryKind: "retention",
+    expiresAt: null, timestamp: 1, importedAt: 2 } as const;
+  useChatStore.getState().setMessages("chat", [
+    { ...row, id: "own", content: "own history", ownerId: "alice" },
+    { ...row, id: "foreign", content: "previous history", ownerId: "bob" },
+  ]);
+  await render();
+  expect(state.conversationMessages.map(({ content }) => content)).toEqual(["own history"]);
+  await act(async () => { useChatStore.getState().removeConversationMessages("chat"); });
+});
+
+const activatedAt = Date.UTC(2026, 10, 17, 21);
+const beforeLink = activatedAt / 1000 - 3600;
+const afterLink = activatedAt / 1000 + 3600;
+it.each([
+  ["older direct chat in seconds", "direct", "passkey", beforeLink, beforeLink, beforeLink, true],
+  ["new direct chat in seconds", "direct", "passkey", afterLink, afterLink, afterLink, false],
+  ["new direct chat in milliseconds", "direct", "passkey", afterLink * 1000, afterLink, afterLink, false],
+  ["original device", "direct", "register", beforeLink, beforeLink, beforeLink, false],
+  ["existing group membership", "group", "passkey", beforeLink, beforeLink, beforeLink * 1000, true],
+  ["group invitation after linking", "group", "passkey", beforeLink, afterLink, afterLink, false],
+  ["pre-link group invitation accepted after linking", "group", "passkey", beforeLink, beforeLink, afterLink, true],
+  ["pending group invitation received before linking", "group", "passkey", beforeLink, beforeLink, null, true],
+  ["pending group invitation received after linking", "group", "passkey", beforeLink, afterLink, null, false],
+] as const)("shows the history guidance only for eligible conversations (%s)", async (_label, type, linkMethod, createdAt, joinedAt, acceptedAt, expected) => {
+  useAuthStore.setState({ device: { id: "device", linkMethod, activatedAt } } as never);
+  vi.mocked(api.get).mockResolvedValue({ id: "chat", type, createdAt, members: [
+    { userId: "alice", joinedAt, acceptedAt, user: { displayName: "Alice" } },
+  ] } as never);
+  await render();
+  await vi.waitFor(() => expect(state.conversation?.createdAt).toBe(createdAt));
+  expect(state.showHistoryGuidance).toBe(expected);
+  expect(state.isPendingRequest).toBe(acceptedAt === null);
+});
 it("keeps removal notices scoped to their conversation and supports dismissal", async () => {
   useChatStore.getState().addOutgoingRemovalNotice("other-chat");
   await render();
@@ -193,6 +251,22 @@ it.each(["resolve", "reject"])("round 5: lock during pending fanout cleans the c
   expect(useCallStore.getState().localCallOwnership).toBeNull();
   expect(pathname).toBe("/chat/chat");
   expect(vi.mocked(api.post).mock.calls.filter(([path]) => path.endsWith("/end"))).toHaveLength(1);
+});
+
+it("keeps immediate acceptance received before the caller's encrypted invite POST returns", async () => {
+  vi.mocked(api.get).mockResolvedValue({ id: "chat", type: "direct", members: [] } as never);
+  vi.mocked(api.post).mockResolvedValueOnce({ call: { id: "B", status: "ringing" }, created: true } as never);
+  let finishInvite!: () => void;
+  vi.mocked(sendDirectPayloadFanout).mockReturnValueOnce(new Promise((resolve) => { finishInvite = () => resolve({} as SendDirectBatchResponse); }));
+  await render();
+  await act(async () => { await new Promise((done) => setTimeout(done, 0)); });
+  let starting!: Promise<void>;
+  await act(async () => { starting = state.handleStartCall("video"); });
+  expect(sendDirectPayloadFanout).toHaveBeenCalledWith(expect.anything(), expect.any(String), expect.any(String), "system");
+  expect(useCallStore.getState().pendingCallStart?.callId).toBe("B");
+  await act(async () => { useCallStore.getState().updateCallStatus("B", "active"); finishInvite(); await starting; });
+  expect(useCallStore.getState()).toMatchObject({ activeCallId: "B", callStatus: "active", localCallOwnership: { callId: "B", reason: "started" } });
+  expect(pathname).toBe("/call/B");
 });
 
 it("round 5: cancellation before any server call exists makes no end request", async () => {

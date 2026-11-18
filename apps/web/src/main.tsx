@@ -23,8 +23,7 @@ void bootstrap(async () => {
             index.html for unknown paths, including tauri://localhost/chat/….
             Source: https://github.com/tauri-apps/tauri/blob/tauri-v2.0.0/crates/tauri/src/manager/mod.rs#L379-L385 */}
         <BrowserRouter>
-          <RouterNavigation />
-          <App />
+          <RouterNavigation><App /></RouterNavigation>
         </BrowserRouter>
       </QueryClientProvider>
     </StrictMode>

@@ -1,4 +1,5 @@
-import { isSameSession, type SessionSnapshot } from "./session-identity.js";
+import { endRevokedDeviceSession } from "./device-session.js";
+import { isSameSession, readPersistedSession, type SessionSnapshot } from "./session-identity.js";
 import { useAuthStore } from "../stores/authStore.js";
 import { isNative } from "../platform/environment.js";
 import { navigate } from "../platform/navigation.js";
@@ -40,25 +41,6 @@ export class ApiError extends Error {
   }
 }
 
-
-type PersistedSession = {
-  accessToken?: unknown;
-  refreshToken?: unknown;
-  sessionId?: unknown;
-  user?: { id?: unknown } | null;
-  device?: { id?: unknown } | null;
-};
-
-/** The auth state other tabs last wrote, or undefined when storage is empty or unreadable. */
-function readPersistedSession(): PersistedSession | undefined {
-  try {
-    const state = JSON.parse(localStorage.getItem("e2ee-auth") ?? "null")?.state;
-    return state && typeof state === "object" ? state : undefined;
-  } catch {
-    // Storage may be unavailable; the in-memory session can still be refreshed.
-    return undefined;
-  }
-}
 
 class ApiClient {
   private extractErrorMessage(body: unknown, fallback: string): string {
@@ -114,6 +96,7 @@ class ApiClient {
         body,
       );
     }
+    if (res.status === 204) return undefined as T;
     return res.json();
   }
 
@@ -177,7 +160,22 @@ class ApiClient {
       return !persisted || persisted.refreshToken === refreshToken;
     };
     if ((res.status === 401 || res.status === 403) && stillSameSession()) {
-      expireSession();
+      let revoked: { status?: string; replacementDeviceName?: string } | undefined;
+      if (accessToken && useAuthStore.getState().device?.id) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 2000);
+        try {
+          const status = await fetch(resolveApiUrl("/auth/device-session/status"), {
+            method: "POST", headers: this.getHeaders(accessToken), signal: controller.signal,
+          });
+          if (status.ok) revoked = await status.json();
+        } catch { /* An expired token may not look up the revocation reason. */ }
+        finally { clearTimeout(timer); }
+      }
+      if (stillSameSession()) {
+        if (revoked?.status === "revoked") endRevokedDeviceSession(revoked.replacementDeviceName);
+        else expireSession();
+      }
     }
     const data = await this.handleResponse<{ accessToken: string; refreshToken: string }>(res);
     if (!stillSameSession()) throw new ApiError("Session changed", 401);
@@ -188,6 +186,7 @@ class ApiClient {
     method?: string;
     headers?: Record<string, string>;
     body?: BodyInit;
+    signal?: AbortSignal;
   } = {}): Promise<T> {
     const before = useAuthStore.getState();
     const { accessToken, refreshToken } = before;
@@ -196,7 +195,9 @@ class ApiClient {
       headers: { ...this.getHeaders(token), ...options.headers },
     });
     let res = await send(accessToken);
-    if (res.status === 401 && accessToken && !this.isAuthPath(path)) {
+    const refreshPasswordVerification = path === "/auth/password/verify" && !options.headers?.Authorization;
+    if (res.status === 401 && accessToken && (!this.isAuthPath(path) ||
+      (refreshPasswordVerification && (await res.clone().json().catch(() => null))?.error === "Invalid token"))) {
       if (!isSameSession(before, useAuthStore.getState())) throw new ApiError("Session changed", 401);
       await this.refreshToken(accessToken, refreshToken);
       // Never replay a request from one session under another session's token.
@@ -210,9 +211,11 @@ class ApiClient {
     return this.request<T>(path);
   }
 
-  async post<T>(path: string, body?: unknown): Promise<T> {
+  async post<T>(path: string, body?: unknown, authorization?: { bearerToken?: string; signal?: AbortSignal }): Promise<T> {
     return this.request<T>(path, {
       method: "POST",
+      headers: authorization?.bearerToken ? { Authorization: `Bearer ${authorization.bearerToken}` } : undefined,
+      ...(authorization?.signal ? { signal: authorization.signal } : {}),
       body: body ? JSON.stringify(body) : undefined,
     });
   }
@@ -226,8 +229,8 @@ class ApiClient {
     });
   }
 
-  async delete<T>(path: string): Promise<T> {
-    return this.request<T>(path, { method: "DELETE" });
+  async delete<T>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>(path, { method: "DELETE", body: body === undefined ? undefined : JSON.stringify(body) });
   }
 
   async patch<T>(path: string, body?: unknown): Promise<T> {

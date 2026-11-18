@@ -2,19 +2,19 @@ import { useEffect, type RefObject } from "react";
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), ' +
-  'textarea:not([disabled]), video[controls], audio[controls], [tabindex]:not([tabindex="-1"])';
+  'textarea:not([disabled]), video[controls], audio[controls], [tabindex]';
 
 function focusableWithin(root: HTMLElement): HTMLElement[] {
-  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE));
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((element) => !element.hasAttribute("tabindex") || element.tabIndex >= 0);
 }
 
 let openOverlays = 0;
 let previousOverflow = "";
-const overlayStack: HTMLElement[] = [];
 
 /** Shared modal stack, focus containment, restoration and scroll lock. */
-export function useModalFocus({ open, onClose, dismissible = true, panelRef, bodyRef, initialFocusRef }: {
+export function useModalFocus({ open, onClose, dismissible = true, panelRef, bodyRef, initialFocusRef, isTop }: {
   open: boolean;
+  isTop: () => boolean;
   onClose: () => void;
   dismissible?: boolean;
   panelRef: RefObject<HTMLElement | null>;
@@ -27,7 +27,6 @@ export function useModalFocus({ open, onClose, dismissible = true, panelRef, bod
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const panel = panelRef.current;
     if (!panel) return;
-    overlayStack.push(panel);
     const target =
       initialFocusRef?.current ??
       (bodyRef?.current && focusableWithin(bodyRef.current)[0]) ??
@@ -39,7 +38,6 @@ export function useModalFocus({ open, onClose, dismissible = true, panelRef, bod
     openOverlays += 1;
     document.body.style.overflow = "hidden";
     return () => {
-      overlayStack.splice(overlayStack.indexOf(panel), 1);
       openOverlays -= 1;
       if (openOverlays === 0) document.body.style.overflow = previousOverflow;
       if (previouslyFocused?.isConnected) previouslyFocused.focus();
@@ -51,15 +49,15 @@ export function useModalFocus({ open, onClose, dismissible = true, panelRef, bod
     if (!open) return;
     const panel = panelRef.current;
     if (!panel) return;
-    const isTopmost = () => overlayStack[overlayStack.length - 1] === panel;
     const handleFocusIn = (event: FocusEvent) => {
-      if (isTopmost() && !panel.contains(event.target as Node)) {
+      if (isTop() && !panel.contains(event.target as Node)) {
         (focusableWithin(panel)[0] ?? panel).focus();
       }
     };
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (!isTopmost()) return;
+      if (!isTop()) return;
       if (event.key === "Escape") {
+        event.preventDefault();
         event.stopPropagation();
         if (dismissible) onClose();
         return;
@@ -89,5 +87,5 @@ export function useModalFocus({ open, onClose, dismissible = true, panelRef, bod
       document.removeEventListener("keydown", handleKeyDown);
       document.removeEventListener("focusin", handleFocusIn);
     };
-  }, [open, dismissible, onClose]);
+  }, [open, dismissible, onClose, isTop]);
 }

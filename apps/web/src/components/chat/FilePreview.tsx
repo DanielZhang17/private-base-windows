@@ -16,7 +16,7 @@ export default function FilePreview(props: FilePreviewOptions & { actionsRef?: R
   const [previewFailed, setPreviewFailed] = useState(false);
   useEffect(() => { setPreviewFailed(false); setViewerOpen(false); }, [props.fileId, props.mimeType, props.fileKey, props.fileIv]);
   const failPreview = () => { setPreviewFailed(true); setViewerOpen(false); };
-  const { fileName, sizeBytes, mimeType } = props;
+  const { fileName, sizeBytes = 0, mimeType } = props;
   const { blocked, canOpen, actionWarning, fileSaveMode, textPreview, closeTextPreview, canPreview, loading, error, expired, objectUrl, isImage, isVideo, saveUnsupported, load, handleDownload, handleOpen, actionError, clearActionError } = useFilePreview(props);
   const open = async () => {
     if (canPreview && !previewFailed) {

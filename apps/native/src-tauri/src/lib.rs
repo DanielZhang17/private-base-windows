@@ -1,4 +1,6 @@
 #[cfg(any(windows, test))]
+mod biometric_unlock;
+#[cfg(any(windows, test))]
 mod capture_protection;
 #[cfg(any(windows, test))]
 mod files;
@@ -10,7 +12,7 @@ mod updater;
 mod updater_policy;
 
 #[cfg(any(windows, test))]
-fn native_capabilities_script(passkey_handoff: bool) -> String {
+fn native_capabilities_script(passkey_handoff: bool, biometric_unlock: Option<&str>) -> String {
     let mut capabilities = serde_json::json!({
         "captureProtection": "full",
         "fileOpen": true,
@@ -18,6 +20,9 @@ fn native_capabilities_script(passkey_handoff: bool) -> String {
     });
     if passkey_handoff {
         capabilities["passkeyHandoff"] = true.into();
+    }
+    if let Some(capability) = biometric_unlock {
+        capabilities["biometricUnlock"] = capability.into();
     }
     format!(
         "window.__PRIVATEBASE_NATIVE_CAPABILITIES__ = Object.assign(window.__PRIVATEBASE_NATIVE_CAPABILITIES__ || {{}}, {capabilities});"
@@ -33,6 +38,12 @@ fn native_invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync 
         capture_protection::get_capture_protection,
         #[cfg(any(windows, test))]
         capture_protection::set_capture_protection,
+        #[cfg(any(windows, test))]
+        biometric_unlock::biometric_unlock_enroll,
+        #[cfg(any(windows, test))]
+        biometric_unlock::biometric_unlock,
+        #[cfg(any(windows, test))]
+        biometric_unlock::biometric_unlock_remove,
         #[cfg(desktop)]
         updater::update_check,
         #[cfg(desktop)]
@@ -88,12 +99,28 @@ mod tests {
     #[test]
     fn capture_capability_is_independent_of_passkey_registration() {
         for passkey_handoff in [false, true] {
-            let script = super::native_capabilities_script(passkey_handoff);
+            let script = super::native_capabilities_script(passkey_handoff, None);
             assert!(script.contains(r#""captureProtection":"full""#));
             assert!(script.contains(r#""fileOpen":true"#));
             assert!(script.contains(r#""fileSave":"dialog""#));
             assert_eq!(script.contains(r#""passkeyHandoff":true"#), passkey_handoff);
+            assert!(!script.contains(r#""biometricUnlock""#));
         }
+    }
+
+    #[test]
+    fn supported_biometric_script_preserves_existing_native_flags() {
+        let script = super::native_capabilities_script(true, Some("windows-hello"));
+        for flag in [
+            r#""biometricUnlock":"windows-hello""#,
+            r#""captureProtection":"full""#,
+            r#""fileOpen":true"#,
+            r#""fileSave":"dialog""#,
+            r#""passkeyHandoff":true"#,
+        ] {
+            assert!(script.contains(flag));
+        }
+        assert!(script.contains("Object.assign(window.__PRIVATEBASE_NATIVE_CAPABILITIES__ || {}"));
     }
 
     #[test]

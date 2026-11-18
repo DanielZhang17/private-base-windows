@@ -64,6 +64,7 @@ export async function isPasskeyAutofillAvailable(): Promise<boolean> {
  */
 export async function createPasskeyCredential(
   serverOptions: PasskeyRegistrationOptionsResponse["options"],
+  onPrfSupport?: (enabled: boolean) => void,
 ): Promise<{
   id: string;
   rawId: string;
@@ -90,20 +91,23 @@ export async function createPasskeyCredential(
     attestation: serverOptions.attestation as AttestationConveyancePreference,
     authenticatorSelection: {
       residentKey: serverOptions.authenticatorSelection.residentKey as ResidentKeyRequirement,
-      requireResidentKey: serverOptions.authenticatorSelection.requireResidentKey,
+      ...(serverOptions.authenticatorSelection.requireResidentKey === undefined ? {}
+        : { requireResidentKey: serverOptions.authenticatorSelection.requireResidentKey }),
       userVerification: serverOptions.authenticatorSelection.userVerification as UserVerificationRequirement,
     },
-    extensions: serverOptions.extensions,
+    extensions: { ...serverOptions.extensions, prf: {} },
     excludeCredentials: serverOptions.excludeCredentials.map((c) => ({
       id: toBuffer(base64urlToBytes(c.id)),
       type: c.type,
-      transports: c.transports as AuthenticatorTransport[] | undefined,
+      ...(c.transports ? { transports: c.transports as AuthenticatorTransport[] } : {}),
     })),
   };
 
   const credential = await navigator.credentials.create({ publicKey }) as PublicKeyCredential;
   if (!credential) throw new Error("Passkey creation cancelled");
 
+  const extensions = credential.getClientExtensionResults?.();
+  onPrfSupport?.(extensions?.prf?.enabled === true);
   const attestationResponse = credential.response as AuthenticatorAttestationResponse;
 
   return {
@@ -116,7 +120,7 @@ export async function createPasskeyCredential(
       transports: attestationResponse.getTransports?.() ?? [],
     },
     authenticatorAttachment: (credential as any).authenticatorAttachment ?? undefined,
-    clientExtensionResults: credential.getClientExtensionResults?.(),
+    clientExtensionResults: extensions?.credProps ? { credProps: extensions.credProps } : undefined,
   };
 }
 
@@ -126,7 +130,12 @@ export async function createPasskeyCredential(
  */
 export async function getPasskeyAssertion(
   serverOptions: PasskeyLoginOptionsResponse["options"],
-): Promise<{
+  request?: Pick<CredentialRequestOptions, "signal" | "mediation">,
+): Promise<PasskeyAssertion> {
+  return (await requestPasskeyAssertion(serverOptions, undefined, request)).credential;
+}
+
+export interface PasskeyAssertion {
   id: string;
   rawId: string;
   type: "public-key";
@@ -136,26 +145,43 @@ export async function getPasskeyAssertion(
     signature: string;
     userHandle?: string;
   };
-}> {
+}
+
+export function getPasskeyAssertionWithPrf(
+  options: PasskeyLoginOptionsResponse["options"], salt: Uint8Array,
+  request?: Pick<CredentialRequestOptions, "signal" | "mediation">,
+) {
+  return requestPasskeyAssertion(options, salt, request);
+}
+
+async function requestPasskeyAssertion(
+  serverOptions: PasskeyLoginOptionsResponse["options"], salt?: Uint8Array,
+  request?: Pick<CredentialRequestOptions, "signal" | "mediation">,
+): Promise<{ credential: PasskeyAssertion; prf?: Uint8Array }> {
   requirePasskeys();
   const publicKey: PublicKeyCredentialRequestOptions = {
     challenge: toBuffer(base64urlToBytes(serverOptions.challenge)),
     rpId: serverOptions.rpId,
     timeout: serverOptions.timeout,
-    userVerification: serverOptions.userVerification as UserVerificationRequirement,
+    userVerification: salt ? "required" : serverOptions.userVerification as UserVerificationRequirement,
+    ...(salt ? { extensions: { prf: { eval: { first: toBuffer(salt) } } } } : {}),
     allowCredentials: serverOptions.allowCredentials.map((c) => ({
       id: toBuffer(base64urlToBytes(c.id)),
       type: c.type,
-      transports: c.transports as AuthenticatorTransport[] | undefined,
+      ...(c.transports ? { transports: c.transports as AuthenticatorTransport[] } : {}),
     })),
   };
 
-  const credential = await navigator.credentials.get({ publicKey }) as PublicKeyCredential;
-  if (!credential) throw new Error("Passkey authentication cancelled");
+  const credential = await navigator.credentials.get({
+    publicKey,
+    ...(request?.signal ? { signal: request.signal } : {}),
+    ...(request?.mediation ? { mediation: request.mediation } : {}),
+  }) as PublicKeyCredential;
+  if (!credential) throw new DOMException("Passkey authentication cancelled", "NotAllowedError");
 
   const assertionResponse = credential.response as AuthenticatorAssertionResponse;
-
-  return {
+  const result = salt ? readPrfResult(credential) : undefined;
+  return { prf: result, credential: {
     id: credential.id,
     rawId: bytesToBase64url(new Uint8Array(credential.rawId)),
     type: "public-key",
@@ -167,5 +193,35 @@ export async function getPasskeyAssertion(
         ? bytesToBase64url(new Uint8Array(assertionResponse.userHandle))
         : undefined,
     },
-  };
+  } };
+}
+
+export class PasskeyPrfUnavailableError extends Error {
+  constructor() {
+    super("This passkey could not unlock this device");
+    this.name = "PasskeyPrfUnavailableError";
+  }
+}
+
+function readPrfResult(credential: PublicKeyCredential): Uint8Array | undefined {
+  const first = credential.getClientExtensionResults?.()?.prf?.results?.first;
+  if (first?.byteLength !== 32) return undefined;
+  const output = ArrayBuffer.isView(first)
+    ? new Uint8Array(first.buffer, first.byteOffset, first.byteLength)
+    : new Uint8Array(first);
+  return output.byteLength === 32 ? output : undefined;
+}
+
+/** A local-only, user-verified request for an enrolled credential. */
+export async function evaluatePasskeyPrf(credentialId: string, rpId: string, salt: Uint8Array): Promise<Uint8Array> {
+  const { credential, prf } = await getPasskeyAssertionWithPrf({
+    challenge: bytesToBase64url(crypto.getRandomValues(new Uint8Array(32))),
+    rpId, timeout: 60_000, userVerification: "required",
+    allowCredentials: [{ id: credentialId, type: "public-key" }],
+  }, salt);
+  if (credential.id !== credentialId || !prf) {
+    prf?.fill(0);
+    throw new PasskeyPrfUnavailableError();
+  }
+  return prf;
 }

@@ -17,11 +17,13 @@ import {
   toBase64Url,
   type RatchetSession,
   type EncryptResult,
+  type EditKeyToSeal,
 } from "@e2ee-chat/crypto";
 import type { InitialMessageHeader, RatchetHeader } from "@e2ee-chat/shared";
 import { deleteSession, hasReceivedMessage, getSession, saveSession, type LocalSession } from "../db/index.js";
 import { api } from "../services/api.js";
 import { consumeOneTimePreKey, findOneTimePreKey, getIdentityKeyPair, getSignedPreKey } from "./key-manager.js";
+import { matchEditSigningIdentity } from "./message-edit.js";
 import { decryptPayload, finishReceive, withReceiveLock, withSessionLock, ReceiveDecryptionError, type ReceiveContext } from "./receive.js";
 
 function sessionKey(userId: string, deviceId: string): string {
@@ -71,7 +73,7 @@ export async function getOrCreateSession(
   };
   // Keep public bootstrap metadata until a successfully decrypted reply confirms the session.
   // Discarding an unsent envelope must not strand the already advanced sending chain.
-  await persistSession(key, session, initialHeader.ephemeralKey, initialHeader);
+  await saveSession(await sessionRecord(key, session, initialHeader.ephemeralKey, initialHeader, bundle.identityKey));
   return { session, initialHeader };
 }
 
@@ -89,12 +91,13 @@ export async function decryptInitialMessage(
 ): Promise<Uint8Array | null> {
   const key = sessionKey(remoteUserId, remoteDeviceId);
   return withReceiveLock(receive, key, async () => {
-    if (await hasReceivedMessage(receive.messageId)) return null;
+    if (await hasReceivedMessage(receive.messageId, receive.ownerId, receive.deviceId)) return null;
     const existing = await getSession(key);
     if (existing && (!existing.x3dhEphemeralKey || existing.x3dhEphemeralKey === header.ephemeralKey)) {
       // Even legacy states must never be rebuilt after a failed decrypt.
       const session = deserializeSession(JSON.parse(existing.state));
-      const plaintext = await decryptPayload(() => ratchetDecrypt(session, ratchetHeader, ciphertext, iv));
+      const editKey = matchEditSigningIdentity(receive.editKey, existing.peerIdentityKey);
+      const plaintext = await decryptPayload(() => ratchetDecrypt(session, ratchetHeader, ciphertext, iv, editKey));
       return finishReceive(receive, plaintext, {
         session: await sessionRecord(key, session, header.ephemeralKey, null),
       });
@@ -128,11 +131,12 @@ export async function decryptInitialMessage(
       );
 
       const session = await initSessionAsResponder(sharedSecret, signedPreKey.keyPair);
-      const plaintext = await ratchetDecrypt(session, ratchetHeader, ciphertext, iv);
+      const editKey = matchEditSigningIdentity(receive.editKey, header.identityKey);
+      const plaintext = await ratchetDecrypt(session, ratchetHeader, ciphertext, iv, editKey);
       return { session, plaintext };
     });
     const result = await finishReceive(receive, decrypted.plaintext, {
-      session: await sessionRecord(key, decrypted.session, header.ephemeralKey, null),
+      session: await sessionRecord(key, decrypted.session, header.ephemeralKey, null, header.identityKey),
       oneTimePreKeyId: header.oneTimePreKeyId,
     });
     if (result && header.oneTimePreKeyId !== undefined) {
@@ -150,6 +154,7 @@ export async function encryptForDevice(
   remoteUserId: string,
   remoteDeviceId: string,
   plaintext: Uint8Array,
+  editKey?: EditKeyToSeal,
 ): Promise<{ result: EncryptResult; isInitial: boolean; initialHeader?: InitialMessageHeader }> {
   const key = sessionKey(remoteUserId, remoteDeviceId);
   return withSessionLock(key, async () => {
@@ -157,7 +162,7 @@ export async function encryptForDevice(
     let result: EncryptResult;
 
     try {
-      result = await ratchetEncrypt(session, plaintext);
+      result = await ratchetEncrypt(session, plaintext, editKey);
     } catch (err) {
       // Recover from corrupted responder-only state by rebuilding as initiator.
       if (!(err instanceof Error) || err.message !== "Session not ready to send") throw err;
@@ -166,10 +171,10 @@ export async function encryptForDevice(
       const recreated = await getOrCreateSession(remoteUserId, remoteDeviceId);
       session = recreated.session;
       initialHeader = recreated.initialHeader;
-      result = await ratchetEncrypt(session, plaintext);
+      result = await ratchetEncrypt(session, plaintext, editKey);
     }
 
-    await persistSession(key, session);
+    await saveSession(await sessionRecord(key, session));
     return { result, isInitial: !!initialHeader, initialHeader };
   });
 }
@@ -185,18 +190,19 @@ export async function decryptFromDevice(
 ): Promise<Uint8Array | null> {
   const key = sessionKey(remoteUserId, remoteDeviceId);
   return withReceiveLock(receive, key, async () => {
-    if (await hasReceivedMessage(receive.messageId)) return null;
+    if (await hasReceivedMessage(receive.messageId, receive.ownerId, receive.deviceId)) return null;
     const stored = await getSession(key);
     if (!stored) throw new ReceiveDecryptionError(new Error(`No session for ${remoteUserId}:${remoteDeviceId}`));
     const session = deserializeSession(JSON.parse(stored.state));
-    const plaintext = await decryptPayload(() => ratchetDecrypt(session, header, ciphertext, iv));
+    const editKey = matchEditSigningIdentity(receive.editKey, stored.peerIdentityKey);
+    const plaintext = await decryptPayload(() => ratchetDecrypt(session, header, ciphertext, iv, editKey));
     return finishReceive(receive, plaintext, {
       session: await sessionRecord(key, session, undefined, null),
     });
   });
 }
 
-async function sessionRecord(key: string, session: RatchetSession, x3dhEphemeralKey?: string, initialHeader?: InitialMessageHeader | null): Promise<LocalSession> {
+async function sessionRecord(key: string, session: RatchetSession, x3dhEphemeralKey?: string, initialHeader?: InitialMessageHeader | null, peerIdentityKey?: string): Promise<LocalSession> {
   const existing = await getSession(key);
   let retiredEphemeralKeys = existing?.retiredEphemeralKeys;
   if (existing?.x3dhEphemeralKey && x3dhEphemeralKey && existing.x3dhEphemeralKey !== x3dhEphemeralKey) {
@@ -209,14 +215,11 @@ async function sessionRecord(key: string, session: RatchetSession, x3dhEphemeral
     id: key,
     state: JSON.stringify(serializeSession(session)),
     updatedAt: Date.now(),
+    peerIdentityKey: peerIdentityKey ?? existing?.peerIdentityKey,
     x3dhEphemeralKey: x3dhEphemeralKey ?? existing?.x3dhEphemeralKey,
     retiredEphemeralKeys,
     initialHeader: initialHeader === null ? undefined : initialHeader ?? existing?.initialHeader,
   };
-}
-
-async function persistSession(key: string, session: RatchetSession, x3dhEphemeralKey?: string, initialHeader?: InitialMessageHeader | null): Promise<void> {
-  await saveSession(await sessionRecord(key, session, x3dhEphemeralKey, initialHeader));
 }
 
 export async function resetSession(remoteUserId: string, remoteDeviceId: string): Promise<void> {

@@ -18,7 +18,6 @@ vi.mock("../../lib/key-manager.js", () => ({ keysLoaded: () => true }));
 vi.mock("../../lib/message-processor.js", () => ({ encryptMessage: vi.fn(), encryptGroupText: vi.fn() }));
 vi.mock("../../lib/conversation-cache.js", () => ({ touchConversationInCache: vi.fn() }));
 
-const { webcrypto } = await vi.importActual<{ webcrypto: Crypto }>("node:crypto");
 const encode = (value: string) => new TextEncoder().encode(value);
 const decode = (value: Uint8Array) => new TextDecoder().decode(value);
 type SendBody = SendDirectBatchRequest | SendMessageRequest;
@@ -39,7 +38,6 @@ let rejectUpload: boolean;
 // and the message-processor adapters are replaced.
 beforeEach(async () => {
   vi.resetAllMocks();
-  vi.stubGlobal("crypto", webcrypto);
   const db = await getAppDB();
   for (const name of Array.from(db.objectStoreNames)) await db.clear(name);
   useChatStore.setState({ messages: new Map(), outgoingRemovalNotices: new Set() });

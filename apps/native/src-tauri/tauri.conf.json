@@ -29,7 +29,7 @@
         "script-src": "'self' 'wasm-unsafe-eval'",
         "worker-src": "'self' blob:",
         "connect-src": "'self' ipc: http://ipc.localhost https://chat.718788.xyz wss://chat.718788.xyz https://chat-api.718788.xyz wss://chat-api.718788.xyz https://dist.718788.xyz http://localhost:8787 ws://localhost:8787",
-        "img-src": "'self' blob: data: https://chat.718788.xyz https://chat-api.718788.xyz https://genshin.jmp.blue https://api.dicebear.com",
+        "img-src": "'self' blob: data: https://chat.718788.xyz https://chat-api.718788.xyz https://dist.718788.xyz https://genshin.jmp.blue https://api.dicebear.com",
         "media-src": "'self' blob: mediastream:",
         "style-src": "'self' 'unsafe-inline'"
       }

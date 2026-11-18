@@ -16,7 +16,10 @@ import {
   fetchConversationList,
   refreshConversationList,
 } from "../../lib/conversation-cache.js";
+import { messageVisibleToAccount } from "../../lib/message-account.js";
+import { hydrateImportedConversationPreviews } from "../../lib/message-sync.js";
 import { usePresenceStore } from "../../stores/presenceStore.js";
+import { linkedDeviceTime, predatesDeviceLink } from "./presentation.js";
 
 function relativeTime(timestamp: number): string {
   return Date.now() - timestamp < 604_800_000 ? formatRelativeTimestamp(timestamp) : formatDate(timestamp, { month: "short", day: "numeric" });
@@ -43,6 +46,11 @@ export function useChatList() {
   const errorDataVersion = useRef(0);
   const [listError, setListError] = useState<LocalizedMessage | null>(null);
   const user = useAuthStore((s) => s.user);
+  const sessionId = useAuthStore((s) => s.sessionId);
+  const deviceId = useAuthStore((s) => s.device?.id);
+  const linkedAt = useAuthStore(({ device }) => linkedDeviceTime(device));
+  const previewScope = JSON.stringify([user?.id, sessionId, deviceId]);
+  const previewedChats = useRef<{ scope: string; ids: Set<string> } | undefined>(undefined);
   const onlineUsers = usePresenceStore((s) => s.onlineUsers);
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const unreadCounts = useChatStore((s) => s.unreadCounts);
@@ -64,6 +72,18 @@ export function useChatList() {
     const version = queryClient.getQueryState(CONVERSATIONS_QUERY_KEY)?.dataUpdateCount ?? 0;
     if (!isFetching && version > errorDataVersion.current) setListError(null);
   }, [dataUpdatedAt, isFetching, queryClient]);
+
+  useEffect(() => {
+    if (!user?.id || !conversations) return;
+    const ids = new Set(conversations.filter((chat) => chat.members.some((member) => member.userId === user.id && member.acceptedAt !== null))
+      .map(({ id }) => id));
+    const previous = previewedChats.current;
+    const newlyEligible = new Set([...ids].filter((id) => previous?.scope !== previewScope || !previous.ids.has(id)));
+    previewedChats.current = { scope: previewScope, ids };
+    if (newlyEligible.size) void hydrateImportedConversationPreviews(newlyEligible).catch(() => {
+      if (previewedChats.current?.scope === previewScope) for (const id of newlyEligible) previewedChats.current.ids.delete(id);
+    });
+  }, [conversations, previewScope, user?.id]);
 
   const openChat = (id: string) => {
     setActiveConversation(id);
@@ -172,6 +192,11 @@ export function useChatList() {
   };
   const pendingConversations = conversations?.filter((conv) => conv.members.find((m) => m.userId === user?.id)?.acceptedAt === null) ?? [];
   const acceptedConversations = conversations?.filter((conv) => conv.members.find((m) => m.userId === user?.id)?.acceptedAt !== null) ?? [];
+  const getLastVisibleMessage = (conversationId: string) => allMessages.get(conversationId)
+    ?.filter((message) => messageVisibleToAccount(message, user?.id ?? null)).at(-1);
+  const showHistoryGuidance = linkedAt !== undefined && acceptedConversations.some((conversation) =>
+    !getLastVisibleMessage(conversation.id) &&
+    predatesDeviceLink(conversation, linkedAt, conversation.members.find(member => member.userId === user?.id)?.joinedAt));
 
   return {
     respondToRequest,
@@ -184,7 +209,8 @@ export function useChatList() {
     user,
     onlineUsers,
     unreadCounts,
-    allMessages,
+    getLastVisibleMessage,
+    showHistoryGuidance,
     showNewChat,
     setShowNewChat,
     showNewGroup,

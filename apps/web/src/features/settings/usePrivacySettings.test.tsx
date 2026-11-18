@@ -3,15 +3,17 @@ import { onlineManager, QueryClient, QueryClientProvider } from "@tanstack/react
 import { beforeEach, afterEach, expect, it, vi } from "vitest";
 import { usePrivacySettings } from "./usePrivacySettings.js";
 import { api } from "../../services/api.js";
+import { signWithIdentityKey } from "../../lib/key-manager.js";
 import { capabilities } from "../../platform/capabilities.js";
 import { invoke } from "@tauri-apps/api/core";
 import { setLocalePreference, t } from "../../i18n/index.js";
 import { setupDom } from "../../ui/test-utils.js";
-vi.mock("../../services/api.js", () => ({ api: { get: vi.fn(), patch: vi.fn() } }));
+vi.mock("../../services/api.js", () => ({ api: { get: vi.fn(), patch: vi.fn(), post: vi.fn() } }));
+vi.mock("../../lib/key-manager.js", () => ({ signWithIdentityKey: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("../../stores/authStore.js", async () => {
   const { create } = await import("zustand");
-  return { useAuthStore: create(() => ({ user: { id: "alice" } })) };
+  return { useAuthStore: create(() => ({ user: { id: "alice" }, device: { id: "phone" } })) };
 });
 const { render } = setupDom();
 let client: QueryClient;
@@ -117,4 +119,25 @@ it("does not invoke capture protection when unsupported", async () => {
   await show();
   await act(async () => { expect(await state.capture.setEnabled(false)).toBe(false); });
   expect(invoke).not.toHaveBeenCalled();
+});
+
+it("exposes the recovery prerequisite and signs a fresh active-device proof when disabling approval", async () => {
+  vi.mocked(api.get).mockResolvedValueOnce({ discoverable: true, groupInvites: "everyone", requireDeviceApproval: false });
+  await show();
+  vi.mocked(api.patch).mockRejectedValueOnce(Object.assign(new Error("Recovery required"), { body: { error: "recovery_key_required" } }));
+  await act(async () => { expect(await state.setDeviceApproval(true)).toBe(false); });
+  expect(state.approvalSaveError).toBe("recovery_key_required");
+  expect(state.data?.requireDeviceApproval).toBe(false);
+  vi.mocked(api.patch).mockResolvedValueOnce({ discoverable: true, groupInvites: "everyone", requireDeviceApproval: true });
+  await act(async () => { expect(await state.setDeviceApproval(true)).toBe(true); });
+  expect(state.data?.requireDeviceApproval).toBe(true);
+  vi.mocked(api.post).mockResolvedValueOnce({ challengeId: "proof" });
+  vi.mocked(signWithIdentityKey).mockResolvedValueOnce("device-signature");
+  vi.mocked(api.patch).mockResolvedValueOnce({ discoverable: true, groupInvites: "everyone", requireDeviceApproval: false });
+  await act(async () => { expect(await state.setDeviceApproval(false)).toBe(true); });
+  expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/account/privacy/approval-disable-options");
+  expect(signWithIdentityKey).toHaveBeenCalledWith(JSON.stringify(["privatebase-device-action-v1", "disable_approval", "phone", "proof"]));
+  expect(api.patch).toHaveBeenLastCalledWith("/api/account/privacy", {
+    requireDeviceApproval: false, approvalProof: { challengeId: "proof", signature: "device-signature" },
+  });
 });

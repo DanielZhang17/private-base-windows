@@ -2,6 +2,8 @@ import {
   HEARTBEAT_INTERVAL,
   WSFrameType,
   type CallEventPayload,
+  type DeviceAlert,
+  type WSDeviceRevokedFrame,
   type ConversationEventPayload,
   type MessageEventPayload,
   type ProfileEventPayload,
@@ -15,6 +17,9 @@ interface NotificationSocketOptions {
   onConversationEvent: (payload: ConversationEventPayload) => void;
   onMessageEvent: (payload: MessageEventPayload) => void;
   onProfileEvent: (payload: ProfileEventPayload) => void;
+  onDeviceRevoked?: (frame: WSDeviceRevokedFrame) => void;
+  onDeviceAlert?: (alert: DeviceAlert) => void;
+  onDeviceAlertAcknowledged?: () => void;
   onPresenceEvent?: (userId: string, status: "online" | "offline") => void;
   onOpen?: () => void;
   onClose?: () => void;
@@ -75,6 +80,18 @@ export function createNotificationWebSocket(options: NotificationSocketOptions):
         }
         if (frame.type === WSFrameType.MessageEvent) {
           options.onMessageEvent(frame.payload);
+          return;
+        }
+        if (frame.type === WSFrameType.DeviceRevoked) {
+          options.onDeviceRevoked?.(frame);
+          return;
+        }
+        if (frame.type === WSFrameType.DeviceAlert) {
+          options.onDeviceAlert?.(frame.payload);
+          return;
+        }
+        if (frame.type === WSFrameType.DeviceAlertAcknowledged) {
+          options.onDeviceAlertAcknowledged?.();
           return;
         }
         if (frame.type === WSFrameType.Profile) {

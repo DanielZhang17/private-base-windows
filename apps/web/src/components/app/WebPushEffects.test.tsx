@@ -39,7 +39,7 @@ it("keeps cold locked startup subscribed, but explicit lock tears it down", asyn
   await render(<MemoryRouter><Probe unlocked /></MemoryRouter>);
   clearUnlockedSessionState();
   expect(disableWebPush).toHaveBeenCalledTimes(1);
-  expect(storePushLocale).toHaveBeenCalledWith("en", "New message", "Incoming call");
+  expect(storePushLocale).toHaveBeenCalledWith("en", "New message", "Incoming call", "A new device signed in to your account. Open Private Base to review.", "A security setting changed on your account. Open Private Base to review.");
 });
 it("uses the previous account token when signing out or switching accounts", async () => {
   await render(<MemoryRouter><Probe unlocked={false} /></MemoryRouter>);
@@ -71,6 +71,19 @@ it.each(["locked", "signed-out", "keys-locked"])("ignores push-open while %s wit
   await render(<MemoryRouter><Probe unlocked /></MemoryRouter>);
   expect(container().querySelector("output")!.textContent).toBe("/");
   expect(api.get).not.toHaveBeenCalled();
+});
+it.each(["/devices", "/settings?section=privacy"])("forwards a locked security notification to the protected route %s", async destination => {
+  vi.mocked(keysLoaded).mockReturnValue(false);
+  await render(<MemoryRouter initialEntries={["/unlock"]}><Probe unlocked={false} /></MemoryRouter>);
+  await act(async () => { worker.dispatchEvent(new MessageEvent("message", { data: { type: "push-open", destination } })); });
+  expect(container().querySelector("output")!.textContent).toBe(destination);
+  expect(api.get).not.toHaveBeenCalled();
+});
+it("ignores even a generic security notification if there is no authenticated session", async () => {
+  useAuthStore.setState({ accessToken: null });
+  await render(<MemoryRouter><Probe unlocked={false} /></MemoryRouter>);
+  await act(async () => { worker.dispatchEvent(new MessageEvent("message", { data: { type: "push-open", destination: "/devices" } })); });
+  expect(container().querySelector("output")!.textContent).toBe("/");
 });
 it.each(["https://evil.example.com/call/x", "//evil.example.com", "/settings", "/native/passkey/sign-in", "/call/../other", "/chat/x?next=other"])("rejects push-open destination %s", async (destination) => {
   await render(<MemoryRouter><Probe unlocked /></MemoryRouter>);

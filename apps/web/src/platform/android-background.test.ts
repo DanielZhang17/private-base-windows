@@ -100,7 +100,9 @@ it("whitelists call/message IPC and uses only the native message path while hidd
   await adapter.cancelIncomingCall("../bad");
   expect(mocks.invoke.mock.calls.some(([, args]) => JSON.stringify(args).includes("../bad"))).toBe(false);
 });
-it("does not invoke the new commands in older shells and keeps generic message notifications", async () => {
+it("does not invoke the new commands in older shells and keeps generic sticker notifications", async () => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Android");
   vi.spyOn(capabilities, "backgroundConnection", "get").mockReturnValue(false);
   vi.spyOn(capabilities, "nativeCallNotifications", "get").mockReturnValue(false);
   dispose = startBackgroundSession("alice", () => true);
@@ -109,8 +111,15 @@ it("does not invoke the new commands in older shells and keeps generic message n
   await adapter.showIncomingCall({ callId: "call-1", callerName: "Alice", video: false });
   await adapter.cancelIncomingCall("call-1"); expect(await adapter.takeNotificationActions()).toEqual([]);
   vi.spyOn(document, "hidden", "get").mockReturnValue(true);
-  showMessageNotification("Alice", "chat-1"); await flush();
+  showMessageNotification("Alice", "chat-1", "sticker"); await flush();
   expect(mocks.notify).toHaveBeenCalledTimes(1); expect(mocks.invoke).not.toHaveBeenCalled();
+  expect(mocks.notify.mock.calls[0][0]).not.toHaveProperty("body");
+});
+
+it("includes a decrypted sticker preview in a browser notification", async () => {
+  vi.spyOn(capabilities, "nativeCallNotifications", "get").mockReturnValue(false);
+  showMessageNotification("Alice", "chat-1", "sticker"); await flush();
+  expect(mocks.notify).toHaveBeenCalledWith(expect.objectContaining({ body: "Sticker" }));
 });
 it("requires native Android and explicit flags while preserving passkey handoff", () => {
   vi.restoreAllMocks();

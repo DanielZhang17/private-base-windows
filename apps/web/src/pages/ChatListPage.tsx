@@ -1,9 +1,11 @@
 import { t, useLocale } from "../i18n/index.js";
 import { useEffect, useRef, useState } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useChatList } from "../features/chat/useChatList.js";
 import { UpdateBanner } from "../features/updates/UpdateBanner.js";
 import { chatPreview } from "../features/chat/presentation.js";
+import { TRANSFER_RECEIVE_PATH } from "../features/transfer/HistoryTransferScreens.js";
+import { capabilities } from "../platform/capabilities.js";
 import { Button, CountBadge, Dialog, EmptyState, Field, Icon, IconButton, Input, ListItem, Notice, Skeleton, TopBar } from "../ui/index.js";
 import UserAvatar from "../components/avatar/UserAvatar.js";
 import UserPicker from "../components/user-picker/UserPicker.js";
@@ -12,6 +14,7 @@ export default function ChatListPage() {
   const { locale } = useLocale();
   const flow = useChatList();
   const { pathname } = useLocation();
+  const navigate = useNavigate();
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -45,6 +48,10 @@ export default function ChatListPage() {
       <Input ref={searchRef} aria-label={t("searchConversations")} placeholder={t("searchAction")} leading={<Icon name="search" size={18} />} value={search} onChange={(event) => setSearch(event.target.value)} />
     </div>
     {flow.listError && <Notice tone="danger" className="m-2" action={<Button variant="danger-ghost" size="sm" onClick={flow.dismissListError}>{t("dismiss")}</Button>}>{flow.listError}</Notice>}
+    {pathname === "/" && flow.showHistoryGuidance && <Notice className="m-2" action={capabilities.historyTransfer &&
+      <Button variant="secondary" size="sm" leadingIcon="transfer" onClick={() => navigate(TRANSFER_RECEIVE_PATH)}>{t("passkeySetup.transferAction")}</Button>}>
+      {t("chats.historyOnOtherDevices")}
+    </Notice>}
     <div className="min-h-0 flex-1 overflow-y-auto">
       {flow.loadError && !flow.conversations ? <EmptyState icon="offline" title={t("couldNotLoadConversations")} description={flow.loadError} />
         : flow.isLoading ? <div className="space-y-2 p-3" aria-busy="true" aria-label={t("loadingChats")}>{Array.from({ length: 6 }, (_, i) => <div key={i} className="flex h-16 items-center gap-3"><Skeleton shape="circle" /><div className="flex-1 space-y-2"><Skeleton className="w-3/4" /><Skeleton /></div></div>)}</div>
@@ -66,8 +73,7 @@ export default function ChatListPage() {
             event.preventDefault(); buttons[(index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length]?.focus();
           }}>{accepted.map((conversation) => {
             const peer = flow.getDirectPeer(conversation);
-            const messages = flow.allMessages.get(conversation.id);
-            const last = messages?.[messages.length - 1];
+            const last = flow.getLastVisibleMessage(conversation.id);
             const failed = last?.status === "failed";
             const unread = flow.unreadCounts.get(conversation.id) ?? 0;
             const preview = last ? chatPreview(last, conversation, flow.user?.id) : conversation.type === "group" ? t("members", { count: conversation.members.length }) : t("startChatting");

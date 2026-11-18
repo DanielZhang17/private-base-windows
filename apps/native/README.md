@@ -408,6 +408,51 @@ the NSIS installer is `apps/native/src-tauri/target/debug/bundle/nsis/*-setup.ex
 These are unsigned test builds. Do not use the shared release-build example for
 this branch's validation.
 
+### Windows Hello device unlock
+
+The local Windows main window exposes the three biometric IPC commands. Startup
+only queries `KeyCredentialManager.IsSupportedAsync()` on an MTA worker and
+waits at most 250 ms. The shell adds `biometricUnlock: "windows-hello"` before
+frontend JS starts when Windows reports readiness. It also offers Hello if the
+probe times out, is otherwise inconclusive, or an existing slot needs unlock or
+cleanup. The startup probe is noninteractive. Enrollment goes directly to
+credential creation, which reports current availability.
+
+Enroll and unlock request Windows Hello verification for a fixed per-vault
+challenge bound to the installation. Hello can verify a face, fingerprint, or
+TPM-backed Windows Hello PIN. Explicit enrollment creates the vault credential,
+requires TPM attestation, and signs the same challenge twice. Both signatures
+must be identical and verify as RSA PKCS#1 v1.5 with SHA-256. Enrollment returns
+`unsupported` if either check fails. The signing code wipes the original WinRT
+buffer after copying the signature into zeroizing storage.
+
+The backend flushes a marker named by the vault UUID before creating its Hello
+credential. Later enrollment attempts retry any native rollback that Windows
+could not confirm. The web client also records the UUID in the IndexedDB cleanup
+queue before invoking enrollment. The transaction that saves the usable slot
+removes that queue entry. If the webview closes before the transaction commits,
+startup or reset can retry deletion of the orphaned credential and wrapped key.
+Settings and the unlock offer share the unsupported result. Transient service
+and public-key export failures remain retryable.
+
+The backend derives an AES-256-GCM wrapping key from the Hello signature with
+HKDF-SHA-256 and protects the wrapped record with user-scoped DPAPI in the app's
+local data directory under `biometric-unlock`. A missing or replaced credential,
+including one lost through a destructive Hello reset, maps to `invalidated`.
+Hello does not report biometric re-enrollment through this API, and a changed face
+or fingerprint set does not by itself invalidate the slot.
+
+[Microsoft's Windows Hello API and TPM attestation guidance](https://learn.microsoft.com/en-us/windows/apps/develop/security/windows-hello)
+
+The removal path derives the new credential name from the vault ID, so it can
+delete the credential even if the installation ID is unreadable or missing, or
+the wrapped file no longer exists.
+It removes the record after Windows confirms the credential is gone. Legacy
+records remain readable with their original installation ID. Removal verifies
+the legacy record against that ID. If the ID is missing or has been replaced,
+removal preserves the record and reports a retryable failure because it cannot
+identify the credential.
+
 ### Open and save decrypted attachments
 
 Windows merges `fileOpen: true` and `fileSave: "dialog"` into the existing

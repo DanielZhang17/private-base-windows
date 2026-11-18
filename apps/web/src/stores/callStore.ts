@@ -13,7 +13,7 @@ interface BaseCallMeta {
 type OutgoingCallMeta = BaseCallMeta & { conversationName?: string | null };
 
 interface CallState {
-  pendingCallStart: { token: symbol; callId: string | null } | null;
+  pendingCallStart: { token: symbol; callId: string | null; accepted?: true } | null;
   beginCallStart: () => symbol | null;
   bindCallStart: (token: symbol, callId: string) => boolean;
   finishCallStart: (token: symbol) => void;
@@ -168,7 +168,7 @@ export const useCallStore = create<CallState>()((set) => ({
         activeCallId: meta.callId,
         conversationId: meta.conversationId,
         callType: meta.callType,
-        callStatus: "ringing",
+        callStatus: token && state.pendingCallStart?.accepted ? "active" : "ringing",
         direction: "outgoing",
         initiatorId: meta.initiatorId,
         callerUserId: meta.initiatorId,
@@ -215,9 +215,10 @@ export const useCallStore = create<CallState>()((set) => ({
         callStatus: status,
         ...(ended ? { localCallOwnership: null, localCallEpoch: state.localCallEpoch + 1 } : {}),
       };
-      if (ended && state.pendingCallStart?.callId === callId) return {
-        pendingCallStart: null, localCallEpoch: state.localCallEpoch + 1,
-      };
+      if (state.pendingCallStart?.callId === callId) {
+        if (ended) return { pendingCallStart: null, localCallEpoch: state.localCallEpoch + 1 };
+        if (status === "active") return { pendingCallStart: { ...state.pendingCallStart, accepted: true } };
+      }
       return state;
     }),
   markKeyReady: (callId, ready = true) =>

@@ -231,15 +231,18 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
         if (!isCurrent()) return;
         callKeyRef.current = key;
 
+        // Acceptance can arrive on the socket while the ringing snapshot is in flight.
+        const live = useCallStore.getState();
+        const status = info.status === "ringing" && live.activeCallId === info.id && live.callStatus === "active" ? "active" : info.status;
         setStateCallId(currentCallId);
-        setCallInfo(info);
+        setCallInfo({ ...info, status });
         setConversation(conversationDetails);
         hydrateCall({
           callId: info.id,
           conversationId: info.conversationId,
           callType: info.type,
           initiatorId: info.initiatorId,
-          status: info.status,
+          status,
           direction: info.initiatorId === currentUser.id ? "outgoing" : "incoming",
           keyReady: !!pendingCall,
           callerUserId: info.initiatorId,
@@ -247,7 +250,7 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
           callerAvatarUrl: conversationDetails.members.find((member) => member.userId === info.initiatorId)?.user.avatarUrl ?? null,
           conversationName: conversationDisplayName(conversationDetails, currentUser.id),
         });
-        setStage(info.status === "active" ? "connecting" : info.status === "ringing" ? "ringing" : "ended");
+        setStage(status === "active" ? "connecting" : status === "ringing" ? "ringing" : "ended");
       } catch (err: any) {
         if (isCurrent()) {
           setStateCallId(currentCallId);

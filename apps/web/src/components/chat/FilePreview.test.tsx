@@ -1,3 +1,4 @@
+import { OVERLAY_RANK, registerOverlay } from "../../ui/overlay-stack.js";
 import { act, createRef, type Ref } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import SaveFeedbackToastProvider from "../app/SaveFeedbackToastProvider.js";
@@ -5,7 +6,7 @@ import IncomingCallModal from "../calls/IncomingCallModal.js";
 import * as environment from "../../platform/environment.js";
 import FilePreview, { type FilePreviewActions } from "./FilePreview.js";
 import MediaViewer from "./MediaViewer.js";
-import { getCachedFile, setCachedFile } from "../../db/index.js";
+import { getCachedFile, cacheAttachmentForMessage } from "../../db/index.js";
 import { decryptFile } from "@e2ee-chat/crypto";
 import { openFile, prepareFileOpen, saveFile, SaveUnsupportedError } from "../../platform/files.js";
 import { capabilities } from "../../platform/capabilities.js";
@@ -17,8 +18,9 @@ import { useAuthStore } from "../../stores/authStore.js";
 import { useCallStore } from "../../stores/callStore.js";
 import { Dialog, Sheet } from "../../ui/index.js";
 import { click, press, setupDom } from "../../ui/test-utils.js";
+import * as localKeys from "../../lib/key-manager.js";
 
-vi.mock("../../db/index.js", () => ({ getCachedFile: vi.fn(), setCachedFile: vi.fn() }));
+vi.mock("../../db/index.js", () => ({ getCachedFile: vi.fn(), cacheAttachmentForMessage: vi.fn(async () => {}) }));
 vi.mock("../../stores/authStore.js", async () => {
   const { create } = await import("zustand");
   return { useAuthStore: create(() => ({ accessToken: "token", user: { id: "alice" }, device: { id: "device" }, sessionId: "session" })) };
@@ -47,13 +49,78 @@ afterEach(async () => {
   await act(async () => clearUnlockedSessionState());
   vi.restoreAllMocks();
 });
-const render = (mimeType = "application/pdf", fileId = "file", sizeBytes = 3, actionsRef?: Ref<FilePreviewActions>) => dom.render(<SaveFeedbackToastProvider><FilePreview fileId={fileId} fileName="private.pdf" mimeType={mimeType} fileKey="key" fileIv="iv" sizeBytes={sizeBytes} actionsRef={actionsRef} /></SaveFeedbackToastProvider>);
+const render = (mimeType = "application/pdf", fileId = "file", sizeBytes: number | null = 3, actionsRef?: Ref<FilePreviewActions>) => dom.render(<SaveFeedbackToastProvider><FilePreview fileId={fileId} fileName="private.pdf" mimeType={mimeType} fileKey="key" fileIv="iv" sizeBytes={sizeBytes ?? undefined} actionsRef={actionsRef} /></SaveFeedbackToastProvider>);
 const download = () => dom.container().querySelector<HTMLButtonElement>('[aria-label="Save private.pdf"][title]')!;
 const toastLayer = () => document.querySelector('[role="region"][aria-label="Notifications"]')!;
 const successToast = () => toastLayer().querySelector('[data-toast-tone="success"]');
 const errorToast = () => toastLayer().querySelector('[data-toast-tone="danger"]');
 const viewerSaveNotice = (viewer: Element) => viewer.querySelector('.media-viewer-toolbar [role="group"]');
 const liveRegion = (surface: Element, priority: "polite" | "assertive") => surface.querySelector(`[aria-live="${priority}"]`)!;
+
+it("opens a transferred sealed attachment offline using the message's file key", async () => {
+  vi.spyOn(localKeys, "keysLoaded").mockReturnValue(true);
+  const sealed = { iv: new Uint8Array(12), ciphertext: new Blob(["device-sealed"]) };
+  vi.mocked(getCachedFile).mockResolvedValueOnce({ id: "file", ownerId: "alice", sealed,
+    cachedAt: Date.now(), expiresAt: Date.now() + 60_000 });
+  const wire = { arrayBuffer: async () => Uint8Array.of(45).buffer } as Blob;
+  vi.spyOn(localKeys, "openCachedAttachment").mockResolvedValueOnce(wire);
+  vi.mocked(fetch).mockRejectedValue(new Error("offline"));
+  await dom.render(<SaveFeedbackToastProvider><FilePreview messageId="imported-message" fileId="file" fileName="private.png"
+    mimeType="image/png" fileKey="transferred-key" fileIv="iv" sizeBytes={3} /></SaveFeedbackToastProvider>);
+  expect(getCachedFile).toHaveBeenCalledWith("file", "alice");
+  expect(localKeys.openCachedAttachment).toHaveBeenCalledWith("alice", "file", sealed);
+  expect(decryptFile).toHaveBeenCalledWith(new Uint8Array([45]), { key: "transferred-key", iv: "iv" });
+  expect(fetch).not.toHaveBeenCalled();
+  expect(dom.container().querySelector("img")?.src).toBe("blob:preview");
+  await act(async () => clearUnlockedSessionState());
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:preview");
+  expect(dom.container().querySelector("img")).toBeNull();
+});
+
+it.each([true, false])("repairs a failed explicit copy only after an authenticated download (valid %s)", async (valid) => {
+  vi.spyOn(localKeys, "keysLoaded").mockReturnValue(true);
+  vi.spyOn(localKeys, "openCachedAttachment").mockRejectedValueOnce(new Error("Invalid cached attachment"));
+  const iv = new Uint8Array(12).fill(7);
+  vi.mocked(getCachedFile).mockResolvedValueOnce({ id: "file", ownerId: "alice", explicitTransfer: true,
+    sealed: { iv, ciphertext: new Blob(["damaged"]) }, cachedAt: 42, expiresAt: Date.now() + 60_000 });
+  const repaired = { iv: new Uint8Array(12).fill(8), ciphertext: new Blob(["sealed download"]) };
+  const seal = vi.spyOn(localKeys, "sealCachedAttachment").mockResolvedValueOnce(repaired);
+  if (!valid) vi.mocked(decryptFile).mockRejectedValueOnce(new Error("Invalid download"));
+  await dom.render(<SaveFeedbackToastProvider><FilePreview messageId="imported-message" fileId="file" fileName="private.png"
+    mimeType="image/png" fileKey="transferred-key" fileIv="iv" sizeBytes={3} /></SaveFeedbackToastProvider>);
+  expect(fetch).toHaveBeenCalledWith("/encrypted", expect.objectContaining({ headers: { Authorization: "Bearer token" } }));
+  if (valid) {
+    expect(cacheAttachmentForMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ sealed: repaired }),
+      "imported-message", expect.any(Function), { cachedAt: 42, iv });
+    expect(dom.container().querySelector("img")?.src).toBe("blob:preview");
+  } else {
+    expect(seal).not.toHaveBeenCalled();
+    expect(cacheAttachmentForMessage).not.toHaveBeenCalled();
+  }
+});
+
+it.each([true, false])("rejects authenticated short cache bytes and requires a complete replacement (complete %s)", async (complete) => {
+  vi.spyOn(localKeys, "keysLoaded").mockReturnValue(true);
+  vi.spyOn(localKeys, "openCachedAttachment").mockResolvedValueOnce({ arrayBuffer: async () => Uint8Array.of(45).buffer } as Blob);
+  const sealed = { iv: new Uint8Array(12), ciphertext: new Blob(["cached"]) };
+  vi.mocked(getCachedFile).mockResolvedValueOnce({ id: "file", ownerId: "alice", explicitTransfer: true, sealed,
+    cachedAt: 42, expiresAt: Date.now() + 60_000 });
+  const seal = vi.spyOn(localKeys, "sealCachedAttachment").mockResolvedValueOnce(sealed);
+  vi.mocked(decryptFile).mockResolvedValueOnce(Uint8Array.of(1, 2)).mockResolvedValueOnce(new Uint8Array(complete ? 3 : 2));
+  await dom.render(<SaveFeedbackToastProvider><FilePreview messageId="imported-message" fileId="file" fileName="private.png"
+    mimeType="image/png" fileKey="transferred-key" fileIv="iv" sizeBytes={3} /></SaveFeedbackToastProvider>);
+  expect(fetch).toHaveBeenCalledOnce();
+  expect(decryptFile).toHaveBeenCalledTimes(2);
+  expect(Boolean(dom.container().querySelector("img"))).toBe(complete);
+  if (complete) {
+    expect(cacheAttachmentForMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ sealed }),
+      "imported-message", expect.any(Function), { cachedAt: 42, iv: sealed.iv });
+  } else {
+    expect(seal).not.toHaveBeenCalled();
+    expect(cacheAttachmentForMessage).not.toHaveBeenCalled();
+    expect(dom.container().querySelector('[role="alert"]')?.textContent).toContain("private.png");
+  }
+});
 
 describe.each(["toast", "viewer"] as const)("save announcements in the %s", (surfaceType) => {
   it.each([
@@ -370,7 +437,7 @@ it.each(["application/pdf", "image/png", "video/mp4", "application/x-apple-diski
   expect(blob.size).toBe(3);
   expect(filename).toBe("private.pdf");
   expect(getCachedFile).not.toHaveBeenCalled();
-  expect(setCachedFile).not.toHaveBeenCalled();
+  expect(cacheAttachmentForMessage).not.toHaveBeenCalled();
   expect(successToast()).toBeNull();
 });
 
@@ -728,7 +795,7 @@ it("does not create a blob URL if decryption finishes after unmount", async () =
   await dom.render(null);
   await act(async () => finish(new Uint8Array([1, 2, 3])));
   expect(URL.createObjectURL).not.toHaveBeenCalled();
-  expect(setCachedFile).not.toHaveBeenCalled();
+  expect(cacheAttachmentForMessage).not.toHaveBeenCalled();
 });
 
 const newMediaTypes = ["image/avif", "image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence", "video/quicktime"];
@@ -781,7 +848,7 @@ it("tapping a PDF opens through the platform adapter without an iframe or decryp
   expect(document.querySelector("iframe")).toBeNull();
   expect(openFile).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ type: "application/pdf", size: 3 }), "private.pdf", "application/pdf");
   expect(saveFile).not.toHaveBeenCalled();
-  expect(setCachedFile).not.toHaveBeenCalled();
+  expect(cacheAttachmentForMessage).not.toHaveBeenCalled();
 });
 it.each(["unsupported", "no_app", "cancelled"])("shows native Open failure %s as a toast", async (code) => {
   vi.spyOn(environment, "isNative").mockReturnValue(true);
@@ -837,13 +904,14 @@ it("closes a reserved tab if decryption completes after the preview unmounts", a
 
 it.each(["text/plain", "text/markdown", "text/csv"])("renders %s literally through textContent in the app viewer", async (type) => {
   const content = '<script>alert("untrusted")</script><img src=x onerror=alert(1)> # heading';
-  vi.mocked(decryptFile).mockResolvedValueOnce(new TextEncoder().encode(content));
+  const bytes = new TextEncoder().encode(content);
+  vi.mocked(decryptFile).mockResolvedValueOnce(bytes);
   const readText = Blob.prototype.text;
   let reading!: Promise<string>;
   vi.spyOn(Blob.prototype, "text").mockImplementation(function (this: Blob) { reading = readText.call(this); return reading; });
   const open = vi.spyOn(window, "open");
   const alert = vi.spyOn(window, "alert");
-  await render(type);
+  await render(type, "file", bytes.length);
   await click(dom.container().querySelector('[aria-label="Open private.pdf"]')!);
   await act(async () => { await reading; });
   expect(document.querySelector("pre")?.textContent).toBe(content);
@@ -859,8 +927,8 @@ it.each(["text/plain", "text/markdown", "text/csv"])("renders %s literally throu
 it.each(["declared", "actual"])("caps the %s text size at 2 MiB and offers Download", async (sizeSource) => {
   const size = 2 * 1024 * 1024 + 1;
   const read = vi.spyOn(Blob.prototype, "text");
-  if (sizeSource === "actual") vi.mocked(decryptFile).mockResolvedValueOnce(new Uint8Array(size));
-  await render("text/plain", "file", sizeSource === "declared" ? size : 3);
+  vi.mocked(decryptFile).mockResolvedValueOnce(new Uint8Array(size));
+  await render("text/plain", "file", sizeSource === "declared" ? size : null);
   await click(dom.container().querySelector('[aria-label="Open private.pdf"]')!);
   expect(document.querySelector('[role="dialog"]')?.textContent).toContain("This text file is too large to preview");
   expect(document.querySelector("pre")).toBeNull();
@@ -872,9 +940,10 @@ it.each(["declared", "actual"])("caps the %s text size at 2 MiB and offers Downl
 });
 it.each(["image/svg+xml", "text/html", "application/xml"])("downloads active %s without previewing or navigating it", async (type) => {
   vi.useFakeTimers();
-  vi.mocked(decryptFile).mockResolvedValueOnce(new TextEncoder().encode('<svg><script>alert(1)</script></svg>'));
+  const bytes = new TextEncoder().encode('<svg><script>alert(1)</script></svg>');
+  vi.mocked(decryptFile).mockResolvedValueOnce(bytes);
   const open = vi.spyOn(window, "open");
-  await render(type);
+  await render(type, "file", bytes.length);
   expect(dom.container().querySelector("img,video,iframe")).toBeNull();
   expect(fetch).not.toHaveBeenCalled();
   await click(dom.container().querySelector('[aria-label="Save private.pdf"]:not([title])')!);
@@ -932,10 +1001,11 @@ it("opens HTML bytes declared as PDF only in a forced-PDF tab, never an iframe",
   vi.useFakeTimers();
   const actual = await vi.importActual<typeof import("../../platform/files.js")>("../../platform/files.js");
   vi.mocked(prepareFileOpen).mockImplementationOnce(actual.prepareFileOpen);
-  vi.mocked(decryptFile).mockResolvedValueOnce(new TextEncoder().encode('<html><script>window.opener.localStorage.clear()</script></html>'));
+  const bytes = new TextEncoder().encode('<html><script>window.opener.localStorage.clear()</script></html>');
+  vi.mocked(decryptFile).mockResolvedValueOnce(bytes);
   const tab = { closed: false, opener: window, location: { replace: vi.fn() }, close: vi.fn() };
   const open = vi.spyOn(window, "open").mockReturnValue(tab as never);
-  await render();
+  await render("application/pdf", "file", bytes.length);
   await click(dom.container().querySelector('[aria-label="Open private.pdf"]')!);
   expect(open).toHaveBeenCalledWith("about:blank", "_blank");
   expect(tab.opener).toBeNull();
@@ -955,7 +1025,7 @@ it("reserves every PDF tab synchronously, including repeated opens of a cached d
   const open = vi.spyOn(window, "open").mockReturnValueOnce(first as never).mockReturnValueOnce(second as never);
   let finish!: (bytes: Uint8Array) => void;
   vi.mocked(decryptFile).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
-  await render();
+  await render("application/pdf", "file", 4);
   await click(dom.container().querySelector('[aria-label="Open private.pdf"]')!);
   expect(open).toHaveBeenCalledTimes(1);
   expect(first.opener).toBeNull();
@@ -998,13 +1068,14 @@ it("shows size before extension and one 44px Save button with inherited contrast
 });
 it("copies literal text from the viewer footer and offers Save beside it", async () => {
   const content = "<b>literal text</b>";
-  vi.mocked(decryptFile).mockResolvedValueOnce(new TextEncoder().encode(content));
+  const bytes = new TextEncoder().encode(content);
+  vi.mocked(decryptFile).mockResolvedValueOnce(bytes);
   const writeText = vi.fn(async () => {});
   Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
   const readText = Blob.prototype.text;
   let reading!: Promise<string>;
   vi.spyOn(Blob.prototype, "text").mockImplementation(function (this: Blob) { reading = readText.call(this); return reading; });
-  await render("text/plain");
+  await render("text/plain", "file", bytes.length);
   const opener = dom.container().querySelector('[aria-label="Open private.pdf"]')!;
   const row = opener.closest('[tabindex="-1"]');
   await click(opener);
@@ -1036,11 +1107,12 @@ it.each([
   { result: "saved", priority: "polite", text: "Saved" },
   { result: "failed", priority: "assertive", text: "Failed to save file" },
 ] as const)("closes oversized text preview before saving and shows a $result result in the global toast", async ({ result, priority, text }) => {
+  const size = 2 * 1024 * 1024 + 1;
   if (result === "saved") vi.mocked(saveFile).mockResolvedValueOnce("saved");
   else vi.mocked(saveFile).mockRejectedValueOnce(new Error("Save denied"));
   let finish!: (bytes: Uint8Array) => void;
   vi.mocked(decryptFile).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
-  await render("text/plain", "file", 2 * 1024 * 1024 + 1);
+  await render("text/plain", "file", size);
   const opener = dom.container().querySelector('[aria-label="Open private.pdf"]')!;
   const row = opener.closest('[tabindex="-1"]');
   await click(opener);
@@ -1050,7 +1122,7 @@ it.each([
   expect(document.querySelector('[role="dialog"]')).toBeNull();
   expect(document.activeElement).toBe(row);
   await press("Escape");
-  await act(async () => finish(new Uint8Array([1, 2, 3])));
+  await act(async () => finish(new Uint8Array(size)));
   expect(saveFile).toHaveBeenCalledOnce();
   expect(document.activeElement).toBe(row);
   expect(liveRegion(toastLayer(), priority).textContent).toBe(text);
@@ -1084,4 +1156,20 @@ it("labels mobile saving Share and keeps blocked rows behind an explicit warning
   expect(warning.querySelector("svg")?.getAttribute("class")).toContain("text-warn");
   await click([...warning.querySelectorAll("button")].find((button) => button.textContent === "Share file")!);
   expect(saveFile).toHaveBeenCalledOnce();
+});
+
+it("shows a save failure for its full visible duration with a picker popover open", async () => {
+  vi.useFakeTimers();
+  await render();
+  await act(async () => captureSaveFeedback("private.pdf").publish("danger", "failedToSaveFile"));
+  expect(errorToast()).not.toBeNull();
+  let unregister!: () => void;
+  await act(async () => { unregister = registerOverlay({ kind: "popover", rank: OVERLAY_RANK.picker }); });
+  try {
+    expect(errorToast()).not.toBeNull();
+    await act(async () => vi.advanceTimersByTime(7999));
+    expect(errorToast()).not.toBeNull();
+    await act(async () => vi.advanceTimersByTime(1));
+    expect(errorToast()).toBeNull();
+  } finally { await act(async () => unregister()); }
 });

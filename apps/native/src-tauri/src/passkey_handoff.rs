@@ -312,6 +312,11 @@ pub(super) mod windows {
                 );
                 let capture_protection_enabled = capture_protection.enabled()?;
                 app.manage(capture_protection);
+                let biometrics = crate::biometric_unlock::BiometricUnlock::probe(
+                    app.path().app_local_data_dir().ok(),
+                );
+                let biometric_capability = biometrics.capability();
+                app.manage(biometrics);
                 let config = app
                     .config()
                     .app
@@ -324,7 +329,10 @@ pub(super) mod windows {
                 let window = WebviewWindowBuilder::from_config(app, config)?
                     .content_protected(capture_protection_enabled)
                     .visible(false)
-                    .initialization_script(crate::native_capabilities_script(available))
+                    .initialization_script(crate::native_capabilities_script(
+                        available,
+                        biometric_capability,
+                    ))
                     .build()?;
                 #[cfg(windows)]
                 crate::capture_protection::apply(&window, capture_protection_enabled)?;

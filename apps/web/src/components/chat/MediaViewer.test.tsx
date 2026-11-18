@@ -1,6 +1,10 @@
 import { act, useState } from "react";
 import { beforeEach, afterEach, expect, it, vi } from "vitest";
+import { BrowserRouter } from "react-router-dom";
 import MediaViewer from "./MediaViewer.js";
+import { RouterNavigation } from "../../platform/RouterNavigation.js";
+import { OVERLAY_RANK } from "../../ui/overlay-stack.js";
+import { useOverlayLayer } from "../../ui/useOverlayLayer.js";
 import { Dialog } from "../../ui/index.js";
 import { click, press, setupDom } from "../../ui/test-utils.js";
 
@@ -213,4 +217,31 @@ it("plays video inline with native controls, ignores video taps, and pauses on b
   await click(stage());
   expect(onClose).toHaveBeenCalledTimes(1);
   expect(video.pause).toHaveBeenCalledTimes(1);
+});
+
+it("dismisses the viewer above the phone picker on the first Back and the picker on the second", async () => {
+  vi.useRealTimers();
+  vi.stubGlobal("CloseWatcher", undefined);
+  history.replaceState({ idx: 0 }, "", "/");
+  history.pushState({ idx: 1 }, "", "/chat/viewer");
+  function PickerAndViewer() {
+    const [picker, setPicker] = useState(true);
+    useOverlayLayer(picker, "popover", OVERLAY_RANK.picker, () => setPicker(false));
+    return <>{picker && <section id="phone-picker" />}<Harness /></>;
+  }
+  await render(<BrowserRouter><RouterNavigation><PickerAndViewer /></RouterNavigation></BrowserRouter>);
+  await click(document.getElementById("opener")!);
+  expect(dialog()).not.toBeNull();
+  const back = () => act(async () => {
+    const traversed = new Promise<void>((resolve) => window.addEventListener("popstate", () => resolve(), { once: true }));
+    history.back();
+    await traversed;
+  });
+  await back();
+  expect(onClose).toHaveBeenCalledTimes(1);
+  expect(dialog()).toBeNull();
+  expect(document.getElementById("phone-picker")).not.toBeNull();
+  await back();
+  expect(document.getElementById("phone-picker")).toBeNull();
+  expect(window.location.pathname).toBe("/chat/viewer");
 });

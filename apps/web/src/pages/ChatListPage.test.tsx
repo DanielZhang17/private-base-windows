@@ -1,7 +1,7 @@
-import { getByRole } from "@testing-library/dom";
+import { getByRole, queryByRole, waitFor } from "@testing-library/dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AppShell } from "../ui/index.js";
@@ -10,6 +10,11 @@ import ChatListPage from "./ChatListPage.js";
 import { api } from "../services/api.js";
 import { fetchConversationList } from "../lib/conversation-cache.js";
 import { setLocalePreference } from "../i18n/index.js";
+import { useChatStore } from "../stores/chatStore.js";
+import { getAppDB } from "../db/index.js";
+import { importHistoryTransferItem } from "../db/history-transfer.js";
+import { useAuthStore } from "../stores/authStore.js";
+import { capabilities } from "../platform/capabilities.js";
 vi.mock("../features/updates/UpdateProvider.js", () => ({ useAppUpdates: vi.fn(() => null) }));
 vi.mock("../stores/authStore.js", async () => { const { create } = await import("zustand"); return { useAuthStore: create(() => ({ user: { id: "alice" } })) }; });
 vi.mock("../services/api.js", () => ({ api: { post: vi.fn() } }));
@@ -35,6 +40,108 @@ it("keeps the Chats route title localized when switching to French", async () =>
   expect(document.title).toBe("Chats · Private Base");
   await act(async () => { await setLocalePreference("fr"); });
   expect(document.title).toBe("Discussions · Private Base");
+});
+it("uses the latest message visible to the signed-in account for the preview", async () => {
+  const row = { conversationId: "existing", senderId: "peer", type: "text", status: "delivered", expiryKind: "retention",
+    expiresAt: null, timestamp: 1 } as const;
+  await act(async () => {
+    useChatStore.getState().setMessages("existing", [
+      { ...row, id: "own", ownerId: "alice", content: "Visible history" },
+      { ...row, id: "foreign", ownerId: "bob", importedAt: 2, timestamp: 2, content: "Other account history" },
+    ]);
+  });
+  expect(container.textContent).toContain("Visible history");
+  expect(container.textContent).not.toContain("Other account history");
+  await act(async () => { useChatStore.getState().removeConversationMessages("existing"); });
+});
+it("restores the latest imported direct-chat preview when the list mounts after reload", async () => {
+  const now = Date.now();
+  const conversation = { id: "copied", type: "direct", name: "Copied chat", avatarUrl: null,
+    invitePolicy: "any_member", createdBy: "alice", createdAt: now, updatedAt: now,
+    members: [{ conversationId: "copied", userId: "alice", role: "admin", acceptedAt: now, joinedAt: now,
+      user: { username: "alice", displayName: "Alice", avatarUrl: null } }],
+  } as const;
+  const db = await getAppDB();
+  try {
+    await act(async () => { root.render(null); useChatStore.getState().removeConversationMessages("copied"); });
+    await importHistoryTransferItem("alice", { entry: { kind: "conversation", conversation: { ...conversation, members: [...conversation.members] } } });
+    await importHistoryTransferItem("alice", { entry: { kind: "message", message: { id: "copied-message", conversationId: "copied",
+      senderId: "peer", type: "text", content: "Recovered preview", timestamp: now,
+      expiresAt: now + 60_000, status: "delivered" } } });
+    client.setQueryData(["conversations"], [conversation]);
+    await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter><ChatListPage /></MemoryRouter></QueryClientProvider>));
+    await act(async () => { await waitFor(() => expect(useChatStore.getState().messages.get("copied")).toHaveLength(1)); });
+    expect(container.textContent).toContain("Recovered preview");
+
+    const reads = vi.spyOn(db, "transaction");
+    try {
+      await act(async () => {
+        client.setQueryData(["conversations"], [{ ...conversation, updatedAt: now + 1 }]);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      expect(reads).not.toHaveBeenCalled();
+
+      const added = { ...conversation, id: "newly-eligible", members: [{ ...conversation.members[0], conversationId: "newly-eligible" }] };
+      await importHistoryTransferItem("alice", { entry: { kind: "conversation", conversation: added } });
+      await importHistoryTransferItem("alice", { entry: { kind: "message", message: { id: "newly-eligible-message", conversationId: added.id,
+        senderId: "peer", type: "text", content: "Newly eligible preview", timestamp: now, expiresAt: now + 60_000, status: "delivered" } } });
+      reads.mockClear();
+      await act(async () => {
+        client.setQueryData(["conversations"], [conversation, added]);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      await act(async () => { await waitFor(() => expect(useChatStore.getState().messages.get(added.id)).toHaveLength(1)); });
+      expect(reads.mock.calls.filter(([stores]) => Array.isArray(stores) && stores.includes("displayMessages"))).toHaveLength(1);
+    } finally { reads.mockRestore(); }
+  } finally {
+    await db.clear("accountConversations");
+    await db.clear("displayMessages");
+    await db.clear("accountState");
+    await act(async () => {
+      useChatStore.getState().removeConversationMessages("copied");
+      useChatStore.getState().removeConversationMessages("newly-eligible");
+    });
+  }
+});
+
+it("shows the account-empty state when a linked device has no conversations", async () => {
+  try {
+    await act(async () => {
+      useAuthStore.setState({ device: { linkMethod: "passkey" } as ReturnType<typeof useAuthStore.getState>["device"] });
+      client.setQueryData(["conversations"], []);
+      root.render(<QueryClientProvider client={client}><MemoryRouter key="empty"><ChatListPage /></MemoryRouter></QueryClientProvider>);
+    });
+    expect(getByRole(container, "heading", { name: "No conversations yet" })).toBeTruthy();
+    expect(getByRole(container, "button", { name: "Start a conversation" })).toBeTruthy();
+    expect(container.textContent).not.toContain("Earlier messages stay on your other devices.");
+  } finally {
+    await act(async () => useAuthStore.setState({ device: null }));
+  }
+});
+
+it.each([false, true])("guides a linked device with older conversations to receive history when enabled (%s)", async enabled => {
+  const previous = capabilities.historyTransfer;
+  capabilities.historyTransfer = enabled;
+  const now = Date.now();
+  const Location = () => { const { pathname, search } = useLocation(); return <output>{pathname}{search}</output>; };
+  try {
+    await act(async () => {
+      useAuthStore.setState({ device: { linkMethod: "passkey", activatedAt: now } as ReturnType<typeof useAuthStore.getState>["device"] });
+      client.setQueryData(["conversations"], [
+        { ...conversations[0], createdAt: now - 1000, members: [{ userId: "alice", joinedAt: now - 1000, acceptedAt: now - 1000 }] },
+      ]);
+      root.render(<QueryClientProvider client={client}><MemoryRouter><Location /><ChatListPage /></MemoryRouter></QueryClientProvider>);
+    });
+    expect(container.textContent).toContain("Earlier messages stay on your other devices.");
+    const action = queryByRole<HTMLButtonElement>(container, "button", { name: "Transfer history" });
+    if (enabled) {
+      await act(async () => action!.click());
+      expect(container.querySelector("output")?.textContent).toBe("/devices/transfer?mode=receive");
+    } else expect(action).toBeNull();
+  } finally {
+    capabilities.historyTransfer = previous;
+    await act(async () => useAuthStore.setState({ device: null }));
+  }
 });
 it("F7: keeps cached chats and request actions available and lets the user dismiss action errors", async () => {
   vi.mocked(api.post).mockRejectedValue(new Error("Accept failed"));

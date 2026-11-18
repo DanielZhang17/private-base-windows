@@ -18,7 +18,7 @@ import { clearAccountScopedState } from "./session.js";
 vi.hoisted(() => {
   Object.defineProperty(globalThis, "localStorage", { value: jsdom.window.localStorage, configurable: true });
 });
-vi.mock("../lib/key-manager.js", () => ({ lockLocalCryptoState: vi.fn() }));
+vi.mock("../lib/key-manager.js", () => ({ lockLocalCryptoState: vi.fn(), keysLoaded: () => false }));
 vi.mock("../lib/message-processor.js", () => ({ decryptMessage: vi.fn(), decryptGroupText: vi.fn() }));
 
 function deferred<T>() {
@@ -39,7 +39,7 @@ const frame = (): WSMessageFrame => ({
   expiresAt: Date.now() + 60_000, expiryKind: "retention",
 });
 const localMessage = (id: string, timestamp: number): db.LocalMessage => ({
-  id, conversationId: "conv", senderId: "peer", type: "text", content: plaintext,
+  id, ownerId: "old-user", conversationId: "conv", senderId: "peer", type: "text", content: plaintext,
   timestamp, expiresAt: Date.now() + 60_000, expiryKind: "retention", status: "delivered",
 });
 

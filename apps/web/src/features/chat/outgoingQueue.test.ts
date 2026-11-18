@@ -1,12 +1,20 @@
+import { setLocalEncryptionKey } from "../../lib/local-key-encryption.js";
+import { connectLocalMessageChannel } from "../../lib/local-message-changes.js";
+import { handleMessageDeletion, startLocalHiddenMessageSync } from "../../lib/message-sync.js";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { cleanupExpiredMessages, getAppDB, getAllOutgoing, getMessageById, saveMessage, getOutgoing, saveQueuedMessage, updateOutgoingIfPresent, type LocalOutgoing } from "../../db/index.js";
+import { encryptMessageEdit, generateAESKey, generateIdentityKeyPair, toBase64Url } from "@e2ee-chat/crypto";
+import { beginMessageHide, cleanupExpiredMessages, deleteOutgoing, finishMessageHide, getAppDB, getAllOutgoing, getMessageById, getMessageDeletion, messageHideKey, getMessages, saveMessage as writeOwnedMessage, getOutgoing, getOutgoingOperation, saveQueuedEdit, saveQueuedMessage, updateOutgoingIfPresent, rememberMessageDeletion, type LocalOutgoing } from "../../db/index.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { useChatStore } from "../../stores/chatStore.js";
 import { api } from "../../services/api.js";
 import { prepareDirectPayloadFanout } from "../../lib/direct-messages.js";
 import { prepareSenderKeyDistribution, finishSenderKeyDistribution } from "../../lib/group-session.js";
 import { encryptGroupText } from "../../lib/message-processor.js";
+import { stickerToken } from "../../lib/stickers.js";
 import { discardOutgoing, getQueueSnapshot, refreshOutgoingQueue, retryOutgoing, startOutgoingQueue, subscribeQueue } from "./outgoingQueue.js";
+
+const saveMessage = (row: Parameters<typeof writeOwnedMessage>[0], current?: () => boolean, ownerId = row.ownerId ?? "alice") =>
+  writeOwnedMessage(row, current, ownerId);
 
 vi.mock("../../stores/authStore.js", async () => {
   const { create } = await import("zustand");
@@ -30,11 +38,12 @@ async function seed(overrides: Partial<LocalOutgoing> = {}) {
 }
 async function queueText(id: string, queuedAt: number) {
   await saveQueuedMessage({ ...(await getMessageById("message"))!, id, type: "text", content: id, status: "sending" }, {
-    ...(await getOutgoing("message"))!, id, queuedAt, steps: [], upload: undefined, fileId: undefined,
+    ...(await getOutgoing("message", "alice"))!, id, queuedAt, steps: [], upload: undefined, fileId: undefined,
     sendDispatched: false, attempts: 0, status: "sending", retryable: true, nextAttemptAt: null, error: null,
   });
 }
 beforeEach(async () => {
+  setLocalEncryptionKey(await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]));
   vi.clearAllMocks();
   const db = await getAppDB();
   for (const name of Array.from(db.objectStoreNames)) await db.clear(name);
@@ -47,7 +56,397 @@ beforeEach(async () => {
   vi.mocked(api.post).mockResolvedValue(response as never);
   vi.mocked(api.put).mockResolvedValue({ success: true } as never);
 });
+
+it("keeps the same outbox and display ID independent across accounts", async () => {
+  await seed();
+  await saveQueuedMessage({ ...(await getMessageById("message", "alice"))!, senderId: "bob", content: "Bob's pending text" },
+    { ...(await getOutgoing("message", "alice"))!, userId: "bob", deviceId: "other-device" });
+  await retryOutgoing("message");
+  expect(await getOutgoing("message", "alice")).toBeUndefined();
+  expect(await getOutgoing("message", "bob")).toMatchObject({ status: "sending", userId: "bob" });
+  expect(await getMessageById("message", "alice")).toMatchObject({ status: "sent", content: "private text" });
+  expect(await getMessageById("message", "bob")).toMatchObject({ status: "sending", content: "Bob's pending text" });
+});
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+const editBodies = new Map<string, import("@e2ee-chat/shared").MessageEditRequest>();
+function editBody(messageId = "original") { return editBodies.get(messageId)!; }
+async function seedEdit(conversationType: LocalOutgoing["conversationType"] = "direct", id = "edit", targetId = "original") {
+  const key = generateAESKey(), identity = await generateIdentityKeyPair();
+  const scope = { messageId: targetId, conversationId: "chat", senderId: "alice", senderDeviceId: "device" };
+  editBodies.set(targetId, { messageId: targetId, conversationId: "chat", editSeq: 1,
+    ...await encryptMessageEdit(key, identity.privateEd25519, scope, 1, "after") });
+  const message = { id: targetId, conversationId: "chat", senderId: "alice", type: "text", content: "before",
+    editKey: toBase64Url(key), editSigningKey: toBase64Url(identity.publicEd25519), editSenderDeviceId: "device", editKeyAccepted: true,
+    timestamp: Date.now(), expiresAt: Date.now() + 60_000, expiryKind: "retention" as const, status: "sent" };
+  await saveMessage(message);
+  const row: LocalOutgoing & { editTargetId: string } = {
+    id, editTargetId: message.id, queuedAt: Date.now(), conversationId: "chat", conversationType,
+    userId: "alice", deviceId: "device", ttlSeconds: null, attempts: 0, status: "sending",
+    retryable: true, error: null, nextAttemptAt: null, steps: [{ path: "/api/messages/edit", body: editBody(targetId), sendDispatched: false }],
+  };
+  await saveQueuedEdit(row, (await getMessageById(message.id, "alice", undefined, true))!.editKeyVersion!, "after", () => true);
+  return message;
+}
+
+it("queues a text edit at its enqueue time without reading earlier upload bodies", async () => {
+  const laterTime = Date.now() + 60_000;
+  await seed({ queuedAt: laterTime, upload: { bytes: new Uint8Array([1, 2, 3]), mimeType: "application/octet-stream" } });
+  const getAll = vi.spyOn(IDBObjectStore.prototype, "getAll");
+  try {
+    await seedEdit();
+    expect(getAll).not.toHaveBeenCalled();
+    expect((await getOutgoingOperation("edit"))?.queuedAt).toBeLessThan(laterTime);
+  } finally { getAll.mockRestore(); }
+});
+
+it("orders an ordinary send without reading queued edit envelopes", async () => {
+  await seed({ queuedAt: 20 });
+  await seedEdit();
+  const getAll = vi.spyOn(IDBObjectStore.prototype, "getAll");
+  try {
+    await queueText("second", 2);
+    expect((await getOutgoing("second", "alice"))?.queuedAt).toBe(21);
+    const ranges = getAll.mock.calls.map(([range]) => range as IDBKeyRange);
+    expect(ranges.filter((range) => range.includes('outgoing-account:["alice","message"]'))).toHaveLength(1);
+    expect(ranges.some((range) => range.includes('outgoing-edit:["alice","edit"]'))).toBe(false);
+  } finally { getAll.mockRestore(); }
+});
+
+it.each(["direct", "group"] as const)("queues an optimistic %s edit and retries its original ciphertext independently", async (kind) => {
+  const message = await seedEdit(kind);
+  expect(await getMessageById(message.id)).toMatchObject({ content: "before", pendingEdit: { id: "edit", content: "after" } });
+  expect(await (await getAppDB()).get("accountState", "outgoing:edit")).toBeUndefined();
+  const receipt = { editedAt: Date.now(), mutationSeq: 7, editSeq: 1 };
+  vi.mocked(api.post).mockRejectedValueOnce(networkError()).mockResolvedValueOnce(receipt);
+  await retryOutgoing("edit");
+  expect(await getOutgoingOperation("edit")).toMatchObject({ status: "failed", retryable: true, sendDispatched: true });
+  expect(JSON.stringify(await getOutgoingOperation("edit"))).not.toContain("after");
+  await retryOutgoing("edit");
+  expect(vi.mocked(api.post).mock.calls).toEqual(Array(2).fill(["/api/messages/edit", editBody()]));
+  expect(api.get).not.toHaveBeenCalled();
+  expect(prepareDirectPayloadFanout).not.toHaveBeenCalled();
+  expect(prepareSenderKeyDistribution).not.toHaveBeenCalled();
+  expect(encryptGroupText).not.toHaveBeenCalled();
+  expect(await getOutgoingOperation("edit")).toBeUndefined();
+  expect(await getMessageById(message.id)).toMatchObject({
+    content: "after", pendingEdit: null, status: "sent", timestamp: message.timestamp,
+    expiresAt: message.expiresAt, editedAt: receipt.editedAt, editSequence: 1,
+  });
+});
+
+it("keeps a deletion when the edit receipt arrives later", async () => {
+  const message = await seedEdit();
+  vi.mocked(api.post).mockImplementationOnce(async () => {
+    await rememberMessageDeletion(message.id, "chat", Date.now(), "alice");
+    return { editedAt: Date.now(), mutationSeq: 7, editSeq: 1 } as never;
+  });
+  await retryOutgoing("edit");
+  expect(await getOutgoingOperation("edit")).toBeUndefined();
+  expect(await getMessageById(message.id)).toMatchObject({ content: "", deletedByUserId: "alice" });
+  expect(await getMessageById(message.id)).not.toHaveProperty("pendingEdit");
+});
+
+it("publishes the newer cached chat-list preview when an older edit receipt resumes after reload", async () => {
+  const original = await seedEdit();
+  await saveMessage({ id: "newest", conversationId: "chat", senderId: "bob", type: "text", content: "newer message",
+    timestamp: original.timestamp + 1, expiresAt: original.expiresAt, expiryKind: "retention", status: "delivered" });
+  expect(useChatStore.getState().messages.get("chat")).toBeUndefined();
+  vi.mocked(api.post).mockResolvedValueOnce({ editedAt: Date.now(), mutationSeq: 7, editSeq: 1 });
+  await retryOutgoing("edit");
+  expect(await getMessageById(original.id)).toMatchObject({ content: "after", editSequence: 1 });
+  expect(useChatStore.getState().messages.get("chat")).toMatchObject([{ id: "newest", content: "newer message", timestamp: original.timestamp + 1 }]);
+});
+
+it.each(["pending", "failed", "locally hidden"])("retires a %s edit on Delete for everyone and refreshes the local queue", async (state) => {
+  const original = await seedEdit();
+  const stop = startLocalHiddenMessageSync(refreshOutgoingQueue);
+  try {
+    if (state === "failed") {
+      vi.mocked(api.post).mockRejectedValueOnce(Object.assign(new Error("Encrypted edit is too large"), { status: 413 }));
+      await retryOutgoing("edit");
+      expect(await getOutgoingOperation("edit")).toMatchObject({ status: "failed", retryable: false });
+    } else if (state === "locally hidden") {
+      const hide = await beginMessageHide(original.id);
+      await finishMessageHide(original.id, hide!.token, false, undefined, "alice");
+      expect(await getMessageById(original.id)).toBeUndefined();
+    }
+    await refreshOutgoingQueue("edit");
+    expect(getQueueSnapshot()).toEqual(expect.arrayContaining([expect.objectContaining({ id: "edit" })]));
+    const deletion = { ids: [original.id], deletedAt: Date.now(), deletedByUserId: "alice" };
+    await handleMessageDeletion({ conversationId: "chat", deletion });
+    expect(await getOutgoingOperation("edit")).toBeUndefined();
+    expect(await (await getAppDB()).get("accountState", 'outgoing-edit-status:["alice","edit"]')).toBeUndefined();
+    await vi.waitFor(() => expect(getQueueSnapshot().some((row) => row.id === "edit")).toBe(false));
+    if (state === "locally hidden") expect(await getMessageById(original.id)).toBeUndefined();
+    else expect(await getMessageById(original.id)).toMatchObject({ content: "", deletedAt: deletion.deletedAt });
+    expect(api.post).toHaveBeenCalledTimes(state === "failed" ? 1 : 0);
+  } finally { stop(); }
+});
+
+it("uses only the tombstone's target range once earlier v5 edits are indexed", async () => {
+  await seedEdit();
+  await seedEdit("direct", "other-edit", "original-other");
+  const db = await getAppDB();
+  const target = 'outgoing-edit-target:["alice","original"]:edit';
+  const otherTarget = 'outgoing-edit-target:["alice","original-other"]:other-edit';
+  // Simulate a pre-release v5 queue whose edit records predate the target lookup.
+  await db.delete("accountState", "outgoing-edit-target-index-v1");
+  await db.delete("accountState", target);
+  await db.delete("accountState", otherTarget);
+  await rememberMessageDeletion("unrelated", "chat", Date.now(), "bob", "bob", undefined, "alice");
+  expect(await db.get("accountState", target)).toBeDefined();
+  expect(await db.get("accountState", otherTarget)).toBeDefined();
+
+  const getAll = vi.spyOn(IDBObjectStore.prototype, "getAll");
+  const getAllKeys = vi.spyOn(IDBObjectStore.prototype, "getAllKeys");
+  try {
+    await handleMessageDeletion({ conversationId: "chat", deletion: { ids: ["original"], deletedAt: Date.now(), deletedByUserId: "alice" } });
+    expect(getAll).toHaveBeenCalled();
+    const ranges = getAll.mock.calls.map(([range]) => range as IDBKeyRange);
+    expect(ranges.some((range) => range.includes(target))).toBe(true);
+    expect(ranges.some((range) => range.includes(otherTarget) || range.includes('outgoing-edit:["alice","edit"]'))).toBe(false);
+    expect(getAllKeys).not.toHaveBeenCalled();
+    expect(await db.get("accountState", target)).toBeUndefined();
+    expect(await getOutgoingOperation("edit")).toBeUndefined();
+    expect(await getOutgoingOperation("other-edit")).toBeDefined();
+  } finally { getAll.mockRestore(); getAllKeys.mockRestore(); }
+});
+
+it.each([true, false])("retires a failed edit on expiry and refreshes the queue (locally hidden=%s)", async (hidden) => {
+  const original = await seedEdit();
+  vi.mocked(api.post).mockRejectedValueOnce(Object.assign(new Error("Encrypted edit is too large"), { status: 413 }));
+  const stop = startLocalHiddenMessageSync(refreshOutgoingQueue);
+  try {
+    await retryOutgoing("edit");
+    expect(getQueueSnapshot()).toMatchObject([{ id: "edit", status: "failed", retryable: false }]);
+    if (hidden) {
+      const hide = await beginMessageHide(original.id);
+      await finishMessageHide(original.id, hide!.token, false, undefined, "alice");
+      expect(await getOutgoingOperation("edit")).toBeDefined();
+    }
+    await cleanupExpiredMessages(original.expiresAt + 1);
+    const db = await getAppDB();
+    for (const id of ['outgoing-edit:["alice","edit"]', 'outgoing-edit-status:["alice","edit"]', 'outgoing-edit-target:["alice","original"]:edit', 'message-edit-state:["alice","original"]']) {
+      expect(await db.get("accountState", id)).toBeUndefined();
+    }
+    expect(await getMessageById(original.id)).toBeUndefined();
+    await vi.waitFor(() => expect(getQueueSnapshot()).toEqual([]));
+    expect(api.post).toHaveBeenCalledOnce();
+  } finally { stop(); }
+});
+
+it.each(["local hide", "expiry", "delete for everyone"])("retries a hidden prepared edit only after a local hide (%s)", async (outcome) => {
+  const message = await seedEdit();
+  vi.mocked(api.post).mockRejectedValueOnce(networkError());
+  await retryOutgoing("edit");
+  expect(await getOutgoingOperation("edit")).toMatchObject({ status: "failed", retryable: true });
+  const hide = await beginMessageHide(message.id);
+  await finishMessageHide(message.id, hide!.token, false, undefined, "alice");
+  const db = await getAppDB();
+  expect(await db.get("accountState", `message-edit-state:${JSON.stringify(["alice", message.id])}`)).toBeUndefined();
+  expect(await getMessageById(message.id)).toBeUndefined();
+  if (outcome === "expiry") await cleanupExpiredMessages(message.expiresAt + 1);
+  if (outcome === "delete for everyone") await rememberMessageDeletion(message.id, "chat", Date.now(), "alice");
+
+  if (outcome === "local hide") vi.mocked(api.post).mockResolvedValueOnce({ editedAt: Date.now(), mutationSeq: 7, editSeq: 1 });
+  await retryOutgoing("edit");
+  expect(api.post).toHaveBeenCalledTimes(outcome === "local hide" ? 2 : 1);
+  for (const call of vi.mocked(api.post).mock.calls) expect(call).toEqual(["/api/messages/edit", editBody()]);
+  expect(await getOutgoingOperation("edit")).toBeUndefined();
+  expect(await getMessages("chat")).toEqual([]);
+  expect(await getMessageById(message.id)).toBeUndefined();
+  expect(useChatStore.getState().messages.get("chat") ?? []).toEqual([]);
+});
+
+it("restores committed text when a queued edit is discarded", async () => {
+  const message = await seedEdit();
+  await discardOutgoing("edit");
+  expect(await getOutgoingOperation("edit")).toBeUndefined();
+  expect(await getMessageById(message.id)).toMatchObject({ content: "before" });
+  expect((await getMessageById(message.id))?.pendingEdit).toBeFalsy();
+  expect(api.post).not.toHaveBeenCalled();
+});
+
+it.each(["during hide", "after Undo"])("keeps the in-flight edit when its acknowledgement arrives %s", async (timing) => {
+  const message = await seedEdit();
+  let sendReceipt!: () => void, reachedPost!: () => void;
+  const ready = new Promise<void>((resolve) => { reachedPost = resolve; });
+  const waiting = new Promise<void>((resolve) => { sendReceipt = resolve; });
+  vi.mocked(api.post).mockImplementationOnce(async () => {
+    reachedPost();
+    await waiting;
+    return { editedAt: Date.now(), mutationSeq: 7, editSeq: 1 } as never;
+  });
+  const posting = retryOutgoing("edit");
+  await ready;
+  const hide = await beginMessageHide(message.id);
+  expect(await getMessages("chat")).toEqual([]);
+  if (timing === "after Undo") {
+    const restored = await finishMessageHide(message.id, hide!.token, true, undefined, "alice");
+    expect(restored?.pendingEdit?.content).toBe("after");
+  }
+  sendReceipt();
+  await posting;
+  if (timing === "during hide") {
+    expect(await getMessages("chat")).toEqual([]);
+    await finishMessageHide(message.id, hide!.token, true, undefined, "alice");
+  }
+  expect(await getMessageById(message.id, "alice", undefined, true)).toMatchObject({ content: "after", editKey: message.editKey, editSequence: 1 });
+  expect(await getOutgoingOperation("edit")).toBeUndefined();
+});
+
+it.each([
+  { scenario: "recovers a pending text edit after a legacy rewrite", sticker: false, legacyRewrite: true },
+  { scenario: "discards a queued sticker replacement on receipt", sticker: true, legacyRewrite: false },
+  { scenario: "discards a queued sticker replacement recovered after a legacy rewrite", sticker: true, legacyRewrite: true },
+])("$scenario", async ({ sticker, legacyRewrite }) => {
+  const key = generateAESKey(), identity = await generateIdentityKeyPair();
+  const scope = { messageId: "mine", conversationId: "chat", senderId: "alice", senderDeviceId: "device" };
+  const legacy = { id: scope.messageId, conversationId: scope.conversationId, senderId: scope.senderId,
+    type: "text", content: "before", timestamp: Date.now(), expiresAt: Date.now() + 60_000, status: "delivered" };
+  await saveMessage({ ...legacy, editKey: toBase64Url(key), editSigningKey: toBase64Url(identity.publicEd25519), editSenderDeviceId: scope.senderDeviceId, editKeyAccepted: true });
+  const editSeq = 1;
+  const replacement = sticker ? stickerToken("genshin_hoyolab_21") : "pending revision";
+  const body = { messageId: scope.messageId, conversationId: scope.conversationId, editSeq,
+    ...await encryptMessageEdit(key, identity.privateEd25519, scope, editSeq, replacement) };
+  const row: LocalOutgoing & { editTargetId: string } = {
+    id: "legacy-race-edit", editTargetId: scope.messageId, queuedAt: Date.now(), conversationId: scope.conversationId,
+    conversationType: "direct", userId: scope.senderId, deviceId: scope.senderDeviceId, ttlSeconds: null, attempts: 0,
+    status: "sending", retryable: true, error: null, nextAttemptAt: null, steps: [{ path: "/api/messages/edit", body, sendDispatched: false }],
+  };
+  await saveQueuedEdit(row, (await getMessageById(legacy.id, "alice", undefined, true))!.editKeyVersion!, "pending revision", () => true);
+  const db = await getAppDB();
+  if (legacyRewrite) await db.put("displayMessages", { ...legacy, ownerId: "alice" });
+  else {
+    // Simulate the pending display text saved by the pre-merge client.
+    await db.put("displayMessages", { ...legacy, ownerId: "alice", pendingEdit: { id: row.id, content: replacement } });
+  }
+  expect(await getMessages("chat")).toMatchObject([{ pendingEdit: { id: row.id, content: replacement } }]);
+  vi.mocked(api.post).mockResolvedValueOnce({ editedAt: Date.now(), mutationSeq: 7, editSeq });
+  await retryOutgoing(row.id);
+  expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/messages/edit", body);
+  expect(await getOutgoingOperation(row.id)).toBeUndefined();
+  expect(await getMessageById(legacy.id)).toMatchObject({ content: sticker ? "before" : replacement, pendingEdit: null });
+  const edits = await db.get("accountState", `message-edit-state:${JSON.stringify(["alice", legacy.id])}`);
+  expect(edits.editSequence).toBe(sticker ? 0 : editSeq);
+  expect(edits.envelope).toEqual(sticker ? undefined : body);
+  expect(JSON.stringify(await db.getAll("accountState"))).not.toContain(replacement);
+});
+
+it("leaves an oversized edit discardable and releases the following send", async () => {
+  await seedEdit();
+  await seed({ queuedAt: Date.now() });
+  vi.mocked(api.post).mockRejectedValueOnce(Object.assign(new Error("Encrypted edit is too large"), { status: 413, code: "EDIT_TOO_LARGE" }));
+  await retryOutgoing("edit");
+  expect(await getOutgoingOperation("edit")).toMatchObject({ status: "failed", retryable: false, nextAttemptAt: null });
+  await retryOutgoing("message");
+  expect(await getMessageById("message")).toMatchObject({ status: "sent" });
+  await discardOutgoing("edit");
+  expect(await getOutgoingOperation("edit")).toBeUndefined();
+  expect(await getMessageById("original")).toMatchObject({ content: "before" });
+});
+
+it("tells a second tab to reload failed edit status only after it is durable", async () => {
+  await seedEdit();
+  vi.stubGlobal("BroadcastChannel", undefined);
+  const receivingTab = vi.fn(async () => getOutgoingOperation("edit"));
+  const stop = startLocalHiddenMessageSync(async () => { await receivingTab(); });
+  const sender = connectLocalMessageChannel({ userId: "alice", deviceId: "device" }, () => {});
+  const storage = vi.spyOn(Storage.prototype, "setItem");
+  try {
+    vi.mocked(api.post).mockRejectedValueOnce(Object.assign(new Error("Encrypted edit is too large"), { status: 413 }));
+    await retryOutgoing("edit");
+    expect(receivingTab).not.toHaveBeenCalled();
+    const [[key, newValue]] = storage.mock.calls;
+    const { nonce, ...hint } = JSON.parse(newValue);
+    expect(typeof nonce).toBe("string");
+    expect(hint).toEqual({ id: "edit", kind: "outbox", conversationId: "chat" });
+    window.dispatchEvent(new StorageEvent("storage", { key, newValue }));
+    await vi.waitFor(() => expect(receivingTab).toHaveBeenCalledOnce());
+    await expect(receivingTab.mock.results[0].value).resolves.toMatchObject({ status: "failed", retryable: false });
+  } finally { stop(); sender(); storage.mockRestore(); }
+});
+
+it("wakes an idle second tab to send a newly queued edit when its originator does not dispatch it", async () => {
+  vi.stubGlobal("BroadcastChannel", undefined);
+  const stopQueue = startOutgoingQueue();
+  const stopSync = startLocalHiddenMessageSync(refreshOutgoingQueue);
+  const sender = connectLocalMessageChannel({ userId: "alice", deviceId: "device" }, () => {});
+  const storage = vi.spyOn(Storage.prototype, "setItem");
+  try {
+    await refreshOutgoingQueue();
+    expect(getQueueSnapshot()).toEqual([]);
+    const receipt = { editedAt: Date.now(), mutationSeq: 7, editSeq: 1 };
+    vi.mocked(api.post).mockResolvedValueOnce(receipt);
+    await seedEdit();
+    expect(api.post).not.toHaveBeenCalled();
+    const hint = storage.mock.calls.find(([, value]) => JSON.parse(value).kind === "outbox")!;
+    expect(hint).toBeDefined();
+    expect(JSON.parse(hint[1])).toMatchObject({ id: "edit", conversationId: "chat", kind: "outbox" });
+    expect(await getOutgoingOperation("edit")).toMatchObject({ status: "sending" });
+    window.dispatchEvent(new StorageEvent("storage", { key: hint[0], newValue: hint[1] }));
+    await vi.waitFor(async () => expect(await getMessageById("original")).toMatchObject({ content: "after", editSequence: 1 }));
+    expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/messages/edit", editBody());
+    expect(await getOutgoingOperation("edit")).toBeUndefined();
+  } finally { stopQueue(); stopSync(); sender(); storage.mockRestore(); }
+});
+
+it("refreshes only edit metadata for an outbox hint without an active consumer", async () => {
+  vi.stubGlobal("BroadcastChannel", undefined);
+  await refreshOutgoingQueue();
+  await seed({ upload: { bytes: new Uint8Array([1, 2, 3]), mimeType: "application/octet-stream" } });
+  await seedEdit();
+  const stop = startLocalHiddenMessageSync(refreshOutgoingQueue);
+  const get = vi.spyOn(IDBObjectStore.prototype, "get");
+  const getAll = vi.spyOn(IDBObjectStore.prototype, "getAll");
+  const hint = () => window.dispatchEvent(new StorageEvent("storage", {
+    key: 'privatebase:local-messages:["alice","device"]',
+    newValue: JSON.stringify({ id: "edit", kind: "outbox", conversationId: "chat", nonce: crypto.randomUUID() }),
+  }));
+  try {
+    hint();
+    await vi.waitFor(() => expect(getQueueSnapshot()).toMatchObject([{ id: "edit", status: "sending", steps: [] }]));
+    expect(get.mock.calls).toEqual([['outgoing-edit-status:["alice","edit"]']]);
+    expect(getAll).not.toHaveBeenCalled();
+    await (await getAppDB()).delete("accountState", 'outgoing-edit:["alice","edit"]');
+    hint();
+    await vi.waitFor(() => expect(getQueueSnapshot()).toEqual([]));
+    expect(get.mock.calls).toEqual([['outgoing-edit-status:["alice","edit"]'], ['outgoing-edit-status:["alice","edit"]']]);
+    expect(getAll).not.toHaveBeenCalled();
+    expect(api.post).not.toHaveBeenCalled();
+  } finally { stop(); get.mockRestore(); getAll.mockRestore(); }
+});
+
+it("schedules independent edits with metadata and never reads the waiting attachment payload", async () => {
+  await seed({ upload: { bytes: new Uint8Array([1, 2, 3]), mimeType: "application/octet-stream" }, nextAttemptAt: Date.now() + 60_000 });
+  const stop = startOutgoingQueue();
+  const get = vi.spyOn(IDBObjectStore.prototype, "get");
+  const getAll = vi.spyOn(IDBObjectStore.prototype, "getAll");
+  try {
+    await vi.waitFor(() => expect(getQueueSnapshot().find((row) => row.id === "message")?.upload).toBeDefined());
+    get.mockClear();
+    getAll.mockClear();
+    await seedEdit();
+    await seedEdit("direct", "other-edit", "other-original");
+    // An existing v5 edit is indexed once when its metadata is first needed.
+    const db = await getAppDB();
+    await db.delete("accountState", 'outgoing-edit-status:["alice","other-edit"]');
+    vi.mocked(api.post).mockResolvedValue({ editedAt: Date.now(), mutationSeq: 7, editSeq: 1 });
+    await refreshOutgoingQueue("edit");
+    await refreshOutgoingQueue("other-edit");
+    await vi.waitFor(async () => {
+      expect(await getMessageById("original")).toMatchObject({ editSequence: 1 });
+      expect(await getMessageById("other-original")).toMatchObject({ editSequence: 1 });
+    });
+    expect(vi.mocked(api.post).mock.calls).toEqual(expect.arrayContaining([
+      ["/api/messages/edit", editBody()], ["/api/messages/edit", editBody("other-original")],
+    ]));
+    expect(get.mock.calls).not.toContainEqual(['outgoing-account:["alice","message"]']);
+    expect(getAll.mock.calls.every(([range]) => !!range && !(range instanceof IDBKeyRange && range.includes('outgoing-account:["alice","message"]')))).toBe(true);
+    expect(api.put).not.toHaveBeenCalled();
+  } finally { stop(); get.mockRestore(); getAll.mockRestore(); }
+});
 
 it.each([0, 429, 503])("keeps a failed %s send durably and reuses its ciphertext on retry", async (status) => {
   await seed();
@@ -291,8 +690,9 @@ it("does not replay another user's pending messages or commit results after logo
     return response as never;
   });
   await retryOutgoing("message");
-  expect(await getOutgoing("message")).toBeDefined();
-  expect(await getMessageById("message")).toMatchObject({ status: "sending" });
+  expect(await getOutgoing("message", "alice")).toBeDefined();
+  expect(await getOutgoing("message", "bob")).toBeDefined();
+  expect(await getMessageById("message", "alice")).toMatchObject({ status: "sending" });
 });
 
 it("keeps later group sends behind a failed send so Sender Keys are received in order", async () => {
@@ -456,6 +856,69 @@ it("turns a file whose encryption was interrupted by reload into a visible faile
   stop();
 });
 
+it("does not repeatedly request the ordinary send lock while another tab holds it", async () => {
+  await seed();
+  await refreshOutgoingQueue();
+  let release!: () => void;
+  let tail = new Promise<void>((resolve) => { release = resolve; });
+  const request = vi.fn((_name: string, action: () => Promise<void>) => {
+    const task = tail.then(action);
+    tail = task.catch(() => undefined);
+    return task;
+  });
+  vi.stubGlobal("navigator", { locks: { request } });
+  const stop = startOutgoingQueue();
+  try {
+    await vi.waitFor(() => expect(request).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(request).toHaveBeenCalledOnce();
+    expect(api.post).not.toHaveBeenCalled();
+
+    release();
+    await vi.waitFor(async () => expect(await getMessageById("message")).toMatchObject({ status: "sent" }));
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(api.post).toHaveBeenCalledOnce();
+    expect(await getOutgoing("message")).toBeUndefined();
+  } finally { stop(); release(); await tail; }
+});
+
+it("sends a message enqueued during its conversation drain without waiting for another conversation", async () => {
+  await refreshOutgoingQueue();
+  await seed();
+  await saveQueuedMessage({ ...(await getMessageById("message"))!, id: "waiting", conversationId: "other" },
+    { ...(await getOutgoing("message"))!, id: "waiting", conversationId: "other" });
+  vi.mocked(prepareDirectPayloadFanout).mockImplementation(async (_conversation, id) => ({ ...body, messages: [{ ...body.messages[0], id }] }) as never);
+
+  let releaseChat!: () => void, releaseOther!: () => void;
+  const chatLock = new Promise<void>((resolve) => { releaseChat = resolve; });
+  const otherLock = new Promise<void>((resolve) => { releaseOther = resolve; });
+  const request = vi.fn(async (name: string, action: () => Promise<void>) => {
+    await (name.endsWith(":other") ? otherLock : chatLock);
+    await action();
+  });
+  vi.stubGlobal("navigator", { locks: { request } });
+  const stop = startOutgoingQueue();
+  try {
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(2));
+    await queueText("second", 2);
+    // The lock holder completed the row this drain originally read.
+    await deleteOutgoing("message");
+    releaseChat();
+    await vi.waitFor(async () => expect(await getMessageById("second")).toMatchObject({ status: "sent" }));
+    expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/messages/send-direct-batch", expect.objectContaining({
+      messages: [expect.objectContaining({ id: "second" })],
+    }));
+    expect(await getOutgoing("waiting")).toBeDefined();
+    expect(request.mock.calls.filter(([name]) => name.endsWith(":other"))).toHaveLength(1);
+  } finally {
+    stop();
+    await deleteOutgoing("waiting");
+    releaseChat();
+    releaseOther();
+    await Promise.all(request.mock.results.map(({ value }) => value));
+  }
+});
+
 it.each(["while waiting for the lock", "after reading the display row"])("keeps file encryption completed in another tab %s", async (interleaving) => {
   await seed({ retryable: false, error: "fileEncryptionWasInterruptedAttachTheFileAgain" });
   await saveMessage({ ...(await getMessageById("message"))!, type: "file" });
@@ -467,16 +930,17 @@ it.each(["while waiting for the lock", "after reading the display row"])("keeps 
   const held = new Promise<void>((resolve) => { release = resolve; });
   const request = vi.fn(async (_name: string, action: () => Promise<void>) => { await held; await action(); });
   vi.stubGlobal("navigator", { locks: { request } });
-  const db = await getAppDB();
-  const get = db.get.bind(db);
+  const get = IDBObjectStore.prototype.get;
   let updated = false;
-  const read = vi.spyOn(db, "get").mockImplementation(async (store, key) => {
-    const value = await get(store, key);
-    if (interleaving === "after reading the display row" && store === "messages" && key === "message" && !updated) {
-      updated = true;
-      await updateOutgoingIfPresent(ready);
+  let preparing: Promise<boolean> | undefined;
+  const read = vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (this: IDBObjectStore, key) {
+    const request = get.call(this, key);
+    if (interleaving === "after reading the display row" && this.name === "displayMessages" && this.transaction.mode === "readonly" && Array.isArray(key) && key[0] === "alice" && key[1] === "message") {
+      request.addEventListener("success", () => {
+        if (!updated) { updated = true; preparing = updateOutgoingIfPresent(ready); }
+      });
     }
-    return value;
+    return request;
   });
   const stop = startOutgoingQueue();
   try {
@@ -487,6 +951,7 @@ it.each(["while waiting for the lock", "after reading the display row"])("keeps 
       const row = getQueueSnapshot().find((entry) => entry.id === "message");
       expect(row?.status === "failed" || !!row?.upload).toBe(true);
     });
+    if (interleaving === "after reading the display row") expect(await preparing).toBe(true);
     const persisted = await getOutgoing("message");
     expect(persisted).toMatchObject({ upload: { mimeType: "image/png" }, retryable: true, error: null, status: "sending" });
     expect(Array.from(persisted?.upload?.bytes ?? [])).toEqual(Array.from(bytes));
@@ -561,7 +1026,7 @@ it.each(["text", "file"])("delivers queued %s after legacy cleanup deletes only 
     ...(type === "file" ? { fileId: "file-1", upload: { bytes, mimeType: "image/png", uploadUrl: "/upload" } } : {}),
   });
   // A v5 tab's cleanup does not know about syncState's outgoing: entries.
-  await (await getAppDB()).delete("messages", "message");
+  await (await getAppDB()).delete("displayMessages", ["alice", "message"]);
   vi.mocked(api.post).mockRejectedValue(networkError());
   await retryOutgoing("message");
   expect(await getOutgoing("message")).toMatchObject({ status: "failed", retryable: true, attempts: 1 });
@@ -592,7 +1057,7 @@ it.each(["needs encryption", "non-retryable", "expired PUT", "expired reservatio
     ...(await getOutgoing("message"))!, id: "second", queuedAt: 2, status: "sending", retryable: true,
     fileId: undefined, upload: undefined, steps: [{ path: "/api/messages/send-direct-batch", body: second as never }],
   });
-  await (await getAppDB()).delete("messages", "message");
+  await (await getAppDB()).delete("displayMessages", ["alice", "message"]);
   if (reason === "expired PUT") vi.mocked(api.put).mockRejectedValue(Object.assign(new Error("Not found"), { status: 404 }));
   if (reason === "expired reservation") vi.mocked(api.post).mockImplementation(async (_path, payload) => {
     if ((payload as typeof prepared).fileId) throw Object.assign(new Error("File not found"), { status: 404 });
@@ -614,7 +1079,7 @@ it("retires a non-retryable orphan before a manual send checks conversation orde
   await saveQueuedMessage({ ...(await getMessageById("message"))!, id: "second" }, {
     ...(await getOutgoing("message"))!, id: "second", queuedAt: 2, retryable: true,
   });
-  await (await getAppDB()).delete("messages", "message");
+  await (await getAppDB()).delete("displayMessages", ["alice", "message"]);
   await retryOutgoing("second");
   expect(await getAllOutgoing()).toEqual([]);
   expect(await getMessageById("second")).toMatchObject({ status: "sent" });
@@ -636,7 +1101,7 @@ it("does not retire an earlier in-flight orphan waiting on metadata without Web 
   try {
     await vi.waitFor(() => expect(api.get).toHaveBeenCalledTimes(1));
     // The active attempt still holds the content needed to finish encryption.
-    await (await getAppDB()).delete("messages", "message");
+    await (await getAppDB()).delete("displayMessages", ["alice", "message"]);
     await retryOutgoing("second");
     expect.soft(await getOutgoing("message")).toMatchObject({ status: "sending", steps: [] });
     expect.soft(await getOutgoing("second")).toMatchObject({ attempts: 0 });
@@ -692,7 +1157,9 @@ it("F3: retains uploaded ciphertext through a lost send response and renews an e
   vi.mocked(prepareDirectPayloadFanout).mockImplementation(async (_conversation, id, _text, type, options) => ({ ...body, type, fileId: options?.fileId, messages: [{ ...body.messages[0], id }] }) as never);
   // The previously prepared envelope uses the old reservation, as a restored queue would.
   const restored = (await getOutgoing("message"))!;
-  restored.steps[0].body.fileId = "old-file";
+  const firstStep = restored.steps[0];
+  if (firstStep.path === "/api/messages/edit") throw new Error("Expected a file send");
+  firstStep.body.fileId = "old-file";
   const { saveOutgoing } = await import("../../db/index.js");
   await saveOutgoing(restored);
   await retryOutgoing("message");
@@ -738,6 +1205,73 @@ it("F4: discard waits on the same conversation lock as a retry in another tab", 
   expect(before).toBeDefined();
   expect(request.mock.calls.map(([name]) => name)).toEqual(["e2ee-outgoing:alice:device:chat", "e2ee-outgoing:alice:device:chat"]);
   expect(await getOutgoing("message")).toBeUndefined();
+});
+
+it.each(["file", "edit"])("drains an edit and an ordinary upload independently while the %s request is held", async (held) => {
+  await seed({ upload: { bytes: new Uint8Array([1, 2]), mimeType: "image/png", uploadUrl: "/slow-upload" }, fileId: "file" });
+  await seedEdit();
+  const tails = new Map<string, Promise<unknown>>();
+  const request = vi.fn((name: string, callback: () => Promise<unknown>) => {
+    const task = (tails.get(name) ?? Promise.resolve()).then(callback);
+    tails.set(name, task.catch(() => undefined));
+    return task;
+  });
+  vi.stubGlobal("navigator", { locks: { request } });
+  let release!: () => void;
+  const stalled = new Promise<void>((resolve) => { release = resolve; });
+  vi.mocked(api.put).mockImplementation(async () => {
+    if (held === "file") await stalled;
+    return { success: true } as never;
+  });
+  vi.mocked(api.post).mockImplementation(async (path) => {
+    if (path !== "/api/messages/edit") return response as never;
+    if (held === "edit") await stalled;
+    return { editedAt: Date.now(), mutationSeq: 7, editSeq: 1 } as never;
+  });
+  const stop = startOutgoingQueue();
+  try {
+    await vi.waitFor(async () => {
+      expect(api.put).toHaveBeenCalled();
+      expect(api.post).toHaveBeenCalledWith("/api/messages/edit", editBody());
+      expect(await getOutgoingOperation(held === "file" ? "edit" : "message")).toBeUndefined();
+    });
+    expect(await getOutgoingOperation(held === "file" ? "message" : "edit")).toBeDefined();
+    expect(request.mock.calls.map(([name]) => name)).toEqual(expect.arrayContaining([
+      "e2ee-outgoing:alice:device:chat", "e2ee-outgoing-edit:alice:device:original",
+    ]));
+  } finally {
+    release();
+    await vi.waitFor(async () => expect(await getAllOutgoing()).toEqual([]));
+    stop();
+  }
+});
+
+it("serializes competing retries for the same edit target across tabs", async () => {
+  await seedEdit();
+  const tails = new Map<string, Promise<unknown>>();
+  const request = vi.fn((name: string, callback: () => Promise<unknown>) => {
+    const task = (tails.get(name) ?? Promise.resolve()).then(callback);
+    tails.set(name, task.catch(() => undefined));
+    return task;
+  });
+  vi.stubGlobal("navigator", { locks: { request } });
+  let release!: (value: never) => void;
+  vi.mocked(api.post).mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+  const first = retryOutgoing("edit");
+  await vi.waitFor(() => expect(api.post).toHaveBeenCalledOnce());
+  vi.resetModules();
+  const otherTab = await import("./outgoingQueue.js");
+  const retry = otherTab.retryOutgoing("edit");
+  try {
+    await vi.waitFor(() => expect(request.mock.calls.map(([name]) => name))
+      .toEqual(Array(2).fill("e2ee-outgoing-edit:alice:device:original")));
+    expect(api.post).toHaveBeenCalledOnce();
+  } finally {
+    release({ editedAt: Date.now(), mutationSeq: 7, editSeq: 1 } as never);
+    await Promise.all([first, retry]);
+  }
+  expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/messages/edit", editBody());
+  expect(await getOutgoingOperation("edit")).toBeUndefined();
 });
 
 it("F4: a failed attempt cannot recreate an entry deleted by another tab without Web Locks", async () => {
@@ -793,9 +1327,9 @@ it("normalizes a legacy error without overwriting newer queue progress", async (
   const { updateOutgoingErrorIfUnchanged, updateOutgoingIfPresent } = await import("../../db/index.js");
   const row = (await getOutgoing("message"))!;
   await updateOutgoingIfPresent({ ...row, attempts: 3, steps: [{ path: "/api/messages/send-direct-batch", body: body as never }] });
-  await updateOutgoingErrorIfUnchanged("message", "old diagnostic", "messageNotSent");
+  await updateOutgoingErrorIfUnchanged("message", "old diagnostic", "messageNotSent", "alice");
   expect(await getOutgoing("message")).toMatchObject({ attempts: 3, error: "messageNotSent", steps: [{ path: "/api/messages/send-direct-batch" }] });
-  await updateOutgoingErrorIfUnchanged("message", "old diagnostic", "fileExpired");
+  await updateOutgoingErrorIfUnchanged("message", "old diagnostic", "fileExpired", "alice");
   expect((await getOutgoing("message"))!.error).toBe("messageNotSent");
 });
 
@@ -837,27 +1371,41 @@ it.each(["direct", "group"] as const)("completes a deleted %s replay and unblock
   expect(await getMessageById("later")).toMatchObject({ status: "sent" });
 });
 
+it("scopes a deleted outbox receipt to its owner even when the display row is missing", async () => {
+  await seed();
+  vi.mocked(api.post).mockRejectedValueOnce(networkError());
+  await retryOutgoing("message");
+  await (await getAppDB()).delete("displayMessages", ["alice", "message"]);
+  vi.mocked(api.post).mockResolvedValueOnce({ ...response, deleted: true, deletedAt: 500, deletedByUserId: "alice" });
+  await retryOutgoing("message");
+  expect(await getOutgoing("message")).toBeUndefined();
+  expect(await getMessageDeletion("message", "alice")).toMatchObject({ ownerId: "alice", deletedAt: 500 });
+  expect(await getMessageDeletion("message", "carol")).toBeUndefined();
+});
+
 it.each(["hide", "delete"])("guards the persisted send receipt when another tab races its publication with %s", async (kind) => {
   const { openDB } = await import("idb");
   await seed();
   const db = await getAppDB(), tabB = await openDB(db.name);
-  const original = db.get.bind(db);
-  let raced = false;
-  const read = vi.spyOn(db, "get").mockImplementation(async (...args) => {
-    const snapshot = await original(...args);
-    if (!raced && args[0] === "messages" && args[1] === "message" && snapshot?.status === "sent") {
-      raced = true;
-      const tx = tabB.transaction("syncState", "readwrite");
-      await tx.store.put(kind === "hide"
-        ? { id: "hidden-message:message", undoToken: "other-tab-undo", undoDeadline: Date.now() + 5000 }
-        : { id: "deleted-message:message", deletedAt: 500, deletedByUserId: "alice", conversationId: "chat" });
-      await tx.done;
+  const get = IDBObjectStore.prototype.get;
+  let raced: Promise<unknown> | undefined;
+  const read = vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (this: IDBObjectStore, key) {
+    const request = get.call(this, key);
+    if (this.name === "displayMessages" && this.transaction.mode === "readonly" && Array.isArray(key) && key[0] === "alice" && key[1] === "message") {
+      request.addEventListener("success", () => {
+        if (raced || request.result?.status !== "sent") return;
+        const tx = tabB.transaction("accountState", "readwrite");
+        raced = Promise.all([tx.store.put(kind === "hide"
+          ? { id: messageHideKey("message", "alice"), ownerId: "alice", undoToken: "other-tab-undo", undoDeadline: Date.now() + 5000 }
+          : { id: "deleted-message:message", deletedAt: 500, deletedByUserId: "alice", conversationId: "chat" }), tx.done]);
+      });
     }
-    return snapshot;
+    return request;
   });
   try {
     await retryOutgoing("message");
-    expect(raced).toBe(true);
+    expect(raced).toBeDefined();
+    await raced;
     const displayed = useChatStore.getState().messages.get("chat")?.find((message) => message.id === "message");
     if (kind === "hide") {
       expect(displayed).toBeUndefined();

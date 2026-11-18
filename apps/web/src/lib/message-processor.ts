@@ -2,7 +2,7 @@
  * High-level encrypt/decrypt interface for the chat UI.
  * Dispatches to Double Ratchet (1:1) or Sender Keys (group) based on conversation type.
  */
-import { fromBase64Url, toBase64Url } from "@e2ee-chat/crypto";
+import { fromBase64Url, toBase64Url, type EditKeyToSeal, type SealedEditKey } from "@e2ee-chat/crypto";
 import type {
   ConversationType,
   InitialMessageHeader,
@@ -38,6 +38,7 @@ export async function encryptMessage(
   plaintext: string,
   recipientUserId: string | null,
   recipientDeviceId: string | null,
+  editKey?: EditKeyToSeal,
 ): Promise<OutgoingEncrypted> {
   if (conversationType !== "direct") {
     throw new Error("encryptMessage supports direct conversations only");
@@ -51,6 +52,7 @@ export async function encryptMessage(
     recipientUserId,
     recipientDeviceId,
     plaintextBytes,
+    editKey,
   );
 
   const header: {
@@ -59,6 +61,7 @@ export async function encryptMessage(
     pn: number;
     recipientDeviceId: string;
     initial?: InitialMessageHeader;
+    editKey?: SealedEditKey;
   } = {
     dhPublicKey: result.header.dhPublicKey,
     n: result.header.n,
@@ -69,6 +72,7 @@ export async function encryptMessage(
   if (isInitial && initialHeader) {
     header.initial = initialHeader;
   }
+  if (result.sealedEditKey) header.editKey = result.sealedEditKey;
 
   return {
     ciphertext: toBase64Url(result.ciphertext),
@@ -141,13 +145,14 @@ export async function decryptMessage(
 export async function encryptGroupText(
   conversationId: string,
   plaintext: string,
+  editKey?: EditKeyToSeal,
 ): Promise<OutgoingEncrypted> {
   const plaintextBytes = new TextEncoder().encode(plaintext);
-  const result = await encryptGroupMessage(conversationId, plaintextBytes);
+  const result = await encryptGroupMessage(conversationId, plaintextBytes, editKey);
   return {
     ciphertext: toBase64Url(result.ciphertext),
     iv: toBase64Url(result.iv),
-    header: JSON.stringify(result.header),
+    header: JSON.stringify({ ...result.header, editKey: result.sealedEditKey }),
   };
 }
 

@@ -19,6 +19,10 @@ export const ICON_PATHS = {
   plus: <path d="M12 5v14M5 12h14" />,
   edit: <><path d="M4 20h4L19 9l-4-4L4 16v4z" /><path d="M13.5 6.5l4 4" /></>,
 
+  star: <path d="M12 3.8l2.5 5.1 5.6.8-4.05 3.95.95 5.6L12 16.6l-5 2.65.95-5.6L3.9 9.7l5.6-.8z" />,
+  "star-off": <><path d="M9.5 8.9l-5.6.8 4.05 3.95-.95 5.6L12 16.6l5 2.65M17.1 13.9l3-4.2-5.6-.8L12 3.8l-1.45 2.95" /><path d="M4 4l16 16" /></>,
+  keyboard: <><rect x="2.5" y="6" width="19" height="12" rx="2" /><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01" strokeWidth={2.25} /><path d="M8 14.5h8" /></>,
+
   // Sections
   chats: <path d="M20 11.5a7.5 7.5 0 01-11 6.63L4 19.5l1.4-4.2A7.5 7.5 0 1120 11.5z" />,
   settings: <><path d="M4 7h9m4 0h3M4 17h3m4 0h9" /><circle cx="15" cy="7" r="2" /><circle cx="9" cy="17" r="2" /></>,
@@ -34,7 +38,15 @@ export const ICON_PATHS = {
   palette: <><path d="M12 3.5a8.5 8.5 0 100 17c1.2 0 1.8-.9 1.8-1.8 0-1.6 1-2.2 2.2-2.2h1.5a3 3 0 003-3c0-5.5-3.8-10-8.5-10z" /><path d="M8 10.5v.01M12 7.5v.01M16 10.5v.01" strokeWidth={2.5} /></>,
   bell: <><path d="M6 16V11a6 6 0 0112 0v5l1.5 2h-15L6 16z" /><path d="M10 20.5a2.2 2.2 0 004 0" /></>,
 
+  "fingerprint": <><path d="M6.2 6.5a8 8 0 0113.3 6"/><path d="M4.5 11a8 8 0 01.6-2.4"/><path d="M8.5 19.5c-1-1.6-1.6-3.5-1.6-5.5V12a5.1 5.1 0 0110.2 0v1"/><path d="M12 12v2.5c0 2.3.7 4.5 2 6.2"/><path d="M17.1 16.5a14 14 0 01.4 3.5"/><path d="M4.6 15a12 12 0 001.2 3.2"/></>,
+  "face-scan": <><path d="M4 8V6a2 2 0 012-2h2M16 4h2a2 2 0 012 2v2M20 16v2a2 2 0 01-2 2h-2M8 20H6a2 2 0 01-2-2v-2"/><path d="M9 9.5v1M15 9.5v1"/><path d="M12 9.5V13h-1"/><path d="M9.5 15.5a3.5 3.5 0 005 0"/></>,
+  "password": <><rect x="2.5" y="7" width="19" height="10" rx="2"/><path d="M7 12h.01M12 12h.01M17 12h.01" strokeWidth={2.6}/></>,
+  "qr-code": <><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M14 14h2v2M20 14v.01M18 18h2v2M14 20h.01M14 17.5v.01"/></>,
+  "scan": <><path d="M4 8V6a2 2 0 012-2h2M16 4h2a2 2 0 012 2v2M20 16v2a2 2 0 01-2 2h-2M8 20H6a2 2 0 01-2-2v-2"/><path d="M4 12h16"/></>,
+
   // Composer and messages
+  transfer: <path d="M3.5 8.5h17m-4-4 4 4m0 7h-17m4 4-4-4" />,
+  signal: <path d="M5 20v-3m4 3v-6m4 6v-9m4 9V8m4 12V5" />,
   send: <path d="M4.5 12L4 4.5 20.5 12 4 19.5l.5-7.5zm0 0h7" />,
   attach: <path d="M19.5 11.5l-7.6 7.6a4.5 4.5 0 01-6.4-6.4l8.3-8.3a3 3 0 014.3 4.3l-8.2 8.2a1.5 1.5 0 01-2.2-2.1l7.5-7.5" />,
   emoji: <><circle cx="12" cy="12" r="8.5" /><path d="M8.5 14a4.2 4.2 0 007 0" /><path d="M9 9.5v.01M15 9.5v.01" strokeWidth={2.5} /></>,

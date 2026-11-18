@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchReleaseManifest, isTrustedDownloadUrl, ManifestError, MANIFEST_URL, parseReleaseManifest } from "./manifest.js";
+import { fetchReleaseJson, fetchReleaseManifest, isTrustedDownloadUrl, ManifestError, MANIFEST_URL, NOTES_URL, parseReleaseManifest } from "./manifest.js";
 import { LATEST } from "./manifest.fixture.js";
 
 type Entry = Record<string, unknown>;
@@ -97,5 +97,24 @@ describe("fetchReleaseManifest", () => {
     const result = expect(fetchReleaseManifest(undefined, 8_000)).rejects.toThrow(/Aborted/);
     await vi.advanceTimersByTimeAsync(8_000);
     await result;
+  });
+
+  it.each([MANIFEST_URL, NOTES_URL] as const)("fetches %s with a signal from an older WebView", async (url) => {
+    const { signal } = new AbortController();
+    Object.defineProperty(signal, "throwIfAborted", { value: undefined });
+    const fetchMock = vi.fn(async () => new Response('{"ok":true}'));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(fetchReleaseJson(url, signal)).resolves.toEqual({ ok: true });
+    expect(fetchMock).toHaveBeenCalledWith(url, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("rejects an already-aborted legacy signal before fetching", async () => {
+    const controller = new AbortController();
+    Object.defineProperty(controller.signal, "throwIfAborted", { value: undefined });
+    controller.abort();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(fetchReleaseManifest(controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

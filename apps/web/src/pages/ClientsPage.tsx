@@ -1,8 +1,11 @@
-import type { ReactNode } from "react";
+import { useEffect, useRef, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { t, useLocale, type TranslationKey } from "../i18n/index.js";
+import { ClientsReleaseNotes } from "../features/clients/ClientsReleaseNotes.js";
 import { PLATFORM_NAME_KEY, type ProcessorLabel } from "../features/clients/format.js";
 import type { PlatformKey } from "../features/clients/manifest.js";
-import { useClientsPage, type PlatformCard } from "../features/clients/useClientsPage.js";
+import { CLIENTS_PATH, CLIENTS_RELEASES_PATH, isClientsReleasesPath } from "../features/clients/routes.js";
+import { HOME_HREF, WEB_APP_HREF, useClientsPage, type PlatformCard } from "../features/clients/useClientsPage.js";
 import { Badge, Button, cx, Disclosure, Icon, Notice, Skeleton, type IconName } from "../ui/index.js";
 
 type Page = ReturnType<typeof useClientsPage>;
@@ -326,9 +329,7 @@ function PlatformsSection({ page, title }: { page: Page; title: string }) {
   );
 }
 
-/** Public download page (/clients). Pure view: all logic lives in features/clients. */
-export default function ClientsPage() {
-  useLocale();
+function DownloadPanel({ whatsNew }: { whatsNew: ReactNode }) {
   const page = useClientsPage();
   const webFeatured = page.featured === "web";
   const gridTitle = webFeatured ? t("clients.allPlatforms") : t("clients.otherPlatforms");
@@ -360,32 +361,107 @@ export default function ClientsPage() {
   }
 
   return (
+    <>
+      {body}
+      {page.footer && (
+        <footer className="mt-8 flex flex-wrap items-center gap-x-4 border-t border-line pt-2 text-xs text-ink-subtle tabular-nums">
+          <p>{t("clients.footer", { version: page.footer.version, date: page.footer.date })}</p>
+          {whatsNew}
+        </footer>
+      )}
+    </>
+  );
+}
+
+const TABS = [
+  { id: "download", path: CLIENTS_PATH, label: "clients.downloadTab" },
+  { id: "releases", path: CLIENTS_RELEASES_PATH, label: "updates.releaseNotes" },
+] as const;
+
+/** Shared shell for the two public routes. The URL is the selected tab. */
+export default function ClientsPage() {
+  const { locale } = useLocale();
+  const { pathname, search } = useLocation();
+  const navigate = useNavigate();
+  const selected = isClientsReleasesPath(pathname) ? 1 : 0;
+  const tablist = useRef<HTMLDivElement>(null);
+  const tabs = useRef<(HTMLAnchorElement | null)[]>([]);
+  const scroll = useRef<HTMLDivElement>(null);
+
+  useEffect(() => { document.title = t(selected === 1 ? "updates.releaseNotes" : "clients.documentTitle"); }, [locale, selected]);
+  useEffect(() => {
+    if (tablist.current?.contains(document.activeElement)) tabs.current[selected]?.focus();
+    if (scroll.current) scroll.current.scrollTop = 0;
+  }, [selected]);
+
+  function onTabKey(event: KeyboardEvent<HTMLAnchorElement>, index: number) {
+    let next: number;
+    switch (event.key) {
+      case "ArrowLeft":
+      case "ArrowRight": next = 1 - index; break;
+      case "Home": next = 0; break;
+      case "End": next = 1; break;
+      case " ":
+        event.preventDefault();
+        event.currentTarget.click();
+        return;
+      default: return;
+    }
+    event.preventDefault();
+    if (next !== selected) void navigate({ pathname: TABS[next].path, search });
+    tabs.current[next]?.focus();
+  }
+
+  function focusNotesTab(event: MouseEvent<HTMLAnchorElement>) {
+    if (event.button === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) tabs.current[1]?.focus();
+  }
+
+  return (
     <div className="flex h-dvh flex-col bg-canvas text-ink">
       <div data-tauri-drag-region="" aria-hidden="true" className="drag-region h-[var(--titlebar-height)] shrink-0 bg-canvas" />
-      <div className="min-h-0 flex-1 overflow-y-auto px-safe pt-safe pb-safe">
-        {/* Gutters sit outside the 60rem column, as in the mockup. */}
+      <div ref={scroll} className="min-h-0 flex-1 overflow-y-auto px-safe pt-safe pb-safe">
+        {/* Gutters sit outside the 60rem column. */}
         <div className="px-4 pb-8 sm:px-6 sm:pb-12">
-        <div className="mx-auto w-full max-w-[60rem]">
-          <header className="flex min-h-14 items-center justify-between gap-3">
-            <a href={page.homeHref} className="flex min-h-11 items-center gap-2.5 rounded-control text-base font-semibold text-ink">
-              <img src="/brand/icon-rounded.svg" alt="" className="size-8" />
-              Private Base
-            </a>
-            <Button href={page.webAppHref} variant="ghost">{t("clients.signIn")}</Button>
-          </header>
-          <main>
-            <div className="pb-5 pt-4 sm:pb-6 sm:pt-8">
-              <h1 className="text-[1.75rem] leading-[2.125rem] font-semibold tracking-[-0.01em]">{t("clients.heading")}</h1>
-              <p className="mt-2 max-w-[36rem] text-base leading-6 text-ink-muted">{t("clients.intro")}</p>
-            </div>
-            {body}
-          </main>
-          {page.footer && (
-            <footer className="mt-8 border-t border-line pt-4 text-xs text-ink-subtle tabular-nums">
-              {t("clients.footer", { version: page.footer.version, date: page.footer.date })}
-            </footer>
-          )}
-        </div>
+          <div className="mx-auto w-full max-w-[60rem]">
+            <header className="flex min-h-14 items-center justify-between gap-3">
+              <a href={HOME_HREF} className="flex min-h-11 items-center gap-2.5 rounded-control text-base font-semibold text-ink">
+                <img src="/brand/icon-rounded.svg" alt="" className="size-8" />
+                Private Base
+              </a>
+              <Button href={WEB_APP_HREF} variant="ghost">{t("clients.signIn")}</Button>
+            </header>
+            <main>
+              <div className="pb-5 pt-4 sm:pb-6 sm:pt-8">
+                <h1 id="clients-title" className="text-[1.75rem] leading-[2.125rem] font-semibold tracking-[-0.01em]">{t("clients.heading")}</h1>
+                <p className="mt-2 max-w-[36rem] text-base leading-6 text-ink-muted">{t("clients.intro")}</p>
+              </div>
+              <div ref={tablist} role="tablist" aria-labelledby="clients-title" className="mb-5 flex gap-2 border-b border-line sm:mb-6">
+                {TABS.map((tab, index) => (
+                  <Link key={tab.id} ref={(element) => { tabs.current[index] = element; }} to={{ pathname: tab.path, search }}
+                    id={`clients-tab-${tab.id}`} role="tab" aria-selected={selected === index}
+                    aria-controls={`clients-panel-${tab.id}`} tabIndex={selected === index ? 0 : -1}
+                    className={cx("flex min-h-11 min-w-11 items-center rounded-t-control border-b-2 px-3 py-2 text-sm font-semibold [overflow-wrap:anywhere] sm:px-4",
+                      selected === index ? "border-brand text-brand" : "border-transparent text-ink-muted hover:bg-sunken hover:text-ink")}
+                    onKeyDown={(event) => onTabKey(event, index)}>
+                    {t(tab.label)}
+                  </Link>
+                ))}
+              </div>
+              {TABS.map((tab, index) => (
+                <div key={tab.id} id={`clients-panel-${tab.id}`} role="tabpanel" aria-labelledby={`clients-tab-${tab.id}`}
+                  hidden={selected !== index} tabIndex={0} className="rounded-control">
+                  {selected === index && (tab.id === "releases" ? <ClientsReleaseNotes /> : (
+                    <DownloadPanel whatsNew={
+                      <Link to={{ pathname: CLIENTS_RELEASES_PATH, search }} onClick={focusNotesTab}
+                        className="inline-flex min-h-11 items-center rounded-control font-semibold text-brand underline">
+                        {t("clients.whatsNew")}
+                      </Link>
+                    } />
+                  ))}
+                </div>
+              ))}
+            </main>
+          </div>
         </div>
       </div>
     </div>

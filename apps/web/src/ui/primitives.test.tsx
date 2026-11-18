@@ -162,6 +162,7 @@ it("Avatar shows the image, then initials if it fails to load", async () => {
 it("Badge renders its text; CountBadge caps and hides at zero", async () => {
   await render(<><Badge tone="success" icon="shield-check">Verified</Badge><CountBadge count={120} label="unread messages" /><CountBadge count={0} label="unread messages" /></>);
   expect(container().textContent).toBe("Verified99+");
+  expect($(".whitespace-nowrap").textContent).toBe("Verified");
   expect(container().querySelectorAll('[aria-label="120 unread messages"]')).toHaveLength(1);
   expect(container().querySelectorAll('[aria-label="0 unread messages"]')).toHaveLength(0);
 });
