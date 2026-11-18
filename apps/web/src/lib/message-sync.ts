@@ -6,6 +6,7 @@ import type {
   MessageEventPayload,
   HistoryDeletionResult,
   MessageEditFrame,
+  MessageDeletionEvent,
 } from "@e2ee-chat/shared";
 import { CALL_KEY_RECOVERY_TTL_MS, HISTORY_DELETION_BATCH_SIZE, carriesEditKey, MAX_EDIT_ENVELOPE_BYTES, MAX_LATEST_EDIT_IDS, SYNC_PAGE_TOO_LARGE, WSFrameType } from "@e2ee-chat/shared";
 import { decryptMessageEdit, fromBase64Url, toBase64Url, type SealedEditKey } from "@e2ee-chat/crypto";
@@ -13,9 +14,9 @@ import { messageEditScope } from "./message-edit.js";
 import { api } from "../services/api.js";
 import {
   getCachedConversationMessagesPage,
+  getAppDB, historyConversationKey,
   cleanupExpiredMessages,
   cleanupExpiredPendingCalls,
-  getLatestCachedMessageTimestamp,
   getMessageById,
   reconcileMessageEditKey,
   getEditKeyResetToken,
@@ -26,7 +27,9 @@ import {
   isMessageHidden, hasReceivedMessage,
   getMessageDeletion,
   rememberMessageDeletion,
+  rememberMessageDeletions,
   removeLocalMessageContent,
+  hideLocalMessages,
   getSyncState,
   saveMessage,
   getPendingCall,
@@ -79,7 +82,6 @@ const inFlightDecryptIds = new Map<string, Promise<void>>();
 let syncEpoch = 0;
 const LOCAL_MESSAGES_PAGE_SIZE = 100;
 const SYNC_BATCH_SIZE = 250;
-const INITIAL_SYNC_BACKFILL_MS = 7 * 24 * 60 * 60 * 1000;
 const MIN_SYNC_INTERVAL_MS = 5_000;
 const EDIT_HISTORY_RESUME_INTERVAL_MS = 30_000;
 let lastSyncStartedAt = 0;
@@ -91,7 +93,6 @@ let editLookupRequested = false;
 interface SyncCursor {
   ts: number;
   id?: string;
-  emptyLocal?: boolean;
 }
 
 interface SyncResponse {
@@ -208,19 +209,16 @@ function getSyncStateId(): string | null {
   return `message-sync:${userId}:${deviceId}`;
 }
 
-async function resolveSyncCursor(explicitSince?: number): Promise<SyncCursor> {
+async function resolveSyncCursor(syncStateId: string | null, explicitSince?: number): Promise<SyncCursor> {
   if (explicitSince !== undefined) return { ts: explicitSince };
-  const syncStateId = getSyncStateId();
-  if (syncStateId) {
-    const saved = await getSyncState(syncStateId);
-    if (saved && saved.value > 0) {
-      return { ts: saved.value, id: saved.cursorId };
-    }
-    if (await getSyncState(`cached-live-empty:${syncStateId}`)) return { ts: 0 };
-  }
+  const saved = syncStateId ? await getSyncState(syncStateId) : undefined;
+  // Cached display times may come from tombstones or use different units from the server cursor.
+  return saved && saved.value > 0 ? { ts: saved.value, id: saved.cursorId } : { ts: 0 };
+}
 
-  const latestCachedTimestamp = await getLatestCachedMessageTimestamp(useAuthStore.getState().user?.id ?? null);
-  return { ts: Math.max(0, latestCachedTimestamp - INITIAL_SYNC_BACKFILL_MS), emptyLocal: latestCachedTimestamp === 0 };
+function messagePageCursor(frame: WSMessageFrame) {
+  // Rollback Workers expose the raw send position as serverTimestamp or timestamp.
+  return { ts: frame.syncTimestamp ?? frame.serverTimestamp ?? frame.timestamp, id: frame.id };
 }
 
 function receivedMessage(frame: WSMessageFrame, content: string, status: "delivered" | "failed" = "delivered"): DecryptedMessage {
@@ -732,7 +730,7 @@ async function executeSync(session: MessageSession, options?: {
   startEditLookups(session);
   if (!isCurrentSession(session)) return;
   const syncStateId = getSyncStateId();
-  let cursor = await resolveSyncCursor(options?.since);
+  let pageCursor = await resolveSyncCursor(syncStateId, options?.since);
   const scope = !options?.conversationId && session.userId && session.deviceId ? `${session.userId}:${session.deviceId}` : null;
   const editStateId = scope && `message-mutations-edits:${scope}`;
   const deletionStateId = scope && `message-mutations:${scope}`;
@@ -744,8 +742,8 @@ async function executeSync(session: MessageSession, options?: {
   while (isCurrentSession(session)) {
     const params = new URLSearchParams();
     if (options?.conversationId) params.set("conversationId", options.conversationId);
-    params.set("since", String(cursor.ts));
-    if (cursor.id !== undefined) params.set("sinceId", cursor.id);
+    params.set("since", String(pageCursor.ts));
+    if (pageCursor.id !== undefined) params.set("sinceId", pageCursor.id);
     params.set("limit", String(limit));
     params.set("mutationSince", String(deletionCursor));
     params.set("editSince", String(editCursor));
@@ -786,26 +784,34 @@ async function executeSync(session: MessageSession, options?: {
 
     const originals: OriginalEditCheck[] = [];
     let lastFrame: WSMessageFrame | undefined;
+    let lastOrdinaryFrame: WSMessageFrame | undefined;
     if (!ordinaryFailure) {
       for (const frame of response.messages) {
         if (!isCurrentSession(session)) return;
         try { await ingestMessageFrame(frame, originals); }
         catch (error) { ordinaryFailure = { error }; break; }
         lastFrame = frame;
+        if (frame.deletedAt == null) lastOrdinaryFrame = frame;
       }
     }
     try { await reconcileOriginalFrames(originals, session); }
-    catch (error) { ordinaryFailure ??= { error }; lastFrame = undefined; }
+    catch (error) {
+      ordinaryFailure ??= { error };
+      lastFrame = undefined;
+      lastOrdinaryFrame = undefined;
+    }
     const originalIds = new Set(originals.filter(({ frame }) => frame.msgType === "text")
       .map(({ frame }) => messageEditScope(frame, frame.senderDeviceId).messageId));
     if (originalIds.size) await drainLockedEdits(session, originalIds).catch((error) => console.error("Queued edits will retry on the next sync", error));
     if (!isCurrentSession(session)) return;
     if (lastFrame) {
-      const next = { ts: lastFrame.syncTimestamp ?? lastFrame.deletedAt ?? getFrameTimestamp(lastFrame), id: lastFrame.id };
       try {
-        // Live frames and conversation-specific backfills never advance this cursor.
-        if (!options?.conversationId && syncStateId) await saveSyncState(syncStateId, next.ts, next.id);
-        cursor = next;
+        // Tombstones in a message page can be paged over without checkpointing them.
+        if (!options?.conversationId && syncStateId && lastOrdinaryFrame) {
+          const next = messagePageCursor(lastOrdinaryFrame);
+          await saveSyncState(syncStateId, next.ts, next.id);
+        }
+        pageCursor = messagePageCursor(lastFrame);
       } catch (error) { ordinaryFailure ??= { error }; }
     }
 
@@ -813,11 +819,7 @@ async function executeSync(session: MessageSession, options?: {
     if (ordinaryFailure) {
       if (!response.hasMoreMutations || !mutations.length) throw ordinaryFailure.error;
     } else if ((!response.hasMore && !response.hasMoreMutations) || (!response.messages.length && !mutations.length)) {
-      if (!options?.conversationId) {
-        // Keep the local fallback separate from the authoritative server cursor.
-        if (syncStateId && cursor.emptyLocal) await advanceMutationCursor(`cached-live-empty:${syncStateId}`, 0);
-        await reconcileImportedHistoryDeletions(session);
-      }
+      if (!options?.conversationId) await reconcileImportedHistoryDeletions(session);
       return;
     }
   }
@@ -1171,24 +1173,90 @@ async function applyMessageDeletion(message: DecryptedMessage & Pick<LocalMessag
 }
 
 export async function handleMessageDeletion(payload: MessageEventPayload): Promise<void> {
-  const session = captureSession();
-  if (!payload.deletion) return;
-  const { ids, deletedAt, deletedByUserId } = payload.deletion;
-  for (const id of ids) {
-    // Finish any authenticated receive before clearing its output, preserving ratchet progress.
-    const previous = inFlightDecryptIds.get(id) ?? Promise.resolve();
-    const pending = previous.catch(() => undefined).then(async () => {
-      if (!isCurrentSession(session)) return;
-      const existing = await getMessageById(id, session.userId ?? null);
-      if (!isCurrentSession(session)) return;
-      if (existing && (existing.conversationId !== payload.conversationId || existing.senderId !== deletedByUserId)) return;
-      if (!await rememberMessageDeletion(id, payload.conversationId, deletedAt, deletedByUserId, deletedByUserId, () => isCurrentSession(session), session.userId)) return;
-      if (existing && existing.conversationId === payload.conversationId) {
-        await applyMessageDeletion({ ...existing, type: existing.type as DecryptedMessage["type"], status: existing.status as DecryptedMessage["status"], expiryKind: existing.expiryKind ?? "retention" }, deletedAt, deletedByUserId, session);
+  const replay = payload.replayedDeletions;
+  await applyDeletionEvents(payload.conversationId, [
+    ...(payload.deletion ? [{ event: payload.deletion, senderId: payload.deletion.deletedByUserId }] : []),
+    ...(replay?.deletions.map((event) => ({ event, senderId: replay.senderId })) ?? []),
+  ], payload.conversationType === undefined ? undefined : payload.conversationType === "direct");
+}
+
+export function handleBatchMessageDeletion(conversationId: string, deletions: MessageDeletionEvent[], senderId: string,
+  conversationType?: MessageEventPayload["conversationType"]) {
+  return handleMessageDeletion({ conversationId, conversationType, replayedDeletions: { senderId, deletions } });
+}
+
+async function applyDeletionEvents(conversationId: string, events: { event: MessageDeletionEvent; senderId: string }[],
+  direct = knownDirectChat(conversationId), session = captureSession()): Promise<void> {
+  const ownerId = session.userId;
+  if (!ownerId || !events.length) return;
+  const current = () => isCurrentSession(session);
+  if (direct === undefined) {
+    const db = await getAppDB();
+    const type = (await db.get("accountConversations", historyConversationKey(ownerId, conversationId)))?.conversation?.type;
+    if (type === "direct" || type === "group") direct = type === "direct";
+    else {
+      for (const { event, senderId } of events) {
+        for (const wireId of event.ids) {
+          if (!wireId.includes(":")) continue;
+          const stored = await getMessageById(wireId, ownerId);
+          if (stored?.conversationId === conversationId && stored.senderId === senderId && stored.direct !== undefined) {
+            direct = stored.direct;
+            break;
+          }
+        }
+        if (direct !== undefined) break;
       }
-    });
-    inFlightDecryptIds.set(id, pending);
-    try { await pending; } finally { if (inFlightDecryptIds.get(id) === pending) inFlightDecryptIds.delete(id); }
+    }
+  }
+  if (!current()) return;
+  const targets = new Map<string, Parameters<typeof rememberMessageDeletions>[0][number] & { receiptId: string }>();
+  const lockedIds = new Set<string>();
+  for (const { event, senderId } of events) {
+    for (const wireId of event.ids) {
+      const id = logicalMessageId(wireId, direct === true);
+      const deletion = { conversationId, senderId, deletedAt: event.deletedAt, deletedByUserId: event.deletedByUserId };
+      const target = targets.get(id) ?? { id, wireIds: new Set<string>(), direct, deletion, receiptId: wireId };
+      // Match the server's choice for compact notifications.
+      if (target.receiptId !== id && (wireId === id || wireId < target.receiptId)) {
+        target.deletion = deletion;
+        target.receiptId = wireId;
+      }
+      target.wireIds.add(wireId);
+      targets.set(id, target);
+      lockedIds.add(wireId);
+      lockedIds.add(id);
+    }
+  }
+  const previous = new Set([...lockedIds].map((id) => inFlightDecryptIds.get(id)));
+  // Serialize against authenticated receives and duplicate room, presence and HTTP delivery.
+  const pending = Promise.allSettled(previous).then(async () => {
+    if (!current()) return;
+    const accepted = await rememberMessageDeletions([...targets.values()], ownerId, current);
+    const cached = new Map(useChatStore.getState().messages.get(conversationId)?.map((message) => [message.id, message]));
+    for (const { id, row, changed } of accepted) {
+      if (!current()) return;
+      const copy = cached.get(id);
+      const stale = copy && messageVisibleToAccount(copy, ownerId) && copy.senderId === (row?.senderId ?? targets.get(id)?.deletion.senderId)
+        && (copy.deletedAt == null || copy.content !== "" || (row && (copy.deletedAt !== row.deletedAt || copy.deletedByUserId !== row.deletedByUserId)));
+      if (!changed && !stale) continue;
+      const visible = row && await guardMessageForPublish(row, ownerId, direct);
+      const message = visible && normalizeStoredMessage(visible, Date.now(), ownerId);
+      if (!current()) return;
+      if (message) useChatStore.getState().addMessage(conversationId, message);
+      else if (stale) useChatStore.getState().removeMessages([id]);
+    }
+  });
+  for (const id of lockedIds) inFlightDecryptIds.set(id, pending);
+  try { await pending; } finally {
+    for (const id of lockedIds) {
+      if (inFlightDecryptIds.get(id) === pending) inFlightDecryptIds.delete(id);
+    }
+  }
+  // A rollback Worker can send an untyped wire receipt. Keep its exact barrier
+  // while resolving metadata, then redact any quarantined direct-family copies.
+  if (direct === undefined && current() && events.some(({ event }) => event.ids.some((id) => id.includes(":")))) {
+    const conversation = await getConversation(conversationId).catch(() => undefined);
+    if (current() && conversation?.type === "direct") await applyDeletionEvents(conversationId, events, true, session);
   }
 }
 
@@ -1200,6 +1268,17 @@ export async function deleteMessageForLocalUserOnly(conversationId: string, mess
   if (!current() || !isCurrentSession(session) || (existing && existing.conversationId !== conversationId)) return;
   await removeLocalMessageContent(messageId, undefined, () => current() && isCurrentSession(session), session.userId ?? null);
   if (current() && isCurrentSession(session)) useChatStore.getState().removeMessages([messageId]);
+}
+
+export async function deleteMessagesForLocalUserOnly(conversationId: string | undefined, ids: string[], current: () => boolean,
+  expectedQueued?: ReadonlySet<string>) {
+  const session = captureSession();
+  const active = () => current() && isCurrentSession(session);
+  await Promise.all(ids.map((id) => inFlightDecryptIds.get(id)?.catch(() => undefined)));
+  if (!session.userId || !session.deviceId || !active()) return { discarded: false, alreadySending: [] };
+  const { hidden, discarded, alreadySending } = await hideLocalMessages(conversationId, ids, session.userId, session.deviceId, active, expectedQueued);
+  if (hidden.length && active()) useChatStore.getState().removeMessages(hidden);
+  return { discarded, alreadySending };
 }
 
 /** The timer lives outside the bubble lifecycle: removing the bubble must not cancel commit. */
@@ -1258,7 +1337,7 @@ export async function publishCachedEdit(id: string, conversationId: string, curr
     await reconcileLocalMessageChange(latest.id, store, current);
   }
 }
-export function startLocalHiddenMessageSync(onOutboxChange?: (id: string) => Promise<void>): () => void {
+export function startLocalHiddenMessageSync(onOutboxChange?: (id?: string) => Promise<void>): () => void {
   const session = captureSession();
   if (!session.userId || !session.deviceId) return () => {};
   let stopped = false, pending = Promise.resolve();
@@ -1267,6 +1346,7 @@ export function startLocalHiddenMessageSync(onOutboxChange?: (id: string) => Pro
     pending = pending.then(() => {
       if (!current()) return;
       if (kind === "outbox") return onOutboxChange?.(id);
+      if (kind === "outbox-batch") return onOutboxChange?.();
       return kind === "edit" && conversationId
         ? publishCachedEdit(id, conversationId, current)
         : reconcileLocalMessageChange(id, useChatStore.getState(), current);

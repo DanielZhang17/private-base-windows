@@ -133,7 +133,7 @@ it("shows a call placed after reload and password unlock, before the presence so
     check.resolve(undefined);
   });
   expect(sockets).toHaveLength(1);
-  expect(sockets[0].url).toMatch(/\/ws\/presence$/);
+  expect(new URL(sockets[0].url).pathname).toBe("/ws/presence");
   expect(sockets[0].protocols).toEqual(["token.bob-token"]);
   await act(async () => {
     sockets[0].open();

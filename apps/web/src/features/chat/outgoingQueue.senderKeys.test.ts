@@ -160,10 +160,7 @@ it("does not block group text after an upload-url rejection and encrypts the ret
   expect(messages.map((body) => JSON.parse(body.header).chainIndex)).toEqual([0, 1]);
 });
 
-it.each([
-  { delivery: "before delivery", resolution: "retry" }, { delivery: "after delivery", resolution: "retry" },
-  { delivery: "before delivery", resolution: "discard" }, { delivery: "after delivery", resolution: "discard" },
-] as const)("holds later group ciphertext after failure $delivery until $resolution", async ({ delivery, resolution }) => {
+it.each(["before delivery", "after delivery"] as const)("holds later group ciphertext after an ambiguous failure %s until a receipt arrives", async (delivery) => {
   failMessage = delivery;
   await enqueue("first");
   await retryOutgoing("first");
@@ -180,16 +177,18 @@ it.each([
     await vi.waitFor(() => expect(published).toHaveBeenCalled());
     await refreshOutgoingQueue();
     expect(encryptGroupText).toHaveBeenCalledTimes(1);
-    if (resolution === "retry") await retryOutgoing("first");
-    else await discardOutgoing("first");
+    await expect(discardOutgoing("first")).resolves.toBe("already-sending");
+    expect(await getOutgoing("first")).toMatchObject({ status: "failed" });
+    expect(await getMessageById("later")).toMatchObject({ status: "sending" });
+    await retryOutgoing("first");
     await vi.waitFor(async () => expect(await getAllOutgoing()).toEqual([]));
     expect(receiveErrors).toEqual([]);
     expect(received).toEqual([
-      ...(resolution === "retry" || delivery === "after delivery" ? [{ id: "first", content: "first" }] : []),
+      { id: "first", content: "first" },
       { id: "later", content: "later" },
     ]);
     const retries = requests.filter((body): body is SendMessageRequest => "id" in body && body.id === "first");
-    expect(retries).toEqual(resolution === "retry" ? [original, original] : [original]);
+    expect(retries).toEqual([original, original]);
     expect(encryptGroupText).toHaveBeenCalledTimes(2);
   } finally { stop(); unsubscribe(); }
 });

@@ -12,7 +12,8 @@ import { messageVisibleToAccount } from "../lib/message-account.js";
 import { getConversationHideGeneration, publishLocalMessageChange } from "../lib/local-message-changes.js";
 
 const DB_NAME = "e2ee-chat";
-const DB_VERSION = 7;
+const DB_VERSION = 8;
+const OUTGOING_REVISION_INDEX = "byOutgoingRevision";
 const RENAMED_STORES = {
   sessions: "receiveSessions", localKeys: "deviceKeys", conversations: "accountConversations",
   senderKeys: "receiveSenderKeys", fileCache: "accountFiles", pendingCalls: "receivePendingCalls",
@@ -65,6 +66,46 @@ function outgoingId(outgoing: Pick<LocalOutgoing, "id" | "userId" | "editTargetI
 }
 
 type OutgoingStore = IDBPObjectStore<unknown, string[], "accountState", "readwrite" | "versionchange">;
+type OutgoingSendState = "queued" | "failed" | "uploading" | "dispatching" | "delivery-unknown" | "discarded";
+type OutgoingLifecycle = { state: OutgoingSendState; conversationId: string; deviceId: string; revision?: string };
+const outgoingLifecycleKey = (key: string) => `outgoing-state:${key}`;
+const draftState = (row: LocalOutgoing): OutgoingSendState => row.status === "failed" ? "failed"
+  : row.upload && !row.upload.uploaded ? "uploading" : "queued";
+const mayHaveBeenDelivered = (state: OutgoingSendState | undefined) => state === "dispatching" || state === "delivery-unknown";
+
+function outboxLifecycle(row: LocalOutgoing, state?: OutgoingSendState): OutgoingLifecycle {
+  const dispatched = row.steps.some((step) => (step.path !== "/api/messages/send-direct-batch" || step.body.type !== "sender_key_distribution")
+    && (step.completed || (step.sendDispatched ?? row.sendDispatched ?? true)));
+  return { conversationId: row.conversationId, deviceId: row.deviceId, revision: row.revision,
+    state: state ?? (dispatched ? (row.status === "failed" ? "delivery-unknown" : "dispatching") : draftState(row)) };
+}
+
+async function readOutgoingLifecycle(store: OutgoingStore, key: string, row?: LocalOutgoing, reAdopt = false): Promise<OutgoingLifecycle | undefined> {
+  const saved = await store.get(outgoingLifecycleKey(key)) as OutgoingLifecycle | undefined;
+  row ??= (await store.get(key))?.outgoing as LocalOutgoing | undefined;
+  if (!row) return saved?.state === "discarded" ? saved : undefined;
+  if (!saved) return outboxLifecycle(row);
+  if ((saved.revision && saved.revision === row.revision) || saved.state === "discarded") return saved;
+  // The sender can adopt the persisted, undispatched envelope in its next write.
+  const persisted = outboxLifecycle(row);
+  return reAdopt && !mayHaveBeenDelivered(persisted.state) ? persisted : { ...persisted, state: "delivery-unknown" };
+}
+
+async function readQueuedDiscardLifecycle(store: OutgoingStore, key: string): Promise<OutgoingLifecycle | "unverified" | undefined> {
+  if (await store.getKey(key) === undefined) return;
+  const saved = await store.get(outgoingLifecycleKey(key)) as OutgoingLifecycle | undefined;
+  if (!saved) {
+    // Pre-v8 entries may lack a sidecar. Read only those entries and use their
+    // persisted dispatch markers, including the conservative legacy default.
+    const row = (await store.get(key))?.outgoing as LocalOutgoing | undefined;
+    return row && Array.isArray(row.steps) ? outboxLifecycle(row) : "unverified";
+  }
+  return saved.revision && await store.index(OUTGOING_REVISION_INDEX).getKey([key, saved.revision]) !== undefined ? saved : "unverified";
+}
+
+async function deleteOutgoingRecord(store: OutgoingStore, key: string) {
+  await Promise.all([store.delete(key), store.delete(outgoingLifecycleKey(key))]);
+}
 type SyncStateReader = { get(key: string): Promise<unknown> };
 type OutgoingEditTarget = Pick<LocalOutgoing, "id" | "conversationId" | "userId">;
 const outgoingEditTargetPrefix = (ownerId: string, targetId: string) =>
@@ -89,9 +130,11 @@ function outgoingEditStatus({ steps, upload, ...status }: LocalOutgoing): Outgoi
   return { ...status, hasEnvelope: steps?.some((step) => step.path === "/api/messages/edit") ?? false };
 }
 
-async function putOutgoing(store: OutgoingStore, outgoing: LocalOutgoing) {
+async function putOutgoing(store: OutgoingStore, outgoing: LocalOutgoing, state?: OutgoingSendState) {
+  const key = outgoingLifecycleKey(outgoingId(outgoing));
   if (outgoing.editTargetId) await ensureOutgoingEditTargets(store);
-  await store.put(outgoingRecord(outgoing));
+  const record = outgoingRecord(outgoing);
+  await Promise.all([store.put(record), store.put({ id: key, ...outboxLifecycle(outgoing, state) })]);
   if (outgoing.editTargetId) await Promise.all([
     store.put({ id: outgoingKey(outgoing.id, outgoing.userId, OUTGOING_EDIT_STATUS_PREFIX), status: outgoingEditStatus(outgoing) }),
     addOutgoingEditTarget(store, outgoing),
@@ -100,7 +143,7 @@ async function putOutgoing(store: OutgoingStore, outgoing: LocalOutgoing) {
 
 async function deleteOutgoingEdit(store: OutgoingStore, id: string, targetId: string, ownerId: string) {
   await Promise.all([
-    store.delete(outgoingKey(id, ownerId, OUTGOING_EDIT_PREFIX)),
+    deleteOutgoingRecord(store, outgoingKey(id, ownerId, OUTGOING_EDIT_PREFIX)),
     store.delete(outgoingKey(id, ownerId, OUTGOING_EDIT_STATUS_PREFIX)),
     store.delete(outgoingEditTargetPrefix(ownerId, targetId) + id),
   ]);
@@ -519,10 +562,11 @@ export function getAppDB() {
       upgrade(db, oldVersion, _newVersion, tx) {
         void tx.done.catch(() => undefined);
         const names = Array.from(db.objectStoreNames);
-        const canonical = oldVersion === 6 && CANONICAL_STORES.every((name) => names.includes(name))
+        const canonical = (oldVersion === 6 || oldVersion === 7) && CANONICAL_STORES.every((name) => names.includes(name))
           && names.length === CANONICAL_STORES.length
-          && hasCanonicalDisplaySchema(tx.objectStore("displayMessages"));
-        const legacy = names.every((name) => LEGACY_STORES.includes(name))
+          && hasCanonicalDisplaySchema(tx.objectStore("displayMessages"))
+          && (oldVersion !== 7 || tx.objectStore("legacyMessages").indexNames.contains("byExpiry"));
+        const legacy = oldVersion < 7 && names.every((name) => LEGACY_STORES.includes(name))
           && (oldVersion < 6 || (names.includes("syncState") && (names.includes("outgoingQueue")
             || ["messages", "localKeys"].every((name) => names.includes(name)))));
         if (!canonical && !legacy) {
@@ -545,6 +589,9 @@ export function getAppDB() {
           display.createIndex("byAccountConversation", ["ownerId", "conversationId", "timestamp", "id"]);
           display.createIndex("byTimestamp", "timestamp");
         }
+        // Index the envelope's own revision, including writes that omit the sidecar.
+        tx.objectStore("accountState").createIndex(OUTGOING_REVISION_INDEX, ["id", "outgoing.revision"]);
+        if (oldVersion === 7) return;
         const quarantine = tx.objectStore("legacyMessages");
         if (!quarantine.indexNames.contains("byConversation")) quarantine.createIndex("byConversation", ["conversationId", "timestamp"]);
         quarantine.createIndex("byExpiry", "quarantineExpiresAt");
@@ -567,6 +614,7 @@ export function getAppDB() {
     }).then((db) => {
       if (db.objectStoreNames.length !== CANONICAL_STORES.length || !CANONICAL_STORES.every((name) => db.objectStoreNames.contains(name))
         || !db.transaction("legacyMessages").store.indexNames.contains("byExpiry")
+        || !db.transaction("accountState").store.indexNames.contains(OUTGOING_REVISION_INDEX)
         || !hasCanonicalDisplaySchema(db.transaction("displayMessages").store)) {
         db.close();
         throw new Error("Unsupported pre-release local database layout");
@@ -973,21 +1021,6 @@ export async function getCachedConversationMessagesPage(
   options?: { before?: number | CachedMessageCursor; limit?: number; ownerId?: string | null; direct?: boolean },
 ): Promise<CachedMessagePage> {
   return readConversationMessagePage(conversationId, options?.limit ?? 100, options?.before, options?.ownerId, options?.direct);
-}
-
-export async function getLatestCachedMessageTimestamp(ownerId?: string | null): Promise<number> {
-  const db = await getAppDB();
-  const tx = db.transaction("displayMessages", "readonly");
-  const index = tx.store.index("byTimestamp");
-  let cursor = await index.openCursor(null, "prev");
-  // Imported display rows are independent of this device's encrypted receive cursor.
-  while (cursor) {
-    const row = cursor.value as LocalMessage;
-    if (row.importedAt === undefined && (ownerId === undefined || messageVisibleToAccount(row, ownerId))) break;
-    cursor = await cursor.continue();
-  }
-  await tx.done;
-  return cursor ? (cursor.value as LocalMessage).timestamp : 0;
 }
 
 export async function saveSyncState(id: string, value: number, cursorId?: string): Promise<void> {
@@ -2101,7 +2134,8 @@ export function subscribeOutgoingMessageReady(listener: (outgoing: LocalOutgoing
 export async function saveOutgoing(outgoing: LocalOutgoing): Promise<void> {
   const db = await getAppDB();
   const tx = db.transaction("accountState", "readwrite");
-  await putOutgoing(tx.store, outgoing);
+  const lifecycle = await readOutgoingLifecycle(tx.store, outgoingId(outgoing));
+  if (lifecycle?.state !== "discarded" && !mayHaveBeenDelivered(lifecycle?.state)) await putOutgoing(tx.store, outgoing);
   await tx.done;
 }
 export async function getOutgoing(id: string, ownerId?: string): Promise<LocalOutgoing | undefined> {
@@ -2139,8 +2173,11 @@ export async function getOutgoingEditStatuses(ownerId: string): Promise<Outgoing
   return statuses.filter((status) => status !== undefined);
 }
 export async function deleteOutgoing(id: string, ownerId?: string): Promise<void> {
-  const outgoing = await getOutgoing(id, ownerId);
-  if (outgoing) await (await getAppDB()).delete("accountState", outgoingKey(id, outgoing.userId));
+  const owner = ownerId ?? (await getOutgoing(id))?.userId;
+  if (!owner) return;
+  const tx = (await getAppDB()).transaction("accountState", "readwrite");
+  await deleteOutgoingRecord(tx.store, outgoingKey(id, owner));
+  await tx.done;
 }
 /** Retire only an unsendable orphan, checking current queue/display state atomically. */
 export async function retireUnsendableOutgoing(id: string, ownerId: string, edit = false) {
@@ -2168,7 +2205,7 @@ export async function retireUnsendableOutgoing(id: string, ownerId: string, edit
   }
   // Encrypted upload bytes live only in this record, so deleting it retires them too.
   if (row.editTargetId) await deleteOutgoingEdit(queue, row.id, row.editTargetId, ownerId);
-  else await queue.delete(outgoingKey(row.id, ownerId));
+  else await deleteOutgoingRecord(queue, outgoingKey(row.id, ownerId));
   await tx.done;
   if (row.editTargetId) publishLocalMessageChange(row.id, "outbox", row.conversationId);
   return row;
@@ -2202,7 +2239,7 @@ export async function saveQueuedEdit(outgoing: LocalOutgoing & { editTargetId: s
   return { ...updated, ...editCredentials(edits) };
 }
 
-export async function finishQueuedEdit(outgoing: LocalOutgoing, current: () => boolean, receipt?: MessageEditReceipt): Promise<boolean> {
+export async function finishQueuedEdit(outgoing: LocalOutgoing, current: () => boolean, receipt?: MessageEditReceipt): Promise<boolean | "already-sending"> {
   const id = outgoing.editTargetId;
   if (!id || !current()) return false;
   const pending = receipt ? (await getMessageById(id, outgoing.userId))?.pendingEdit : undefined;
@@ -2210,10 +2247,12 @@ export async function finishQueuedEdit(outgoing: LocalOutgoing, current: () => b
   const tx = db.transaction(["displayMessages", "accountState", "accountFiles"], "readwrite");
   const state = tx.objectStore("accountState"), messages = tx.objectStore("displayMessages");
   const stored = await readOutgoing(state, outgoing.id, outgoing.userId);
+  const lifecycle = stored && await readOutgoingLifecycle(state, outgoingId(stored), stored);
   const message = await readDisplayMessage(messages, id, outgoing.userId);
   const edits = message && await readEditState(state, message);
   const { hidden, deletion } = message ? await readHistoryMessageBarriers(state, message, outgoing.userId, !!message.direct) : {};
-  if (!current() || !stored || stored.revision !== outgoing.revision) { await tx.done; return false; }
+  if (!current() || !stored || (receipt && stored.revision !== outgoing.revision) || lifecycle?.state === "discarded") { await tx.done; return false; }
+  if (!receipt && mayHaveBeenDelivered(lifecycle?.state)) { await tx.done; return "already-sending"; }
   if (message && edits?.pendingId === outgoing.id && message.conversationId === outgoing.conversationId && message.senderId === outgoing.userId
     && !(hidden && permanentHide(await readMessageHide(state, id, outgoing.userId, message))) && !deletion && normalizeExpiryMetadata(message).expiresAt > Date.now()) {
     const step = stored.steps[0];
@@ -2226,6 +2265,7 @@ export async function finishQueuedEdit(outgoing: LocalOutgoing, current: () => b
       ...(applied && { editSequence: receipt.editSeq, editedAt: receipt.editedAt, envelope: editEnvelope(step.body) }) });
   }
   await deleteOutgoingEdit(state, outgoing.id, id, outgoing.userId);
+  if (!receipt && lifecycle) await state.put({ id: outgoingLifecycleKey(outgoingId(outgoing)), ...lifecycle, state: "discarded" });
   if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
   await tx.done;
   if (message) publishLocalMessageChange(message.id, "edit", message.conversationId);
@@ -2237,10 +2277,12 @@ export async function saveQueuedMessage(message: LocalMessage, outgoing: LocalOu
   const db = await getAppDB();
   const tx = db.transaction(["displayMessages", "accountState", "accountFiles"], "readwrite");
   const queue = tx.objectStore("accountState");
+  const existing = (await queue.get(outgoingId(outgoing)))?.outgoing as LocalOutgoing | undefined;
+  const lifecycle = (await readOutgoingLifecycle(queue, outgoingId(outgoing), existing))?.state;
+  if (lifecycle === "discarded" || mayHaveBeenDelivered(lifecycle)) { await tx.done; return; }
   const merged = await mergeDisplayMessage(tx, { ...message, id: outgoing.id, wireId: outgoing.id,
     ownerId: outgoing.userId, direct: outgoing.conversationType === "direct" });
   if (!merged.row || merged.hidden || merged.row.deletedAt != null) { await tx.done; return; }
-  const existing = (await queue.get(outgoingId(outgoing)))?.outgoing as LocalOutgoing | undefined;
   if (existing) {
     outgoing.queuedAt = existing.queuedAt;
   } else {
@@ -2251,43 +2293,47 @@ export async function saveQueuedMessage(message: LocalMessage, outgoing: LocalOu
   await tx.done;
   if (outgoing.retryable && !existing?.retryable) outgoingMessageReadyListeners.forEach((listener) => listener(outgoing));
 }
-export async function discardQueuedMessage(id: string, current: () => boolean = () => true, ownerId?: string): Promise<void> {
-  const db = await getAppDB();
-  const owner = ownerId ?? (await getOutgoing(id))?.userId;
-  if (!owner || !current()) return;
-  const tx = db.transaction(["displayMessages", "accountState", "accountFiles"], "readwrite");
-  const key = outgoingKey(id, owner);
-  const outgoing = (await tx.objectStore("accountState").get(key))?.outgoing as LocalOutgoing | undefined;
-  const message = outgoing && await readDisplayMessage(tx.objectStore("displayMessages"), id, outgoing.userId);
-  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return; }
-  const fileId = message && extractFileIdFromMessage(message);
-  if (fileId) await evictCachedFile(tx.objectStore("accountFiles"), fileId, message?.ownerId);
-  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return; }
-  if (message?.ownerId) {
-    await tx.objectStore("displayMessages").delete([message.ownerId, message.id]);
-    await tx.objectStore("accountState").delete(editStateKey(message.id, message.ownerId));
-  }
-  await tx.objectStore("accountState").delete(key);
-  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return; }
-  await tx.done;
-}
-
-
 /** Update an existing outbox entry atomically, without resurrecting another tab's discard. */
-export async function updateOutgoingIfPresent(outgoing: LocalOutgoing, message?: LocalMessage, options: { ifUnchanged?: boolean; prepareEditKey?: boolean; editKeyResetToken?: string | null } = {}): Promise<boolean> {
+export async function updateOutgoingIfPresent(outgoing: LocalOutgoing, message?: LocalMessage, options: {
+  ifUnchanged?: boolean; prepareEditKey?: boolean; editKeyResetToken?: string | null; releaseDispatch?: boolean; rejectedDispatch?: boolean;
+} = {}): Promise<boolean> {
   const wrappedEditState = options.prepareEditKey && message ? await prepareEditState({ ...message, ownerId: outgoing.userId }) : undefined;
   const db = await getAppDB();
   const tx = db.transaction(["displayMessages", "accountState", "accountFiles"], "readwrite");
   const queue = tx.objectStore("accountState");
   const current = (await queue.get(outgoingId(outgoing)))?.outgoing as LocalOutgoing | undefined;
-  if (!current || (options.ifUnchanged && current.revision !== outgoing.revision)) { await tx.done; return false; }
-  await putOutgoing(queue, outgoing);
+  const previous = current && (await readOutgoingLifecycle(queue, outgoingId(outgoing), current, options.ifUnchanged))?.state;
+  if (!current || previous === "discarded"
+    || ((options.ifUnchanged || mayHaveBeenDelivered(previous)) && current.revision !== outgoing.revision)) { await tx.done; return false; }
+  let next = draftState(outgoing);
+  if (!options.releaseDispatch) {
+    if (previous === "delivery-unknown") next = previous;
+    if (previous === "dispatching" && !options.rejectedDispatch) next = outgoing.status === "failed" ? "delivery-unknown" : previous;
+  }
+  await putOutgoing(queue, outgoing, next);
   if (message) await mergeDisplayMessage(tx, { ...message, ownerId: current.userId, direct: current.conversationType === "direct" }, { ...options, wrappedEditState });
   await tx.done;
   if (outgoing.editTargetId && current.status !== outgoing.status) publishLocalMessageChange(outgoing.id, "outbox", outgoing.conversationId);
   if (!outgoing.editTargetId && !options.ifUnchanged && !current.retryable && outgoing.retryable) {
     outgoingMessageReadyListeners.forEach((listener) => listener(outgoing));
   }
+  return true;
+}
+
+/** The committed lifecycle write is the boundary between discard and a message POST. */
+export async function claimOutgoingDispatch(outgoing: LocalOutgoing, stepIndex: number, active: () => boolean): Promise<boolean> {
+  const tx = (await getAppDB()).transaction("accountState", "readwrite");
+  const key = outgoingId(outgoing);
+  const stored = (await tx.store.get(key))?.outgoing as LocalOutgoing | undefined;
+  const lifecycle = await readOutgoingLifecycle(tx.store, key, stored, true);
+  const step = stored?.steps[stepIndex];
+  // After an interruption, retry only the same persisted, possibly submitted envelope.
+  const replay = mayHaveBeenDelivered(lifecycle?.state) && step && (step.sendDispatched ?? stored?.sendDispatched ?? true);
+  if (!active() || !stored || stored.revision !== outgoing.revision || !step || step.completed
+    || (!replay && lifecycle?.state !== "queued" && lifecycle?.state !== "uploading")) { await tx.done; return false; }
+  await putOutgoing(tx.store, outgoing, replay ? "delivery-unknown" : "dispatching");
+  if (!active()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
+  await tx.done;
   return true;
 }
 export async function completeOutgoingIfPresent(outgoing: LocalOutgoing, message?: LocalMessage, options: { ifUnchanged?: boolean; editKeyAccepted?: boolean } = {}): Promise<boolean> {
@@ -2297,7 +2343,7 @@ export async function completeOutgoingIfPresent(outgoing: LocalOutgoing, message
   const current = (await queue.get(outgoingId(outgoing)))?.outgoing as LocalOutgoing | undefined;
   if (!current || (options.ifUnchanged && current.revision !== outgoing.revision)) { await tx.done; return false; }
   if (message) await mergeDisplayMessage(tx, { ...message, ownerId: current.userId, direct: current.conversationType === "direct" }, options);
-  await queue.delete(outgoingId(outgoing));
+  await deleteOutgoingRecord(queue, outgoingId(outgoing));
   await tx.done;
   return true;
 }
@@ -2307,7 +2353,13 @@ export async function updateOutgoingErrorIfUnchanged(id: string, previous: strin
   const db = await getAppDB();
   const tx = db.transaction("accountState", "readwrite");
   const row = (await tx.store.get(outgoingKey(id, ownerId)))?.outgoing as LocalOutgoing | undefined;
-  if (row?.error === previous) await tx.store.put(outgoingRecord({ ...row, error: next }));
+  if (row?.error === previous) {
+    const key = outgoingId(row);
+    const lifecycle = await tx.store.get(outgoingLifecycleKey(key)) as OutgoingLifecycle | undefined;
+    if (!lifecycle || (lifecycle.revision && lifecycle.revision === row.revision)) {
+      await putOutgoing(tx.store, { ...row, error: next }, lifecycle?.state);
+    }
+  }
   await tx.done;
 }
 
@@ -2346,10 +2398,61 @@ export async function isMessageHidden(id: string, ownerId?: string, direct?: boo
     || ((direct ?? row?.direct ?? false) && await hasMessageFamilyHide(state, id, ownerId));
 }
 
+async function hideDisplayMessage(tx: DisplayTransaction, id: string, ownerId: string, row?: LocalMessage, conversationId = row?.conversationId) {
+  const state = tx.objectStore("accountState");
+  const edits = row && await readEditState(state, row);
+  if (row) await mergeDisplayMessage(tx, row, { finalizeHide: true });
+  await state.put({ id: messageHideKey(id, ownerId), messageId: id, ownerId,
+    ...(edits?.pendingId && row && { expiresAt: normalizeExpiryMetadata(row).expiresAt }) });
+  await noteHistoryRemoval(state, conversationId, ownerId);
+}
+
+export async function hideLocalMessages(conversationId: string | undefined, ids: string[], ownerId: string, deviceId: string, current: () => boolean,
+  expectedQueued?: ReadonlySet<string>) {
+  const tx = (await getAppDB()).transaction(["displayMessages", "legacyMessages", "accountState", "accountFiles"], "readwrite");
+  const state = tx.objectStore("accountState");
+  const hidden = new Map<string, string | undefined>();
+  const alreadySending: string[] = [];
+  let discarded = false;
+  try {
+    for (const id of ids) {
+      if (!current()) break;
+      const row = await readDisplayMessage(tx.objectStore("displayMessages"), id, ownerId);
+      if (row && conversationId && row.conversationId !== conversationId) continue;
+      const displayId = row?.id ?? logicalMessageId(id, id.includes(":"));
+      if (hidden.has(displayId)) continue;
+      const key = outgoingKey(displayId, ownerId);
+      const queued = !row || row.senderId === ownerId ? await readQueuedDiscardLifecycle(state, key) : undefined;
+      if (!conversationId && !queued) continue; // Standalone Discard targets outbox entries only.
+      if (queued === "unverified" || (!queued && expectedQueued?.has(id) && row?.senderId === ownerId
+        && (row.status === "sent" || row.status === "delivered" || row.status === "read"))) { alreadySending.push(id); continue; }
+      if (queued && (queued.deviceId !== deviceId || (conversationId && queued.conversationId !== conversationId))) continue;
+      if (mayHaveBeenDelivered(queued?.state)) { alreadySending.push(id); continue; }
+      if (queued && queued.state !== "discarded") {
+        await state.put({ id: outgoingLifecycleKey(key), ...queued, state: "discarded" });
+        await state.delete(key);
+        discarded = true;
+      }
+      const chat = conversationId ?? queued?.conversationId ?? row?.conversationId;
+      await hideDisplayMessage(tx, displayId, ownerId, row, chat);
+      hidden.set(displayId, chat);
+    }
+  } catch (error) {
+    // An IndexedDB request may have already aborted the transaction.
+    try { tx.abort(); } catch { /* Already aborted. */ }
+    await tx.done.catch(() => undefined);
+    throw error;
+  }
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return { hidden: [], discarded: false, alreadySending: [] }; }
+  await tx.done;
+  for (const [id, chat] of hidden) publishLocalMessageChange(id, "hide", chat);
+  if (discarded) publishLocalMessageChange(ids[0], "outbox-batch", conversationId ?? hidden.values().next().value, false, ownerId);
+  return { hidden: [...hidden.keys()], discarded, alreadySending };
+}
+
 export async function removeLocalMessageContent(messageId: string, tombstone?: LocalMessage, current: () => boolean = () => true, ownerId?: string | null): Promise<boolean> {
   if (ownerId === null || !current()) return false;
   const tx = (await getAppDB()).transaction(["displayMessages", "legacyMessages", "accountState", "accountFiles"], "readwrite");
-  const state = tx.objectStore("accountState");
   const row = await readDisplayMessage(tx.objectStore("displayMessages"), messageId, ownerId, tombstone?.direct);
   const owner = ownerId ?? row?.ownerId ?? tombstone?.ownerId;
   if (!owner || !current()) { await tx.done; return false; }
@@ -2362,11 +2465,7 @@ export async function removeLocalMessageContent(messageId: string, tombstone?: L
     if (!result.accepted) { await tx.done; return false; }
     changed = result.changed;
   } else {
-    const edits = row && await readEditState(state, row);
-    if (row) await mergeDisplayMessage(tx, row, { finalizeHide: true });
-    await state.put({ id: messageHideKey(id, owner), messageId: id, ownerId: owner,
-      ...(edits?.pendingId && row && { expiresAt: normalizeExpiryMetadata(row).expiresAt }) });
-    await noteHistoryRemoval(state, row?.conversationId, owner);
+    await hideDisplayMessage(tx, id, owner, row);
     changed = true;
   }
   if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
@@ -2382,11 +2481,11 @@ export async function getMessageDeletion(id: string, ownerId?: string, identity?
 
 export async function mergeDisplayDeletion(
   tx: DisplayTransaction, wireId: string, ownerId: string, deletion: MessageDeletion,
-  direct?: boolean, incoming?: LocalMessage,
+  direct?: boolean, incoming?: LocalMessage, clearPending = true,
 ): Promise<{ accepted: boolean; changed: boolean; row?: LocalMessage }> {
   const state = tx.objectStore("accountState");
   const displayed = await readDisplayMessage(tx.objectStore("displayMessages"), wireId, ownerId, direct);
-  const directFamily = direct ?? displayed?.direct ?? wireId.includes(":");
+  const directFamily = direct ?? (displayed && deletionMatches(displayed, deletion) ? displayed.direct : undefined) ?? incoming?.direct ?? false;
   // A server tombstone applies to matching quarantine rows even if a live row
   // already exists, or if this mutation was seen before the schema migration.
   if (deletion.importedAt === undefined) {
@@ -2415,10 +2514,49 @@ export async function mergeDisplayDeletion(
   await retireEditsForMessage(state, id, ownerId, { conversationId: deletion.conversationId, senderId: deletion.senderId ?? deletion.deletedByUserId });
   const base = displayed ?? incoming;
   const merged = base && await mergeDisplayMessage(tx, { ...base, ...deletion, id, ownerId,
-    wireId: base.wireId ?? wireId, direct: direct ?? base.direct ?? wireId.includes(":") });
+    wireId: base.wireId ?? wireId, direct: directFamily });
   if (!merged?.changed && markerChanged) await noteHistoryRemoval(state, deletion.conversationId, ownerId);
-  await deletePendingReceive(state, wireId, ownerId);
+  if (clearPending) await deletePendingReceive(state, wireId, ownerId);
   return { accepted: true, changed: markerChanged || !!merged?.changed, row: merged?.row };
+}
+
+export async function rememberMessageDeletions(targets: { id: string; wireIds: Set<string>; direct?: boolean; deletion: MessageDeletion }[],
+  ownerId: string, current: () => boolean): Promise<{ id: string; row?: LocalMessage; changed: boolean }[]> {
+  const tx = (await getAppDB()).transaction(["displayMessages", "legacyMessages", "accountState", "accountFiles"], "readwrite");
+  const state = tx.objectStore("accountState");
+  const accepted: { id: string; row?: LocalMessage; changed: boolean }[] = [];
+  const exact = new Map<string, MessageDeletion>(), families = new Map<string, MessageDeletion>();
+  try {
+    for (const target of targets) {
+      if (!current()) break;
+      const result = await mergeDisplayDeletion(tx, target.id, ownerId, target.deletion, target.direct, undefined, false);
+      if (!result.accepted) continue;
+      for (const id of target.wireIds) exact.set(id, target.deletion);
+      if (target.direct || result.row?.direct) families.set(result.row?.id ?? target.id, target.deletion);
+      accepted.push({ id: result.row?.id ?? target.id, row: result.row, changed: result.changed });
+    }
+    if (current() && exact.size) {
+      const prefix = PENDING_RECEIVE_PREFIX + JSON.stringify([ownerId]).slice(0, -1) + ",";
+      const pending = await state.getAllKeys(IDBKeyRange.bound(prefix, prefix + "\uffff"));
+      for (const key of pending) {
+        const [, , id] = JSON.parse(String(key).slice(PENDING_RECEIVE_PREFIX.length)) as [string, string, string];
+        const wire = exact.get(id), family = families.get(logicalMessageId(id, true));
+        if (!wire && !family) continue;
+        const frame = (await state.get(key))?.frame as WSMessageFrame | undefined;
+        if (frame?.id === id && ((wire && deletionMatches(frame, wire)) || (family && deletionMatches(frame, family)))) await state.delete(key);
+      }
+    }
+  } catch (error) {
+    try { tx.abort(); } catch { /* A failed request may have already aborted. */ }
+    await tx.done.catch(() => undefined);
+    throw error;
+  }
+  if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return []; }
+  await tx.done;
+  for (const { row, changed } of accepted) {
+    if (row && changed) publishLocalMessageChange(row.id, "commit", row.conversationId, false, ownerId);
+  }
+  return accepted;
 }
 
 export async function rememberMessageDeletion(id: string, conversationId: string, deletedAt: number, deletedByUserId: string, senderId = deletedByUserId,

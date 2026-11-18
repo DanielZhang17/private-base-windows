@@ -42,7 +42,7 @@ export function createNotificationWebSocket(options: NotificationSocketOptions):
     if (!token) return;
 
     const socket = new WebSocket(
-      `${resolveWsBaseUrl()}/ws/presence`,
+      `${resolveWsBaseUrl()}/ws/presence?logicalDeletionIds=1`,
       [`token.${token}`],
     );
     ws = socket;

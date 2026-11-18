@@ -3,6 +3,7 @@ import { MAX_LATEST_EDIT_IDS } from "./types/messages.js";
 import {
   MAX_CUSTOM_EMOJIS_PER_USER,
   MAX_CUSTOM_EMOJI_SIZE,
+  MAX_DELETE_BATCH_SIZE,
   MAX_TIMED_MESSAGE_TTL_SECONDS,
   MIN_TIMED_MESSAGE_TTL_SECONDS,
   OTP_KEY_POOL_SIZE,
@@ -155,6 +156,14 @@ export const enrollRecoveryKeySchema = z.object({
 // A colon is reserved exclusively for <family>:<recipient-device> fanout envelopes.
 const familyMessageId = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const fanoutEnvelopeId = z.string().regex(/^[A-Za-z0-9_-]{1,128}(?::[A-Za-z0-9_-]{1,128})?$/);
+
+export const deleteMessagesSchema = z.object({
+  conversationId: z.string().min(1).max(128).optional(),
+  ids: z.array(fanoutEnvelopeId).min(1).max(MAX_DELETE_BATCH_SIZE),
+  fileIds: z.record(fanoutEnvelopeId, z.string().min(1).max(128)).optional(),
+}).strict().refine(({ ids, fileIds }) => !fileIds || Object.keys(fileIds).every((id) => ids.includes(id)), {
+  message: "Attachment references must belong to selected messages", path: ["fileIds"],
+});
 
 export const sendMessageSchema = z.object({
   id: familyMessageId,

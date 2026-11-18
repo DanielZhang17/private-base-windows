@@ -493,6 +493,42 @@ describe("message ingest dedupe", () => {
 });
 
 describe("composite sync cursor", () => {
+  it("stores normalized display times for recovered messages and tombstones while paging by the raw cursor", async () => {
+    const seconds = Math.floor(Date.now() / 1000) - 60;
+    const sentAt = seconds * 1000;
+    const recovered = { ...frame("seconds-message", sentAt), timestamp: seconds, syncTimestamp: seconds };
+    const tombstone = { ...frame("seconds-deleted", sentAt + 1000), timestamp: seconds + 1, syncTimestamp: seconds + 1,
+      ciphertext: "", deletedAt: Date.now(), deletedByUserId: "alice" };
+    vi.mocked(api.get).mockResolvedValueOnce({ messages: [recovered], hasMore: true })
+      .mockResolvedValueOnce({ messages: [tombstone], hasMore: false });
+    await syncMessages({ force: true });
+    expect(requestParams(1).get("since")).toBe(String(seconds));
+    expect(requestParams(1).get("sinceId")).toBe(recovered.id);
+    expect(await getSyncState(syncStateId)).toMatchObject({ value: seconds, cursorId: recovered.id });
+    expect(useChatStore.getState().messages.get("conv")).toMatchObject([
+      { id: recovered.id, timestamp: sentAt, content: "decrypted" },
+      { id: tombstone.id, timestamp: sentAt + 1000, deletedAt: tombstone.deletedAt, content: "" },
+    ]);
+  });
+
+  it.each(["serverTimestamp", "timestamp"] as const)("pages past rollback tombstones by raw %s without checkpointing them", async (field) => {
+    const raw = Math.floor(Date.now() / 1000) - 60;
+    const tombstone = { ...frame("rollback-deleted", raw), deletedAt: Date.now(), deletedByUserId: "alice",
+      serverTimestamp: field === "serverTimestamp" ? raw : undefined, timestamp: field === "timestamp" ? raw : raw - 1 };
+    const ordinary = frame("rollback-ordinary", raw + 1);
+    vi.mocked(api.get).mockResolvedValueOnce({ messages: [tombstone], hasMore: true })
+      .mockImplementationOnce(async () => {
+        expect(await getSyncState(syncStateId)).toBeUndefined();
+        expect(requestParams(1).get("since")).toBe(String(raw));
+        expect(requestParams(1).get("sinceId")).toBe(tombstone.id);
+        return { messages: [ordinary], hasMore: false };
+      });
+    await syncMessages({ force: true });
+    expect(await getSyncState(syncStateId)).toMatchObject({ value: raw + 1, cursorId: ordinary.id });
+    expect(await getMessageById(tombstone.id)).toMatchObject({ deletedAt: tombstone.deletedAt, content: "" });
+    expect(await getMessageById(ordinary.id)).toMatchObject({ content: "decrypted" });
+  });
+
   it("paginates equal timestamps and resumes from the saved last frame", async () => {
     vi.mocked(api.get)
       .mockResolvedValueOnce({ messages: [frame("a"), frame("b")], hasMore: true })
@@ -561,11 +597,14 @@ describe("message deletion", () => {
     await ingestMessageFrame(original);
     vi.mocked(decryptMessage).mockClear();
     await saveSyncState(syncStateId, 200, "later");
-    vi.mocked(api.get).mockResolvedValue({ messages: [{ ...original, ciphertext: "", header: "", iv: "", deletedAt: 300, deletedByUserId: "alice", syncTimestamp: 300 }], hasMore: false });
+    vi.mocked(api.get).mockResolvedValue({ messages: [], hasMore: false, mutationCursor: 1, mutations: [
+      { ...original, ciphertext: "", header: "", iv: "", deletedAt: 300, deletedByUserId: "alice", syncTimestamp: 100, mutationSeq: 1 },
+    ] });
     await syncMessages({ force: true });
     expect(decryptMessage).not.toHaveBeenCalled();
     expect(await getMessageById("deleted")).toMatchObject({ content: "", deletedAt: 300, timestamp: 100 });
-    expect((await getSyncState(syncStateId))?.value).toBe(300);
+    expect(await getSyncState(syncStateId)).toMatchObject({ value: 200, cursorId: "later" });
+    expect(await getSyncState("message-mutations:bob:bob-device")).toMatchObject({ value: 1 });
     expect((await simulateReload())[0]).toMatchObject({ content: "", deletedAt: 300 });
   });
   it("redacts a quarantined direct sibling before checkpointing a deletion of an already hidden message", async () => {
@@ -865,6 +904,32 @@ it.each([true, false])("checkpoints and drains deletion pages despite a retryabl
   await syncMessages({ force: true });
   expect(requestParams(2).get(queryCursor)).toBe("2");
   expect(await getSyncState(syncStateId)).toMatchObject({ value: 100, cursorId: "blocked" });
+});
+
+it.each([true, false])("retries the first ordinary page from a safe boundary after a legacy tombstone (edit stream=%s)", async (editStream) => {
+  const mutationState = `${editStream ? "message-mutations-edits" : "message-mutations"}:bob:bob-device`;
+  const mutationParam = editStream ? "editSince" : "mutationSince";
+  const seconds = Math.floor(Date.now() / 1000) - 60;
+  const tombstone = { ...frame("seconds-tombstone", seconds * 1000), timestamp: seconds, syncTimestamp: seconds,
+    deletedAt: Date.now(), deletedByUserId: "alice", mutationSeq: 1 };
+  const raw = seconds + 1;
+  const ordinary = { ...frame("first-ordinary", raw * 1000), timestamp: raw, syncTimestamp: raw };
+  vi.mocked(api.get).mockResolvedValueOnce({ editStream, messages: [ordinary], hasMore: false, mutations: [tombstone], mutationCursor: 1 })
+    .mockImplementationOnce(async () => ({ editStream, messages: Number(requestParams(1).get("since")) < raw ? [ordinary] : [],
+      hasMore: false, mutations: [], mutationCursor: 1 }));
+  vi.mocked(decryptMessage).mockRejectedValueOnce(new DOMException("Ordinary write failed", "QuotaExceededError"));
+
+  await expect(syncMessages({ force: true })).rejects.toThrow("Ordinary write failed");
+  expect(await getMessageById(tombstone.id)).toMatchObject({ timestamp: seconds * 1000, content: "", deletedAt: tombstone.deletedAt });
+  expect(await getSyncState(mutationState)).toMatchObject({ value: 1 });
+  expect(await getSyncState(syncStateId)).toBeUndefined();
+  resetMessageSyncState();
+  await syncMessages({ force: true });
+  expect(requestParams(1).get("since")).toBe("0");
+  expect(requestParams(1).has("sinceId")).toBe(false);
+  expect(requestParams(1).get(mutationParam)).toBe("1");
+  expect(await getMessageById(ordinary.id)).toMatchObject({ content: "decrypted" });
+  expect(await getSyncState(syncStateId)).toMatchObject({ value: raw, cursorId: ordinary.id });
 });
 
 it("does not regress the account/device mutation cursor when another tab finishes an older page", async () => {

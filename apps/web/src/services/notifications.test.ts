@@ -38,6 +38,7 @@ afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals()
 describe("notification reconnects", () => {
   it("backs off, refreshes after three failed opens, and connects with the fresh token", async () => {
     const socket = createNotificationWebSocket(callbacks());
+    expect(latest().url).toBe("wss://test/ws/presence?logicalDeletionIds=1");
     expect(latest().protocols).toEqual(["token.old-token"]);
     latest().close();
     await vi.advanceTimersByTimeAsync(999);

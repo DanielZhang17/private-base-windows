@@ -10,7 +10,7 @@ import { generateAESKey, toBase64Url } from "@e2ee-chat/crypto";
 import { api } from "../../services/api.js";
 import { uploadMimeType } from "./uploadMimeType.js";
 import {
-  discardQueuedMessage,
+  claimOutgoingDispatch,
   getAllOutgoingMessages,
   getMessageById,
   getEditKeyResetToken,
@@ -33,7 +33,7 @@ import {
 } from "../../db/index.js";
 import { editKeyToSeal } from "../../lib/message-edit.js";
 import { isSticker } from "../../lib/stickers.js";
-import { publishCachedEdit } from "../../lib/message-sync.js";
+import { deleteMessagesForLocalUserOnly, publishCachedEdit } from "../../lib/message-sync.js";
 import { prepareDirectPayloadFanout } from "../../lib/direct-messages.js";
 import { encryptGroupText } from "../../lib/message-processor.js";
 import { finishSenderKeyDistribution, prepareSenderKeyDistribution } from "../../lib/group-session.js";
@@ -174,7 +174,7 @@ async function renewUpload(row: LocalOutgoing) {
   // Keep any completed sender-key distribution, then prepare a new file envelope locally.
   row.steps = row.steps.filter((step) => step.distributed);
   row.sendDispatched = false;
-  await persistOutgoing(row);
+  if (!await updateOutgoingIfPresent(row, undefined, { ifUnchanged: true, releaseDispatch: true })) throw new DiscardedSend();
 }
 
 /**
@@ -318,6 +318,7 @@ async function attempt(id: string, ownerId: string, scheduledEdit?: { online: bo
   const sessionId = useAuthStore.getState().sessionId;
   const current = () => belongsToSession(row!) && useAuthStore.getState().sessionId === sessionId;
   const message = await getMessageById(row.editTargetId ?? id, row.userId);
+  let rejectedDispatch = false;
   try {
     if (message?.type === "file" && !row.fileId && !row.upload && row.steps.length === 0) throw new Error(INTERRUPTED_FILE_ERROR);
     row.attempts += 1;
@@ -337,22 +338,28 @@ async function attempt(id: string, ownerId: string, scheduledEdit?: { online: bo
     let result: SendMessageResponse | null = null;
     let editReceipt: MessageEditReceipt | null = null;
     for (let renewal = 0; ; renewal++) {
+      let awaitingEnvelope = false;
       try {
-        for (const step of row.steps) {
+        for (const [index, step] of row.steps.entries()) {
           if (step.completed) continue;
           if (!current()) return;
-          if (!step.sendDispatched) {
+          if (isMessageStep(step)) {
             step.sendDispatched = true;
-            if (isMessageStep(step)) row.sendDispatched = true;
+            row.sendDispatched = true;
+            if (!await claimOutgoingDispatch(row, index, current) || !current()) return;
+          } else if (!step.sendDispatched) {
+            step.sendDispatched = true;
             await persistOutgoing(row);
             if (!current()) return;
           }
+          awaitingEnvelope = isMessageStep(step);
           if (step.path === "/api/messages/edit") {
             editReceipt = await api.post<MessageEditReceipt>(step.path, step.body);
             if (!Number.isSafeInteger(editReceipt?.editedAt) || !Number.isSafeInteger(editReceipt?.mutationSeq) || editReceipt.mutationSeq < 1 || editReceipt.editSeq !== step.body.editSeq) {
               throw new SyntaxError("Invalid edit receipt");
             }
           } else result = await api.post<SendMessageResponse>(step.path, step.body);
+          awaitingEnvelope = false;
           if (!current()) return;
           if (step.distributed) await finishSenderKeyDistribution(row.conversationId, step);
           if (step !== row.steps[row.steps.length - 1]) {
@@ -363,6 +370,8 @@ async function attempt(id: string, ownerId: string, scheduledEdit?: { online: bo
         break;
       } catch (error) {
         if (!current()) return;
+        const status = (error as { status?: number } | null)?.status;
+        rejectedDispatch = awaitingEnvelope && status !== undefined && status >= 400 && status < 500 && status !== 408;
         if (renewal > 0 || !row.upload || message?.type !== "file" || !expiredReservation(error, true)) throw error;
         await renewUpload(row);
         await prepare(row, message, current);
@@ -395,18 +404,20 @@ async function attempt(id: string, ownerId: string, scheduledEdit?: { online: bo
       : !retryable && row.upload && !row.upload.uploaded ? "fileCouldNotBeUploaded" : outgoingErrorKey(error);
     row.nextAttemptAt = retryable ? Date.now() + RETRY_DELAYS[Math.min(row.attempts - 1, RETRY_DELAYS.length - 1)] : null;
     const failed = message && !row.editTargetId ? { ...message, status: "failed" } : undefined;
-    if (!await updateOutgoingIfPresent(row, failed, { ifUnchanged: true })) return;
+    if (!await updateOutgoingIfPresent(row, failed, { ifUnchanged: true, rejectedDispatch })) return;
     if (!retryable && await retireOrphan(row)) return;
     if (failed) await showMessage(failed);
   }
 }
 
-function outgoingLockName(row: QueueScope): string {
+type QueueLockScope = Pick<QueueScope, "userId" | "deviceId" | "conversationId" | "editTargetId">;
+
+function outgoingLockName(row: QueueLockScope): string {
   return row.editTargetId ? `e2ee-outgoing-edit:${row.userId}:${row.deviceId}:${row.editTargetId}`
     : `e2ee-outgoing:${row.userId}:${row.deviceId}:${row.conversationId}`;
 }
 
-async function withOutgoingLock(row: QueueScope, action: () => Promise<void>): Promise<void> {
+async function withOutgoingLock(row: QueueLockScope, action: () => Promise<void>): Promise<void> {
   if (navigator.locks) await navigator.locks.request(outgoingLockName(row), action);
   else await action();
 }
@@ -427,28 +438,33 @@ export function retryOutgoing(id: string, scheduledEdit?: { row: OutgoingEditSta
   inFlight.set(id, task);
   return task;
 }
-export async function discardOutgoing(id: string) {
+export async function discardOutgoing(id: string, conversationId?: string): Promise<"already-sending" | undefined> {
   const session = captureMessageActionSession();
   const active = () => isMessageActionSessionCurrent(session);
-  // Preparation is outside the network attempt; cancel its continuations immediately.
-  if (preparingFiles.has(id)) cancelledPreparations.add(id);
-  // An already submitted request cannot be unsent; only discard after its attempt settles.
-  await inFlight.get(id);
-  if (!active() || !session.userId) return;
+  const result = await discardAndHideMessages(conversationId, [id]);
+  if (!active()) return;
+  if (result.alreadySending.length) return "already-sending";
+  if (conversationId || result.discarded) return;
+  if (!session.userId) return;
   const row = await getOutgoingOperation(id, session.userId);
-  if (!row || !active()) return;
-  await withOutgoingLock(row, async () => {
-    const current = await getOutgoingOperation(id, row.userId);
-    if (!active() || !current || !belongsToSession(current)) return;
-    if (current.editTargetId) {
-      const message = await getMessageById(current.editTargetId, current.userId);
-      if (await finishQueuedEdit(current, active) && message) await showMessage(message);
-      return;
-    }
-    await discardQueuedMessage(id, active, row.userId);
-    if (active()) useChatStore.getState().removeMessages([id]);
-  });
-  await drain();
+  if (!row?.editTargetId || !active() || !belongsToSession(row)) return;
+  const outcome = await finishQueuedEdit(row, active);
+  if (outcome === "already-sending") return outcome;
+  if (outcome) {
+    await publishCachedEdit(row.editTargetId, row.conversationId, active);
+    await drain();
+  }
+}
+
+export async function discardAndHideMessages(conversationId: string | undefined, ids: string[], expectedQueued?: ReadonlySet<string>) {
+  const session = captureMessageActionSession();
+  const current = () => isMessageActionSessionCurrent(session);
+  const result = await deleteMessagesForLocalUserOnly(conversationId, [...new Set(ids)], current, expectedQueued);
+  if (result.discarded && current()) {
+    for (const id of ids) if (preparingFiles.has(id)) cancelledPreparations.add(id);
+    void drain().catch(console.error);
+  }
+  return result;
 }
 async function drainEdits(online: boolean) {
   const ownerId = useAuthStore.getState().user?.id;

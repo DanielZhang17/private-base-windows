@@ -20,7 +20,7 @@ export function useLongPress(menuOpen: boolean) {
   useLayoutEffect(() => cancel, [cancel]);
 
   useLayoutEffect(() => {
-    if (!menuOpen) return;
+    if (!menuOpen || !openingTouch.current) return;
     // A phone sheet can replace the original target before the finger lifts.
     // Capture release and its compatibility mouse events, including on the scrim.
     const stop = (event: Event) => {
@@ -79,9 +79,9 @@ export function useLongPress(menuOpen: boolean) {
       cancel();
       return valid;
     },
-    contextMenu() {
+    contextMenu(touch = false) {
       if (guarded()) return false;
-      openingTouch.current = press.current?.timer !== undefined;
+      openingTouch.current = touch || press.current?.timer !== undefined;
       cancel();
       return true;
     },

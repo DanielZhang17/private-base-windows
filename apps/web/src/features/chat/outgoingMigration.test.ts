@@ -1,5 +1,5 @@
 import { encryptMessageEdit, generateAESKey, generateIdentityKeyPair, serializeIdentityKeyPair, toBase64Url } from "@e2ee-chat/crypto";
-import { openDB } from "idb";
+import { openDB, type IDBPDatabase } from "idb";
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -37,7 +37,7 @@ it("waits for v5 writers, quarantines ambiguous rows, and fences even an unversi
   old.close();
   const next = await opening;
   try {
-    expect(next.version).toBe(7);
+    expect(next.version).toBe(8);
     expect(db.isDatabaseUpgradeBlocked()).toBe(false);
     expect(await db.getMessageById("unverified", "user")).toBeUndefined();
     expect(await next.get("legacyMessages", "unverified")).toMatchObject({ content: "cached" });
@@ -100,19 +100,21 @@ it("migrates the supported pre-release v6 outbox and indexes quarantine expiry i
   } finally { db.close(); }
 });
 
+function createCanonicalStores(db: IDBPDatabase) {
+  for (const name of ["legacyMessages", "receiveSessions", "deviceKeys", "accountConversations", "receiveSenderKeys", "accountFiles", "receivePendingCalls", "receiveSenderKeyRecipients", "accountState"]) {
+    db.createObjectStore(name, { keyPath: "id" });
+  }
+  const display = db.createObjectStore("displayMessages", { keyPath: ["ownerId", "id"] });
+  display.createIndex("byId", "id");
+  display.createIndex("byConversation", ["conversationId", "timestamp"]);
+  display.createIndex("byAccountConversation", ["ownerId", "conversationId", "timestamp", "id"]);
+  display.createIndex("byTimestamp", "timestamp");
+}
+
 it("upgrades the canonical v6 layout in place and removes a legacy row retained under a finalized hide", async () => {
   vi.stubGlobal("indexedDB", new IDBFactory());
   vi.resetModules();
-  const old = await openDB("e2ee-chat", 6, { upgrade(db) {
-    for (const name of ["legacyMessages", "receiveSessions", "deviceKeys", "accountConversations", "receiveSenderKeys", "accountFiles", "receivePendingCalls", "receiveSenderKeyRecipients", "accountState"]) {
-      db.createObjectStore(name, { keyPath: "id" });
-    }
-    const display = db.createObjectStore("displayMessages", { keyPath: ["ownerId", "id"] });
-    display.createIndex("byId", "id");
-    display.createIndex("byConversation", ["conversationId", "timestamp"]);
-    display.createIndex("byAccountConversation", ["ownerId", "conversationId", "timestamp", "id"]);
-    display.createIndex("byTimestamp", "timestamp");
-  } });
+  const old = await openDB("e2ee-chat", 6, { upgrade: createCanonicalStores });
   const row = { id: "retained", conversationId: "chat", senderId: "peer", type: "text", content: "private", status: "delivered",
     timestamp: Date.now(), expiresAt: Date.now() + 60_000 };
   await old.put("legacyMessages", row);
@@ -126,6 +128,65 @@ it("upgrades the canonical v6 layout in place and removes a legacy row retained 
     expect(await database.isMessageHidden(row.id, "user")).toBe(true);
     expect(await database.getMessageById("visible", "user")).toMatchObject({ content: "private" });
   } finally { db.close(); }
+});
+
+it("adds key-only revision checks to v7 without rewriting queued uploads", async () => {
+  vi.stubGlobal("indexedDB", new IDBFactory());
+  vi.resetModules();
+  const old = await openDB("e2ee-chat", 7, { upgrade(db, _, __, tx) {
+    createCanonicalStores(db);
+    const quarantine = tx.objectStore("legacyMessages");
+    quarantine.createIndex("byExpiry", "quarantineExpiresAt");
+    quarantine.createIndex("byConversation", ["conversationId", "timestamp"]);
+  } });
+  const id = 'outgoing-account:["user","file"]';
+  const draft = { userId: "user", deviceId: "device", conversationId: "chat", revision: "queued-revision", status: "failed", retryable: false,
+    upload: { bytes: new Uint8Array([4, 5, 6]) }, steps: [] };
+  const entry = { id, outgoing: { ...draft, id: "file" } };
+  await old.put("accountState", entry);
+  const standalone = 'outgoing-account:["user","standalone"]';
+  await old.put("accountState", { id: standalone, outgoing: { ...draft, id: "standalone" } });
+  const ambiguous = 'outgoing-account:["user","ambiguous"]';
+  await old.put("accountState", { id: ambiguous, outgoing: { ...draft, id: "ambiguous", steps: [{ path: "/api/messages/send" }] } });
+  const database = await import("../../db/index.js");
+  const opening = database.getAppDB();
+  await vi.waitFor(() => expect(database.isDatabaseUpgradeBlocked()).toBe(true));
+  old.close();
+  const db = await opening;
+  try {
+    expect(db.version).toBe(8);
+    expect(await db.getKeyFromIndex("accountState", "byOutgoingRevision", [id, "queued-revision"])).toBe(id);
+    const persisted = await db.get("accountState", id);
+    expect(persisted.outgoing.revision).toBe(entry.outgoing.revision);
+    expect(Array.from(persisted.outgoing.upload.bytes)).toEqual([4, 5, 6]);
+    expect(await db.get("accountState", `outgoing-state:${id}`)).toBeUndefined();
+    expect(await database.hideLocalMessages(undefined, ["standalone"], "user", "device", () => true))
+      .toMatchObject({ discarded: true, hidden: ["standalone"], alreadySending: [] });
+    expect(await database.hideLocalMessages("chat", ["file", "ambiguous"], "user", "device", () => true))
+      .toMatchObject({ discarded: true, hidden: ["file"], alreadySending: ["ambiguous"] });
+    expect(await db.get("accountState", id)).toBeUndefined();
+    expect(await db.get("accountState", standalone)).toBeUndefined();
+    expect(await db.get("accountState", ambiguous)).toBeDefined();
+  } finally { db.close(); }
+});
+
+it("rejects legacy-named v7 stores before changing the version, schema, or data", async () => {
+  vi.stubGlobal("indexedDB", new IDBFactory());
+  vi.resetModules();
+  const stores = ["localKeys", "messages", "syncState"];
+  const old = await openDB("e2ee-chat", 7, { upgrade(db) {
+    for (const name of stores) db.createObjectStore(name, { keyPath: "id" });
+  } });
+  const saved = { id: "original", content: "cached plaintext" };
+  await old.put("messages", saved);
+  old.close();
+  const database = await import("../../db/index.js");
+  await expect(database.getAppDB()).rejects.toThrow("Unsupported pre-release local database layout");
+  const unchanged = await openDB("e2ee-chat", 7);
+  try {
+    expect(Array.from(unchanged.objectStoreNames)).toEqual(stores);
+    expect(await unchanged.get("messages", saved.id)).toEqual(saved);
+  } finally { unchanged.close(); }
 });
 
 it("preserves a sparse v6 preview's sync cursor and quarantines its unscoped queue entry", async () => {
@@ -147,14 +208,14 @@ it("preserves a sparse v6 preview's sync cursor and quarantines its unscoped que
   } finally { db.close(); }
 });
 
-it.each([6, 7, 8])("fails closed on an unknown v%s layout without replacing it", async (version) => {
+it.each([6, 7, 8, 9])("fails closed on an unknown v%s layout without replacing it", async (version) => {
   vi.stubGlobal("indexedDB", new IDBFactory());
   vi.resetModules();
   const newer = await openDB("e2ee-chat", version, { upgrade(db) { db.createObjectStore("unrelated"); } });
   newer.close();
   try {
     const db = await import("../../db/index.js");
-    if (version > 7) await expect(db.getAppDB()).rejects.toMatchObject({ name: "VersionError" });
+    if (version > 8) await expect(db.getAppDB()).rejects.toMatchObject({ name: "VersionError" });
     else await expect(db.getAppDB()).rejects.toThrow("Unsupported pre-release local database layout");
     const original = await openDB("e2ee-chat");
     expect(original.version).toBe(version);
@@ -163,7 +224,7 @@ it.each([6, 7, 8])("fails closed on an unknown v%s layout without replacing it",
   } finally { newer.close(); }
 });
 
-it("upgrades main's v5 device vault, wrapped edit keys and deferred edits into v7", async () => {
+it("upgrades main's v5 device vault, wrapped edit keys and deferred edits into v8", async () => {
   vi.stubGlobal("indexedDB", new IDBFactory());
   vi.resetModules();
   const { encryptData } = await import("../../lib/local-key-encryption.js");
@@ -243,7 +304,7 @@ it("upgrades main's v5 device vault, wrapped edit keys and deferred edits into v
 
   const next = await database.getAppDB();
   try {
-    expect(next.version).toBe(7);
+    expect(next.version).toBe(8);
     expect(await next.getAll("deviceKeys")).toEqual(vaultRecords.sort((a, b) => a.id < b.id ? -1 : 1));
     expect(await database.readPendingSetupRecord()).toEqual(setup);
     expect(await next.get("accountState", unlockAttempts.id)).toEqual(unlockAttempts);

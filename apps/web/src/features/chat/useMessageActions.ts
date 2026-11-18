@@ -10,13 +10,13 @@ import { parseFilePayload } from "./presentation.js";
 import { t } from "../../i18n/index.js";
 import { useLongPress } from "./useLongPress.js";
 
-export function useMessageActions(message: DecryptedMessage, isOwn: boolean) {
+export function useMessageActions(message: DecryptedMessage, isOwn: boolean, selecting = false) {
   const [position, setPosition] = useState<{ x: number; y: number; top?: number; source: "button" | "pointer"; align: "start" | "end"; keyboard: boolean } | null>(null);
   const [confirmLocalDelete, setConfirmLocalDelete] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const press = useLongPress(position !== null);
+  const press = useLongPress(position !== null || selecting);
   useEffect(() => {
     if (!position) return;
     const scroll = (event: Event) => {
@@ -38,7 +38,8 @@ export function useMessageActions(message: DecryptedMessage, isOwn: boolean) {
       const selection = window.getSelection();
       if (target?.closest("a") || (selection && !selection.isCollapsed && selection.rangeCount && selection.getRangeAt(0).intersectsNode(event.currentTarget))) { press.cancel(); return; }
       event.preventDefault(); event.stopPropagation();
-      if (press.contextMenu()) openAtPointer(event.clientX, event.clientY);
+      const native = event.nativeEvent as PointerEvent & { sourceCapabilities?: { firesTouchEvents?: boolean } };
+      if (press.contextMenu(native.pointerType === "touch" || native.sourceCapabilities?.firesTouchEvents)) openAtPointer(event.clientX, event.clientY);
     },
     onPointerDown(event: React.PointerEvent) {
       if (!event.currentTarget.contains(event.target as Node) || event.pointerType !== "touch" || !event.isPrimary) return;
@@ -81,10 +82,12 @@ export function useMessageActions(message: DecryptedMessage, isOwn: boolean) {
     try {
       const outgoing = await getOutgoing(message.id, session.userId);
       if (!current()) return;
-      if (outgoing || message.status === "sending" || message.status === "failed") await discardOutgoing(message.id);
+      const result = outgoing || message.status === "sending" || message.status === "failed"
+        ? await discardOutgoing(message.id, message.conversationId)
+        : await deleteMessageForLocalUserOnly(message.conversationId, message.id, current);
       if (!current()) return;
-      await deleteMessageForLocalUserOnly(message.conversationId, message.id, current);
-      if (current()) setConfirmLocalDelete(false);
+      if (result === "already-sending") { setError(t("messageAlreadySending")); return; }
+      setConfirmLocalDelete(false);
     } catch { if (current()) setError(t("messageDeleteFailed")); }
   }
   async function deleteForEveryone() {

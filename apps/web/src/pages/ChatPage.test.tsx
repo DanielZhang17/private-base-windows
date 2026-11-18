@@ -1,5 +1,5 @@
 import { act } from "react";
-import { getByRole, queryByRole } from "@testing-library/dom";
+import { getByRole, queryByRole, waitFor } from "@testing-library/dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -8,6 +8,10 @@ import ChatPage from "./ChatPage.js";
 import { useConversation } from "../features/chat/useConversation.js";
 import { useAuthStore } from "../stores/authStore.js";
 import { capabilities } from "../platform/capabilities.js";
+import { api } from "../services/api.js";
+import { getMessageById, saveMessage, saveOutgoing } from "../db/index.js";
+import * as outgoingQueue from "../features/chat/outgoingQueue.js";
+import { click, press } from "../ui/test-utils.js";
 vi.mock("../features/chat/useConversation.js", () => ({ useConversation: vi.fn() }));
 vi.mock("../components/chat/MessageInput.js", () => ({ default: ({ editing, editConflict }: { editing?: { id: string; content: string }; editConflict?: boolean }) =>
   <div data-testid="message-composer" data-editing={editing?.id} data-content={editing?.content} data-conflict={editConflict} /> }));
@@ -230,4 +234,256 @@ it("requires acknowledgement before permanently deleting a group", async () => {
   expect(confirm.disabled).toBe(true);
   await act(async () => dialog.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
   expect(confirm.disabled).toBe(false);
+});
+
+const selectionRows = [
+  { id: "peer", conversationId: "chat", senderId: "mara", type: "text", content: "An earlier message", timestamp: 1000, status: "delivered" },
+  { id: "own", conversationId: "chat", senderId: "alice", type: "text", content: "A later message", timestamp: 2000, status: "sent" },
+];
+function selectionFlow(rows = selectionRows) {
+  return { conversationId: "chat", conversationMessages: rows.map((message) => ({ ...message, expiresAt: Date.now() + 600_000 })),
+    conversation: { id: "chat", type: "direct", members: [
+      { userId: "alice", acceptedAt: 1, user: { displayName: "Alice" } }, { userId: "mara", acceptedAt: 1, user: { displayName: "Mara" } },
+    ] } };
+}
+async function selectFromMenu(content: string) {
+  const article = [...container.querySelectorAll("article")].find((row) => row.textContent?.includes(content))!;
+  const menu = getByRole<HTMLButtonElement>(article, "button", { name: "Message actions" });
+  menu.focus();
+  await click(menu);
+  await click(getByRole(document.body, "menuitem", { name: "Select" }));
+}
+
+it("enters selection from the menu, announces the count and disabled reason, and honors Escape", async () => {
+  await renderFlow(selectionFlow());
+  await selectFromMenu("A later message");
+  const own = getByRole(container, "checkbox", { name: /A later message/, checked: true });
+  expect(document.activeElement).toBe(own);
+  expect(getByRole(container, "status").textContent).toBe("Selected (1)");
+  const everyone = getByRole<HTMLButtonElement>(container, "button", { name: "Delete for everyone" });
+  expect(everyone.hasAttribute("aria-disabled")).toBe(false);
+  // The checkbox is a native button and receives the browser's activation click on Space.
+  const peer = getByRole(container, "checkbox", { name: /An earlier message/, checked: false });
+  peer.focus();
+  await press(" ");
+  await click(peer);
+  expect(getByRole(container, "status").textContent).toBe("Selected (2)");
+  expect(everyone.getAttribute("aria-disabled")).toBe("true");
+  const scopes = getByRole(container, "group", { name: "Selected message actions" });
+  expect(scopes.tabIndex).toBe(0);
+  expect(document.getElementById(scopes.getAttribute("aria-describedby")!)?.textContent).toBe("Deselect received messages to delete for everyone.");
+  const scroll = vi.fn();
+  const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { value: scroll, configurable: true });
+  try {
+    await press("Escape");
+    expect(queryByRole(container, "checkbox")).toBeNull();
+    expect(document.activeElement).toBe(getByRole(container.querySelector('[data-message-id="own"]')!, "button", { name: "Message actions" }));
+    expect(scroll).toHaveBeenCalledExactlyOnceWith({ block: "nearest" });
+  } finally {
+    if (original) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", original);
+    else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+  }
+});
+
+it.each(["hold", "native contextmenu"])("opens the phone sheet on %s and requires a fresh tap on Select", async (trigger) => {
+  vi.useFakeTimers();
+  try {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("max-width"), addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    await renderFlow(selectionFlow());
+    const bubble = container.querySelector(".bubble-own")!;
+    const down = new MouseEvent("pointerdown", { bubbles: true, cancelable: true });
+    Object.defineProperties(down, { pointerType: { value: "touch" }, isPrimary: { value: true }, pointerId: { value: 5 } });
+    await act(async () => {
+      if (trigger === "hold") { bubble.dispatchEvent(down); vi.advanceTimersByTime(500); }
+      else {
+        const context = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+        Object.defineProperty(context, "pointerType", { value: "touch" });
+        bubble.dispatchEvent(context);
+      }
+    });
+    const sheet = getByRole(document.body, "dialog", { name: "Message actions" });
+    expect(getByRole(sheet, "menuitem", { name: "Copy text" })).toBeTruthy();
+    expect(getByRole(sheet, "menuitem", { name: "Delete for everyone" })).toBeTruthy();
+    expect(queryByRole(container, "checkbox")).toBeNull();
+    const select = getByRole(sheet, "menuitem", { name: "Select" });
+    await act(async () => sheet.dispatchEvent(new Event("touchend", { bubbles: true, cancelable: true })));
+    await click(select);
+    expect(queryByRole(document.body, "menu")).toBeTruthy();
+    await act(async () => select.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })));
+    await click(select);
+    expect(queryByRole(document.body, "menu")).toBeNull();
+    expect(getByRole(container, "checkbox", { name: /A later message/, checked: true })).toBeTruthy();
+    expect(getByRole(container, "status").textContent).toBe("Selected (1)");
+    const peer = getByRole(container, "checkbox", { name: /An earlier message/, checked: false });
+    await act(async () => peer.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })));
+    await click(peer.closest("article")!);
+    expect(getByRole(container, "status").textContent).toBe("Selected (2)");
+    for (const row of container.querySelectorAll("article")) {
+      expect(row.className).toContain("grid-cols-[44px_minmax(0,1fr)]");
+      expect(row.firstElementChild?.getAttribute("role")).toBe("checkbox");
+    }
+    const bar = getByRole(container, "group", { name: "Selected message actions" });
+    expect(bar.dataset.callAvoid).toBe("bottom");
+    expect(bar.classList.contains("pb-safe")).toBe(true);
+    expect(getByRole(bar, "button", { name: "Copy" })).toBeTruthy();
+    const remove = getByRole(bar, "button", { name: "Delete…" });
+    expect(container.querySelector("header")!.contains(remove)).toBe(false);
+    await click(remove);
+    const dialog = getByRole(document.body, "alertdialog", { name: "Delete 2 messages from this device?" });
+    expect(dialog.textContent).toContain("Other participants will still see them.");
+    const group = getByRole(dialog, "radiogroup", { name: "Who should this delete for?" });
+    expect(getByRole(group, "radio", { name: "This device only", checked: true })).toBeTruthy();
+    expect(getByRole<HTMLInputElement>(group, "radio", { name: "Everyone in this chat" }).disabled).toBe(true);
+    expect(getByRole(dialog, "button", { name: "Delete messages" }).classList.contains("bg-danger")).toBe(true);
+    expect(group.querySelector("button")).toBeNull();
+    expect(document.getElementById(group.getAttribute("aria-describedby")!)?.textContent).toContain("Deselect received messages");
+    expect(document.activeElement).toBe(getByRole(dialog, "button", { name: "Cancel" }));
+    await press("Escape");
+    expect(document.activeElement).toBe(remove);
+    await click(peer);
+    await click(remove);
+    await click(getByRole(document.body, "radio", { name: "Everyone in this chat" }));
+    expect(getByRole(document.body, "radio", { name: "Everyone in this chat", checked: true })).toBeTruthy();
+    expect(getByRole(document.body, "alertdialog", { name: "Delete 1 message for everyone?" }).textContent).toContain("This cannot be undone.");
+    await click(getByRole(document.body, "button", { name: "Cancel" }));
+    await click(getByRole(container, "button", { name: "Cancel selection" }));
+    expect(queryByRole(container, "checkbox")).toBeNull();
+  } finally { vi.useRealTimers(); }
+});
+
+it("keeps focus on a connected control outside the chat when pruning ends selection", async () => {
+  const search = document.createElement("input");
+  document.body.append(search);
+  try {
+    await renderFlow(selectionFlow());
+    await selectFromMenu("A later message");
+    search.focus();
+    await renderFlow(selectionFlow(selectionRows.slice(0, 1)));
+    expect(queryByRole(container, "checkbox")).toBeNull();
+    expect(document.activeElement).toBe(search);
+  } finally { search.remove(); }
+});
+
+it("explains unsent and mixed local deletes and reports the skipped count inside the dialog", async () => {
+  const prior = useAuthStore.getState();
+  try {
+    useAuthStore.setState({ user: { id: "alice" } as never, device: { id: "device" } as never, sessionId: "ui-partial" });
+    const outgoing = { ...selectionRows[1], id: "partial-sending", status: "sending" as const, timestamp: Date.now(), expiresAt: Date.now() + 60_000 };
+    const incoming = { ...selectionRows[0], id: "partial-peer", timestamp: outgoing.timestamp - 1000, expiresAt: outgoing.expiresAt };
+    await saveMessage(outgoing, undefined, "alice");
+    await saveMessage(incoming, undefined, "alice");
+    await saveOutgoing({ id: outgoing.id, userId: "alice", deviceId: "device", conversationId: "chat", conversationType: "group", queuedAt: 1,
+      ttlSeconds: null, status: "sending", attempts: 1, retryable: true, nextAttemptAt: null, error: null, sendDispatched: true,
+      steps: [{ path: "/api/messages/send", sendDispatched: true, body: { id: outgoing.id, conversationId: "chat", type: "text", ciphertext: "opaque", iv: "iv", header: "{}" } }] });
+    await renderFlow(selectionFlow([incoming, outgoing]));
+    await selectFromMenu("A later message");
+    await click(getByRole(container, "button", { name: "Delete for me" }));
+    const queued = getByRole(document.body, "alertdialog", { name: "Delete 1 message from this device?" });
+    expect(queued.textContent).toContain("Unsent messages in the selection will be discarded.");
+    expect(queued.textContent).not.toContain("Other participants");
+    await click(getByRole(queued, "button", { name: "Cancel" }));
+    await click(getByRole(container, "checkbox", { name: /An earlier message/ }));
+    await click(getByRole(container, "button", { name: "Delete for me" }));
+    const confirm = getByRole(document.body, "alertdialog", { name: "Delete 2 messages from this device?" });
+    expect(confirm.textContent).toContain("Other participants will still see messages that were already sent.");
+    await click(getByRole(confirm, "button", { name: "Delete messages" }));
+    const result = await waitFor(() => getByRole(document.body, "alertdialog", { name: "Delete result" }));
+    expect(result.textContent).toContain("Skipped 1 message because it was already sending or had been sent. It may still be delivered.");
+    expect(queryByRole(result, "button", { name: "Delete messages" })).toBeNull();
+    const continueButton = getByRole(result, "button", { name: "Continue" });
+    expect(document.activeElement).toBe(continueButton);
+    expect(await getMessageById(incoming.id, "alice")).toBeUndefined();
+    expect(await getMessageById(outgoing.id, "alice")).toMatchObject({ content: outgoing.content });
+    await click(continueButton);
+    expect(queryByRole(document.body, "alertdialog")).toBeNull();
+    expect(getByRole(container, "checkbox", { name: /A later message/, checked: true })).toBeTruthy();
+    expect(getByRole(container, "status").textContent).toBe("Selected (1)");
+  } finally { await act(async () => useAuthStore.setState(prior)); }
+});
+
+it("opens Select on desktop right-click and restores focus to the nearest remaining row", async () => {
+  await renderFlow(selectionFlow());
+  const bubble = container.querySelector(".bubble-own")!;
+  await act(async () => bubble.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })));
+  await click(getByRole(document.body, "menuitem", { name: "Select" }));
+  expect(getByRole(container, "checkbox", { name: /A later message/, checked: true })).toBeTruthy();
+  await renderFlow(selectionFlow(selectionRows.slice(0, 1)));
+  expect(document.activeElement).toBe(getByRole(container, "button", { name: "Message actions" }));
+});
+
+it.each(["confirmation", "result"] as const)("restores focus after the delete %s closes with no selected rows left", async (phase) => {
+  const prior = useAuthStore.getState();
+  let finish!: (result: Awaited<ReturnType<typeof outgoingQueue.discardAndHideMessages>>) => void;
+  const discard = vi.spyOn(outgoingQueue, "discardAndHideMessages").mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+  try {
+    useAuthStore.setState({ user: { id: "alice" } as never, device: { id: "device" } as never, sessionId: "ui-focus" });
+    await renderFlow(selectionFlow());
+    await selectFromMenu("A later message");
+    const opener = getByRole(container, "button", { name: "Delete for me" });
+    opener.focus();
+    await click(opener);
+    const confirm = getByRole(document.body, "alertdialog");
+    await click(getByRole(confirm, "button", { name: "Delete messages" }));
+    expect(discard).toHaveBeenCalledOnce();
+    if (phase === "result") {
+      await act(async () => finish({ discarded: false, alreadySending: ["own"] }));
+      expect(getByRole(document.body, "alertdialog", { name: "Delete result" })).toBeTruthy();
+    }
+    await renderFlow(selectionFlow(selectionRows.slice(0, 1)));
+    expect(queryByRole(container, "checkbox")).toBeNull();
+    expect(opener.isConnected).toBe(false);
+    expect(getByRole(document.body, "alertdialog")).toBe(confirm);
+    const actions = getByRole(container, "button", { name: "Message actions" });
+    expect(document.activeElement).not.toBe(actions);
+    if (phase === "confirmation") await act(async () => finish({ discarded: true, alreadySending: [] }));
+    else await click(getByRole(confirm, "button", { name: "Continue" }));
+    expect(queryByRole(document.body, "alertdialog")).toBeNull();
+    expect(document.activeElement).toBe(actions);
+  } finally {
+    discard.mockRestore();
+    await act(async () => useAuthStore.setState(prior));
+  }
+});
+
+it("copies from the header and requires confirmation before deleting for everyone", async () => {
+  const prior = useAuthStore.getState();
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+  const post = vi.spyOn(api, "post").mockRejectedValueOnce(new Error("Offline")).mockResolvedValue({ deletions: [] });
+  try {
+    useAuthStore.setState({ user: { id: "alice" } as never, device: { id: "device" } as never, sessionId: "ui-session" });
+    await renderFlow(selectionFlow());
+    await selectFromMenu("A later message");
+    await click(getByRole(container, "checkbox", { name: /An earlier message/ }));
+    await click(getByRole(container, "button", { name: "Copy selected" }));
+    expect(writeText).toHaveBeenCalledOnce();
+    expect(writeText.mock.calls[0][0]).toMatch(/^Mara · [^\n]+\nAn earlier message\n\nAlice · [^\n]+\nA later message$/);
+    expect(queryByRole(container, "checkbox")).toBeNull();
+    const copied = container.querySelector("[data-selection-copy-toast]")!;
+    expect(copied.textContent).toBe("2 messages copied");
+    expect(container.querySelector('[aria-live="polite"].sr-only')?.textContent).toBe("2 messages copied");
+    const composer = container.querySelector('[data-testid="message-composer"]')!;
+    expect(composer.closest("[hidden]")).toBeNull();
+    expect(copied.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await selectFromMenu("A later message");
+    const remove = getByRole(container, "button", { name: "Delete for everyone" });
+    remove.focus();
+    await click(remove);
+    expect(post).not.toHaveBeenCalled();
+    await press("Escape");
+    expect(document.activeElement).toBe(remove);
+    await click(remove);
+    const confirm = getByRole(document.body, "alertdialog", { name: "Delete 1 message for everyone?" });
+    await click(getByRole(confirm, "button", { name: "Delete messages" }));
+    expect(getByRole(confirm, "alert").textContent).toBe("Could not delete the message. Try again.");
+    await click(getByRole(confirm, "button", { name: "Delete messages" }));
+    await waitFor(() => expect(post).toHaveBeenNthCalledWith(2, "/api/messages/delete-batch", { conversationId: "chat", ids: ["own"], fileIds: {} }));
+  } finally {
+    await act(async () => useAuthStore.setState(prior));
+    post.mockRestore();
+    if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
 });

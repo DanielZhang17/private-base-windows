@@ -164,12 +164,12 @@ export default function UnlockedAppEffects() {
           if (current()) void reconcileConversationEdits(conversationId, true).catch(() => undefined);
         },
         onMessageEvent: (payload) => {
-          if (payload.deletion) void handleMessageDeletion(payload).catch(scheduleMessageSync);
+          if (payload.deletion || payload.replayedDeletions) void handleMessageDeletion(payload).catch(scheduleMessageSync);
           const activeConversationId = useChatStore.getState().activeConversationId;
           const isVisibleActiveConversation =
             document.visibilityState === "visible" &&
             activeConversationId === payload.conversationId;
-          if (payload.editAvailable || !isVisibleActiveConversation) {
+          if (payload.deletionSync || payload.editAvailable || !isVisibleActiveConversation) {
             scheduleMessageSync();
           }
         },

@@ -54,8 +54,13 @@ export interface WSPresenceFrame {
   status: "online" | "offline";
 }
 
+export interface MessageDeletionEvent { ids: string[]; deletedAt: number; deletedByUserId: string }
+
 export interface MessageEventPayload {
-  deletion?: { ids: string[]; deletedAt: number; deletedByUserId: string };
+  deletion?: MessageDeletionEvent;
+  deletionSync?: true;
+  replayedDeletions?: { senderId: string; deletions: MessageDeletionEvent[] };
+  conversationType?: "direct" | "group";
   edit?: MessageEditFrame;
   editAvailable?: boolean;
   conversationId: string;

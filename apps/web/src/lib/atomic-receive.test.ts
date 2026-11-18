@@ -679,7 +679,7 @@ it("clears a discarded pending edit from the same committed revision after unloc
   const draft = {
     id: "queued-edit", editTargetId: original.id, conversationId: original.conversationId, conversationType: "direct",
     userId: original.senderId, deviceId: original.editSenderDeviceId!, queuedAt: Date.now(), ttlSeconds: null,
-    steps: [{ path: "/api/messages/edit", body: await revision(key, 2, "discarded revision") }],
+    steps: [{ path: "/api/messages/edit", body: await revision(key, 2, "discarded revision"), sendDispatched: false }],
     status: "failed", retryable: false, attempts: 1, nextAttemptAt: null, error: "messageEditFailed",
   } as const;
   const queued = await database.saveQueuedEdit({ ...draft, steps: [...draft.steps] }, authored.editKeyVersion!, "discarded revision", () => true);

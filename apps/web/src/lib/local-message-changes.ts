@@ -1,5 +1,5 @@
 /** Cross-tab hints contain opaque IDs only. IndexedDB remains the source of truth. */
-export interface LocalMessageChange { id: string; kind: "hide" | "commit" | "undo" | "history" | "edit" | "outbox" | "repair"; conversationId?: string }
+export interface LocalMessageChange { id: string; kind: "hide" | "commit" | "undo" | "history" | "edit" | "outbox" | "outbox-batch" | "repair"; conversationId?: string }
 const hideGenerations = new Map<string, number>();
 const historyPreviewListeners = new Set<(id: string) => void>();
 export function subscribeHistoryPreviews(listener: (id: string) => void): () => void {
@@ -49,11 +49,11 @@ export function createLocalMessageChannel(scope: { userId: string; deviceId: str
   const receive = (value: unknown) => {
     if (!value || typeof value !== "object") return;
     const event = value as LocalMessageChange & { nonce?: string };
-    if (typeof event.id !== "string" || !["hide", "commit", "undo", "history", "edit", "outbox", "repair"].includes(event.kind) || typeof event.nonce !== "string" || seen.has(event.nonce)) return;
+    if (typeof event.id !== "string" || !["hide", "commit", "undo", "history", "edit", "outbox", "outbox-batch", "repair"].includes(event.kind) || typeof event.nonce !== "string" || seen.has(event.nonce)) return;
     seen.add(event.nonce);
     if (seen.size > 128) seen.delete(seen.values().next().value!);
     const conversationId = typeof event.conversationId === "string" ? event.conversationId : undefined;
-    if (event.kind !== "outbox") noteHideChange(conversationId);
+    if (event.kind !== "outbox" && event.kind !== "outbox-batch") noteHideChange(conversationId);
     const change = { id: event.id, kind: event.kind, ...(conversationId ? { conversationId } : {}) };
     notifyRemoval(change);
     if (change.kind === "history") notifyHistory(change);
@@ -85,7 +85,7 @@ export function connectLocalMessageChannel(scope: { userId: string; deviceId: st
 }
 export function publishLocalMessageChange(id: string, kind: LocalMessageChange["kind"], conversationId?: string, includeSelf = false, ownerId?: string): void {
   if (ownerId && active?.userId !== ownerId) return;
-  if (kind !== "outbox") noteHideChange(conversationId);
+  if (kind !== "outbox" && kind !== "outbox-batch") noteHideChange(conversationId);
   const change = { id, kind, ...(conversationId ? { conversationId } : {}) };
   notifyHistory(change);
   notifyRemoval(change);

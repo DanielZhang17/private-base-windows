@@ -131,7 +131,7 @@ export interface ConfirmDialogProps {
   /** What will happen, in plain words, including what cannot be undone. */
   description: ReactNode;
   /** Verb phrase naming the action, e.g. "Remove device". Never "OK" or "Yes". */
-  confirmLabel: string;
+  confirmLabel?: string;
   cancelLabel?: string;
   /** "danger" styles the confirm button as destructive and focuses Cancel first. */
   tone?: "default" | "danger";
@@ -140,6 +140,7 @@ export interface ConfirmDialogProps {
   acknowledgeLabel?: ReactNode;
   /** Confirm is in flight: shows a spinner and blocks both dismissal and a second click. */
   busy?: boolean;
+  confirmDisabled?: boolean;
   /** Failure from the last attempt, shown inside the dialog so the user can retry. */
   error?: ReactNode;
   onConfirm: () => void;
@@ -158,6 +159,7 @@ export function ConfirmDialog({
   icon,
   acknowledgeLabel,
   busy = false,
+  confirmDisabled = false,
   error,
   onConfirm,
   onCancel,
@@ -171,6 +173,9 @@ export function ConfirmDialog({
   useEffect(() => {
     if (!open) setAcknowledged(false);
   }, [open]);
+  useEffect(() => {
+    if (open && !confirmLabel) cancelRef.current?.focus();
+  }, [open, confirmLabel]);
 
   return (
     <Overlay
@@ -194,14 +199,14 @@ export function ConfirmDialog({
       footer={
         <>
           <Button ref={cancelRef} variant="secondary" onClick={onCancel} disabled={busy}>{cancelLabel}</Button>
-          <Button
+          {confirmLabel && <Button
             variant={danger ? "danger" : "primary"}
             onClick={onConfirm}
             loading={busy}
-            disabled={Boolean(acknowledgeLabel) && !acknowledged}
+            disabled={confirmDisabled || (Boolean(acknowledgeLabel) && !acknowledged)}
           >
             {confirmLabel}
-          </Button>
+          </Button>}
         </>
       }
     >

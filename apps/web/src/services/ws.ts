@@ -12,7 +12,7 @@ export function createChatWebSocket(
     throw new Error("Missing access token for chat websocket");
   }
   const ws = new WebSocket(
-    `${resolveWsBaseUrl()}/ws/chat/${conversationId}?edits=1`,
+    `${resolveWsBaseUrl()}/ws/chat/${conversationId}?edits=1&logicalDeletionIds=1`,
     [`token.${accessToken}`]
   );
 

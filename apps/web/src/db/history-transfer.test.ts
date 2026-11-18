@@ -10,7 +10,7 @@ import { buildTransferArchive } from "../features/transfer/archive.js";
 import { mergeTransferredStickers, readStickerState, stickerStateKey, updateStickerState } from "../features/stickers/storage.js";
 import { publishLocalMessageChange } from "../lib/local-message-changes.js";
 import {
-  applyReceivedEdit, cacheAttachmentForMessage, getOriginalForEdit, commitReceivedMessage, getAppDB, getCachedFile, getLatestCachedMessageTimestamp, getMessageById, getMessages, historyConversationKey,
+  applyReceivedEdit, cacheAttachmentForMessage, getOriginalForEdit, commitReceivedMessage, getAppDB, getCachedFile, getMessageById, getMessages, historyConversationKey,
   getMessageDeletion, getReceiveReceipt, getSession, hasReceivedMessage, HISTORY_REMOVAL_GENERATION_KEY, messageDeletionKey, rememberMessageDeletion, removeLocalMessageContent, saveMessage, messageHideKey, beginMessageHide, finishMessageHide, writeCachedFile,
 } from "./index.js";
 
@@ -506,11 +506,10 @@ it("repairs a failed placeholder, preserves receive deduplication, and records i
   expect(publishLocalMessageChange).toHaveBeenCalledExactlyOnceWith(message.id, "commit", "chat");
 });
 
-it("keeps imported history separate from the live cursor and commits a racing receive's ratchet", async () => {
+it("keeps imported history separate from receive receipts and commits a racing receive's ratchet", async () => {
   await importHistoryTransferItem("alice", { entry: { kind: "conversation", conversation } });
   const transferred = { ...message, id: "racing:old", editedAt: now, content: "edited history" };
   await importHistoryTransferItem("alice", { entry: entry(transferred) });
-  expect(await getLatestCachedMessageTimestamp()).toBe(0);
   expect(await hasReceivedMessage("racing:old")).toBe(false);
   const live = { ...message, id: "racing:new", content: "older live content" };
   const session = { id: "sender:device", state: "advanced state", updatedAt: now };

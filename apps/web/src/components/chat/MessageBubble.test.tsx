@@ -174,10 +174,36 @@ it.each(["sending", "failed"] as const)("treats local deletion of %s as Discard"
   const dialog = getByRole(document.body, "alertdialog");
   expect(discardOutgoing).not.toHaveBeenCalled();
   expect(document.activeElement).toBe(getByRole(dialog, "button", { name: "Cancel" }));
+  vi.mocked(discardOutgoing).mockImplementationOnce(async (id, conversationId) => {
+    const { deleteMessagesForLocalUserOnly } = await import("../../lib/message-sync.js");
+    await deleteMessagesForLocalUserOnly(conversationId, [id], () => true);
+    return undefined;
+  });
   await click(getByRole(dialog, "button", { name: "Delete for me" }));
-  expect(discardOutgoing).toHaveBeenCalledWith(message.id);
+  expect(discardOutgoing).toHaveBeenCalledWith(message.id, "conv");
   await act(async () => { await waitFor(async () => expect(await getMessageById(message.id)).toBeUndefined()); });
   expect(api.delete).not.toHaveBeenCalled();
+});
+
+it("reports an already-sending message without hiding its bubble", async () => {
+  await saveMessage({ ...message, status: "sending" });
+  await render({ status: "sending" });
+  vi.mocked(discardOutgoing).mockResolvedValueOnce("already-sending");
+  await click(getByRole(document.body, "button", { name: "Message actions" }));
+  await click(getByRole(document.body, "menuitem", { name: "Delete for me" }));
+  const dialog = getByRole(document.body, "alertdialog");
+  await click(getByRole(dialog, "button", { name: "Delete for me" }));
+  await act(async () => { await waitFor(() => expect(dialog.textContent).toContain("may still be delivered")); });
+  expect(await getMessageById(message.id)).toMatchObject({ content: message.content });
+});
+
+it("uses distinct accessible names for attachments from the same sender and minute", async () => {
+  await dom.render(<ToastProvider>{["notes.txt", "report.txt"].map((fileName) => (
+    <MessageBubble key={fileName} message={{ ...message, id: fileName, type: "file", content: JSON.stringify({ ...JSON.parse(fileContent), fileName }) }}
+      isOwn selection={{ selected: false, busy: false }} onSelect={() => {}} />
+  ))}</ToastProvider>);
+  expect(getByRole(document.body, "checkbox", { name: /notes\.txt/ })).toBeTruthy();
+  expect(getByRole(document.body, "checkbox", { name: /report\.txt/ })).toBeTruthy();
 });
 
 it.each(["scrim", "menu item", "bubble"])("keeps the phone Sheet open through a retargeted touch release and compatibility click on the %s", async (targetName) => {

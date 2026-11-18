@@ -89,7 +89,7 @@ export function ActionMenu({ open, position, title, items, onClose, children, pr
           item.onSelect();
         }}>
         {item.icon && <Icon name={item.icon} size={phone ? 20 : 18} className="shrink-0" />}
-        <span className={`flex min-w-0 flex-1 ${phone ? "flex-col" : "items-center justify-between gap-6"}`}><span>{item.label}</span>{item.hint && <span id={`${hintId}-${item.id}`} className="text-xs text-ink-subtle">{item.hint}</span>}</span>
+        <span className="flex min-w-0 flex-1 flex-col"><span>{item.label}</span>{item.hint && <span id={`${hintId}-${item.id}`} className="text-xs text-ink-muted">{item.hint}</span>}</span>
       </button>
     </Fragment>)}
   </div>;

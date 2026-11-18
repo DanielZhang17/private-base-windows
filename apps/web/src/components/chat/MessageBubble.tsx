@@ -7,6 +7,7 @@ import { canOpenFile, copyMessageText } from "../../features/chat/message-action
 import { formatBytes } from "../../features/chat/useFilePreview.js";
 import { captureMessageActionSession, isMessageActionSessionCurrent, trackMessageUndoToast } from "../../features/chat/message-action-session.js";
 import { useMessageActions } from "../../features/chat/useMessageActions.js";
+import { messageSelectionText } from "../../features/chat/message-selection.js";
 import { ActionMenu, ConfirmDialog, Icon, IconButton, useToast, type ActionMenuItem } from "../../ui/index.js";
 import FilePreview, { type FilePreviewActions } from "./FilePreview.js";
 import InlineEmojiText from "./InlineEmojiText.js";
@@ -28,10 +29,17 @@ interface Props {
   onRetry?: () => void;
   onDiscard?: () => void;
   onEdit?: () => void;
+  onSelect?: () => void;
+  selection?: { selected: boolean; busy: boolean };
 }
-export default function MessageBubble({ message, isOwn, isGroup, senderName, failure, onRetry, onDiscard, onEdit, showMeta = true, firstInRun = true }: Props) {
+export default function MessageBubble({ message, isOwn, isGroup, senderName, failure, onRetry, onDiscard, onEdit, onSelect, selection, showMeta = true, firstInRun = true }: Props) {
   useLocale();
-  const actions = useMessageActions(message, isOwn);
+  const selecting = !!selection;
+  const actions = useMessageActions(message, isOwn, selecting);
+  const selectionControl = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (selecting && selection?.selected) selectionControl.current?.focus({ preventScroll: true });
+  }, [selecting]);
   const fileActions = useRef<FilePreviewActions>(null);
   const toast = useToast();
   const [fileBlocked, setFileBlocked] = useState(false);
@@ -98,6 +106,7 @@ export default function MessageBubble({ message, isOwn, isGroup, senderName, fai
   }
   if (!deleted && message.type === "file" && message.content) items.push({ id: "copy-name", icon: "copy", label: t("copyFileName"), onSelect: () => copy(attachmentName(message.content)) });
   if (failed && onRetry) items.push({ id: "retry", icon: "retry", label: t("retry"), onSelect: onRetry });
+  if (onSelect) items.push({ id: "select", icon: "check", label: t("messageSelect"), onSelect });
   if (failed && onDiscard) items.push({ id: "discard", icon: "trash", label: t("discard"), onSelect: onDiscard, danger: true, separatorBefore: items.length > 0 });
   items.push({ id: "delete-me", icon: "trash", hint: t("thisDeviceOnly"), label: t("deleteForMe"), onSelect: deleteForMe, danger: true, separatorBefore: items.length > 0 && !items.at(-1)?.danger });
   if (isOwn && !queued && !deleted) items.push({ id: "delete-everyone", icon: "trash", hint: t("removesForAllMembers"), label: t("deleteForEveryone"), onSelect: () => { actions.clearError(); actions.setConfirmDelete(true); }, danger: true });
@@ -114,20 +123,31 @@ export default function MessageBubble({ message, isOwn, isGroup, senderName, fai
   const stickerAnnouncement = stickerId ? t("stickerMessageAnnouncement", { message: announcement, sticker: sticker ? stickerName(sticker) : t("stickerPreview"), status: isOwn && !failed ? status : "" }) : announcement;
   const menu = { open: !!actions.position, position: actions.position ?? { x: 0, y: 0 }, onClose: actions.close,
     title: t("messageActions"), items, preview, children: failure && <p className="px-3 py-2 text-sm text-ink-muted">{failure}</p> };
-  return <article className={`flex flex-col ${isOwn ? "items-end" : "items-start"}`} aria-label={stickerAnnouncement}>
+  return <article data-message-id={message.id} className={`${selecting ? "grid grid-cols-[44px_minmax(0,1fr)] items-start cursor-pointer rounded-control select-none" : ""} ${selection?.selected ? "bg-brand-soft" : ""}`} aria-label={stickerAnnouncement}
+    onClick={selecting && !selection?.busy ? onSelect : undefined} onClickCapture={selecting ? actions.triggers.onClickCapture : undefined}
+    onContextMenu={selecting ? (event) => event.preventDefault() : undefined}>
+    {selection && <button ref={selectionControl} type="button" role="checkbox" aria-checked={selection.selected}
+      aria-label={[stickerAnnouncement, !stickerId && (file ? file.fileName : messageSelectionText(message))].filter(Boolean).join(", ")}
+      aria-disabled={selection.busy || undefined} className="grid size-11 cursor-pointer place-items-center rounded-control"
+      onClick={(event) => { event.stopPropagation(); if (!selection.busy) onSelect?.(); }}>
+      <span className={`flex size-5 items-center justify-center rounded border ${selection.selected ? "border-brand bg-brand text-on-brand" : "border-line-strong bg-surface"}`}>
+        {selection.selected && <Icon name="check" size={16} />}
+      </span>
+    </button>}
+    <div className={`flex min-w-0 flex-col ${isOwn ? "items-end" : "items-start"}`}>
     {firstInRun && isGroup && !isOwn && senderName && <p className="mb-1 px-3 text-xs font-semibold text-ink-muted">{senderName}</p>}
     <div className={`message-row flex w-full items-center gap-2 ${isOwn ? "flex-row-reverse" : ""}`} data-menu-open={!!actions.position || undefined}>
-      {stickerId ? <div className="sticker-message-frame">
+      {stickerId ? <div className="sticker-message-frame" inert={selecting}>
         <StickerMessage key={stickerId} sticker={sticker} failed={failed} menuOpen={!!actions.position} triggers={actions.triggers}
           onShowActions={() => more.current?.click()} retryCatalog={catalogFailed ? retryCatalog : undefined} onOpen={openPack} />
         <StickerMessageStatus message={message} isOwn={isOwn} failed={failed} showMeta={showMeta} status={status}
           onRetry={onRetry ?? (() => more.current?.click())} />
-      </div> : failed ? <button {...actions.triggers} type="button" onClick={onRetry ?? actions.openFromButton}
+      </div> : failed ? <button {...actions.triggers} inert={selecting} type="button" onClick={onRetry ?? actions.openFromButton}
         aria-label={t("retryMessage", { content: message.type === "file" ? attachmentName(message.content) : message.content })}
         className={`message-action-surface bubble bubble-own bubble-failed text-start ${actions.position ? "message-menu-target" : ""}`}>
         {message.type === "file" ? attachmentName(message.content) : <InlineEmojiText content={message.content} />}
-      </button> : <div {...actions.triggers} className={`message-action-surface bubble ${isOwn ? "bubble-own" : "bubble-incoming"} ${deleted ? "bubble-deleted" : ""} ${actions.position ? "message-menu-target" : ""}`}>{content}</div>}
-      <IconButton ref={more} icon="more" label={t(failed ? "failedMessageActions" : "messageActions")} size="sm" aria-haspopup="menu" aria-expanded={!!actions.position} onClick={actions.openFromButton} className="message-more text-ink-subtle focus-visible:outline-2 focus-visible:outline-brand" />
+      </button> : <div {...actions.triggers} inert={selecting} className={`message-action-surface bubble ${isOwn ? "bubble-own" : "bubble-incoming"} ${deleted ? "bubble-deleted" : ""} ${actions.position ? "message-menu-target" : ""}`}>{content}</div>}
+      {!selection && <IconButton ref={more} icon="more" label={t(failed ? "failedMessageActions" : "messageActions")} size="sm" aria-haspopup="menu" aria-expanded={!!actions.position} onClick={actions.openFromButton} className="message-more text-ink-subtle focus-visible:outline-2 focus-visible:outline-brand" />}
     </div>
     {!stickerId && (showMeta || editStatus || (message.expiryKind === "timed" && message.expiresAt != null)) && <div className={`flex min-h-7 flex-wrap items-center gap-1.5 px-1 pt-1 text-xs tabular-nums ${failed ? "font-semibold text-danger" : "text-ink-subtle"}`}>
       {showMeta && <span data-message-meta="" className="inline-flex items-center gap-1.5">{failed ? <><Icon name="alert-circle" size={14} /><span>{t("notSent")}</span></>
@@ -136,9 +156,10 @@ export default function MessageBubble({ message, isOwn, isGroup, senderName, fai
       {editStatus && <span>{editStatus}</span>}
       {message.expiryKind === "timed" && message.expiresAt != null && <TimedCountdownBadge expiresAt={message.expiresAt} />}
     </div>}
-    {actions.position && stickerId && !failed
+    </div>
+    {!selecting && (actions.position && stickerId && !failed
       ? <StickerMessageMenu {...menu} stickerId={stickerId} onOpenPack={sticker ? openPack : undefined} />
-      : <ActionMenu {...menu} />}
+      : <ActionMenu {...menu} />)}
     {packOpen && sticker && catalog && <StickerPackSheet pack={packSelection(sticker)} stickers={catalog.stickers} onClose={closePack} />}
     <ConfirmDialog open={actions.confirmLocalDelete} title={t("deleteQueuedTitle")} description={t("deleteQueuedDescription")} confirmLabel={t("deleteForMe")} tone="danger" error={actions.error} onConfirm={() => void actions.deleteForMe()} onCancel={() => actions.setConfirmLocalDelete(false)} />
     <ConfirmDialog open={actions.confirmDelete} title={file ? t("deleteFileEveryoneTitle", { fileName: file.fileName }) : t("deleteForEveryoneTitle")} description={t("deleteForEveryoneDescription")} confirmLabel={t("deleteForEveryone")} tone="danger" busy={actions.busy} error={actions.error} onConfirm={() => void actions.deleteForEveryone()} onCancel={() => { if (!actions.busy) actions.setConfirmDelete(false); }} />

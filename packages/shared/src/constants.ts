@@ -1,4 +1,5 @@
 export const MAX_MESSAGE_SIZE = 64 * 1024; // 64KB max message payload
+export const MAX_DELETE_BATCH_SIZE = 100;
 export const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB max file
 export const MAX_CUSTOM_EMOJI_SIZE = 128 * 1024; // 128KB max custom emoji
 export const MAX_CUSTOM_EMOJIS_PER_USER = 64;

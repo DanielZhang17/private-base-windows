@@ -24,7 +24,10 @@ it("focuses the pointer menu container, supports arrows/typeahead and renders ic
   expect(menu.tabIndex).toBe(-1);
   expect(getByRole(menu, "separator")).toBeDefined();
   const remove = getByRole(menu, "menuitem", { name: "Delete for me" });
-  expect(document.getElementById(remove.getAttribute("aria-describedby")!)?.textContent).toBe("This device only");
+  const hint = document.getElementById(remove.getAttribute("aria-describedby")!)!;
+  expect(hint.textContent).toBe("This device only");
+  expect(hint.parentElement?.classList.contains("flex-col")).toBe(true);
+  expect(hint.previousElementSibling?.textContent).toBe("Delete for me");
   expect(remove.querySelector("svg")?.getAttribute("width")).toBe("18");
   await press("ArrowDown"); expect(document.activeElement?.getAttribute("aria-label")).toBe("Copy text");
   await press("d"); expect(document.activeElement).toBe(remove);

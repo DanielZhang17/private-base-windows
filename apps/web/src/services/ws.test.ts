@@ -8,7 +8,7 @@ it("reports a 4403 closure once without reopening or scheduling reconnects", asy
   const constructor = vi.fn();
   class Socket {
     onclose?: (event: { code: number }) => void;
-    constructor() { constructor(); }
+    constructor(url: string, protocols: string[]) { constructor(url, protocols); }
     close = vi.fn();
   }
   vi.stubGlobal("WebSocket", Socket);
@@ -17,6 +17,6 @@ it("reports a 4403 closure once without reopening or scheduling reconnects", asy
   ws.onclose?.({ code: 4403 } as CloseEvent);
   await vi.advanceTimersByTimeAsync(120_000);
   expect(onClose).toHaveBeenCalledOnce();
-  expect(constructor).toHaveBeenCalledOnce();
+  expect(constructor).toHaveBeenCalledExactlyOnceWith("wss://test/ws/chat/chat?edits=1&logicalDeletionIds=1", ["token.token"]);
   expect(vi.getTimerCount()).toBe(0);
 });

@@ -11,6 +11,7 @@ import { api } from "../../services/api.js";
 import { refreshConversationList } from "../../lib/conversation-cache.js";
 import { commitAbandonedMessageHides, getAppDB, deletePendingCall, getPendingCall } from "../../db/index.js";
 import { useCallStore } from "../../stores/callStore.js";
+import { useChatStore } from "../../stores/chatStore.js";
 import { clearRegisteredLocalCallState } from "../../platform/session-cleanup.js";
 
 vi.mock("../../stores/authStore.js", async () => {
@@ -63,6 +64,24 @@ it("reconciles cached edits when a conversation membership notification arrives"
   await act(async () => root.render(<UnlockedAppEffects />));
   await act(async () => vi.mocked(createNotificationWebSocket).mock.calls.at(-1)![0].onConversationEvent({ conversationId: "rejoined" }));
   expect(reconcileConversationEdits).toHaveBeenCalledExactlyOnceWith("rejoined", true);
+});
+it("syncs replayed tombstones once even when their conversation is already visible", async () => {
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  const previous = useChatStore.getState().activeConversationId;
+  useChatStore.getState().setActiveConversation("chat-1");
+  try {
+    await act(async () => root.render(<UnlockedAppEffects />));
+    await act(async () => {
+      const onMessageEvent = vi.mocked(createNotificationWebSocket).mock.calls.at(-1)![0].onMessageEvent;
+      const hint = { conversationId: "chat-1", deletionSync: true as const,
+        replayedDeletions: { senderId: "alice", deletions: [{ ids: ["cached"], deletedByUserId: "admin", deletedAt: 123 }] } };
+      onMessageEvent(hint);
+      onMessageEvent(hint);
+      expect(handleMessageDeletion).toHaveBeenCalledWith(hint);
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(syncMessages).toHaveBeenCalledExactlyOnceWith({ force: true });
+  } finally { useChatStore.getState().setActiveConversation(previous); }
 });
 it.each(["ringing", "active", "starting"])("retains existing busy-call checks when %s", async (state) => {
   await act(async () => root.render(<UnlockedAppEffects />));
