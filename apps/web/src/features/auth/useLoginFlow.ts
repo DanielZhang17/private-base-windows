@@ -44,9 +44,11 @@ import {
 import { signInWithNativePasskey } from "../../lib/native-passkeys.js";
 import { getPasskeyAssertion, PasskeyUnsupportedError } from "../../lib/webauthn.js";
 import { capabilities } from "../../platform/capabilities.js";
-import { isUnlockPromptCancelled } from "../../platform/biometric-unlock.js";
+import { canUseNativeUnlock, isNativeEnrollmentUnsupported, isUnlockPromptCancelled, useNativeUnlockStatus } from "../../platform/biometric-unlock.js";
+import { assertNotAborted } from "../../platform/native-wait.js";
 import { waitForNativePasskeyHandoff } from "../../platform/passkeyHandoff.js";
 import { clearRegisteredAccountState } from "../../platform/session-cleanup.js";
+import { unlockMethodInfo } from "./unlockMethods.js";
 
 interface PendingLinkState {
   deviceName: string;
@@ -75,12 +77,13 @@ function isUnknownPasskeyDevice(error: unknown): boolean {
 
 function availableUnlockMethods(methods: UnlockMethod[]) {
   return methods.filter(method => method === "password" || (
-    method === "passkey" ? capabilities.passkeys : !!capabilities.biometricUnlock
+    method === "passkey" ? capabilities.passkeys : canUseNativeUnlock()
   ));
 }
 
 export function useLoginFlow() {
   useLocale();
+  useNativeUnlockStatus();
   const location = useLocation();
   const [recoveryRetry, setRecoveryRetry] = useState(readRecoveryRetry);
   const submitting = useRef(false);
@@ -93,6 +96,8 @@ export function useLoginFlow() {
   const preparation = useRef<Promise<boolean> | undefined>(undefined);
   const autofill = useRef<AbortController | undefined>(undefined);
   const nativeCeremony = useRef<AbortController | undefined>(undefined);
+  const nativeUnlockAttempt = useRef<{ controller: AbortController; task: Promise<void> } | undefined>(undefined);
+  const [nativeUnlockPending, setNativeUnlockPending] = useState(false);
   const webCeremony = useRef<AbortController | undefined>(undefined);
   const ceremonyTask = useRef<Promise<void> | undefined>(undefined);
   const [entryState, setEntryState] = useState<"ready" | "preparing" | "failed" | "offline" | "other-tab" | "moved" | "unavailable" | null>(null);
@@ -115,7 +120,8 @@ export function useLoginFlow() {
   const [savedPasskeySetupId, setSavedPasskeySetupId] = useState<string>();
   const [forgetSavedSetupId, setForgetSavedSetupId] = useState<string>();
   const [passkeyPasswordRequired, setPasskeyPasswordRequired] = useState(false);
-  const [resumeMethods, setResumeMethods] = useState<UnlockMethod[]>([]);
+  const [savedMethods, setSavedMethods] = useState<UnlockMethod[]>([]);
+  const resumeMethods = availableUnlockMethods(savedMethods);
   useEffect(() => {
     let active = true;
     void readPendingPasskeySetup().then(async (record) => {
@@ -124,7 +130,7 @@ export function useLoginFlow() {
           const methods = await listLocalUnlockMethods().catch(() => []);
           if (!active) return;
           setSavedPasskeySetupId(record.setupId);
-          setResumeMethods(availableUnlockMethods(methods));
+          setSavedMethods(methods);
         }
       } else if (record && active) {
         if (await clearInterruptedPasskeySetup() && active) setInterrupted(true);
@@ -137,6 +143,7 @@ export function useLoginFlow() {
     preparingOptions.current?.abort();
     webCeremony.current?.abort();
     nativeCeremony.current?.abort();
+    nativeUnlockAttempt.current?.controller.abort();
     nativeRestart.current?.abort();
     setupAttempt.current?.discard();
     void preparedSetup.current?.discard().catch(() => undefined);
@@ -544,7 +551,7 @@ export function useLoginFlow() {
     const record = await readPendingPasskeySetup();
     const durable = record?.stage === "unlockReady" || record?.stage === "complete";
     setSavedPasskeySetupId(durable ? record.setupId : undefined);
-    setResumeMethods(durable ? availableUnlockMethods(await listLocalUnlockMethods().catch(() => [])) : []);
+    setSavedMethods(durable ? await listLocalUnlockMethods().catch(() => []) : []);
   };
 
   const applyPasskeySetup = async (auth: AuthResponse, setupId: string) => {
@@ -554,7 +561,7 @@ export function useLoginFlow() {
     setPasskeyDeviceLimit(undefined);
     setPasskeySetupProblem(undefined);
     setSavedPasskeySetupId(undefined);
-    setResumeMethods([]);
+    setSavedMethods([]);
     setPasskeyPasswordRequired(false);
     setSetupScreen(null);
     setPassword("");
@@ -689,10 +696,14 @@ export function useLoginFlow() {
       ? localized("approveFromAnotherDevice") : toErrorMessage(error, "passkeyLoginFailed"));
   };
 
-  const resumePasskeySetup = async (method: UnlockMethod, fallback?: string, replacement?: PasskeyReplacement) => {
+  const resumePasskeySetup = async (
+    method: UnlockMethod, fallback?: string, replacement?: PasskeyReplacement, signal?: AbortSignal, onLocalUnlock?: () => void,
+  ) => {
     const record = await readPendingPasskeySetup();
     try {
-      const result = await resumePasskeyDeviceSetup(method, fallback, replacement);
+      const result = signal ? await resumePasskeyDeviceSetup(method, fallback, replacement, signal, onLocalUnlock)
+        : await resumePasskeyDeviceSetup(method, fallback, replacement);
+      assertNotAborted(signal);
       if ("backupMethod" in result) {
         if (!mounted.current) return;
         setResumedBackup(result);
@@ -702,7 +713,7 @@ export function useLoginFlow() {
         setPassword("");
       } else if (record) await applyPasskeySetup(result, record.setupId);
     } catch (err) {
-      await showSavedPasskeySetup();
+      if (!signal?.aborted) await showSavedPasskeySetup();
       throw err;
     }
   };
@@ -718,16 +729,46 @@ export function useLoginFlow() {
     finally { submitting.current = false; if (mounted.current) setLoading(false); }
   };
 
+  const runNativeSetupUnlock = (operation: (signal: AbortSignal, onLocalUnlock: () => void) => Promise<void>) => {
+    if (submitting.current) return;
+    const controller = new AbortController();
+    const endTakeover = () => {
+      if (nativeUnlockAttempt.current?.controller !== controller) return;
+      nativeUnlockAttempt.current = undefined;
+      if (mounted.current) setNativeUnlockPending(false);
+    };
+    const task = runPasskeySetup(async () => {
+      try { await operation(controller.signal, endTakeover); }
+      catch (error) { if (!controller.signal.aborted) throw error; }
+    });
+    nativeUnlockAttempt.current = { controller, task };
+    setNativeUnlockPending(true);
+    return task.finally(endTakeover);
+  };
+
+  const runSetupWithUnlock = async (
+    method: UnlockMethod | undefined, operation: (signal?: AbortSignal, onLocalUnlock?: () => void) => Promise<void>,
+  ) => {
+    if (method === "native") return runNativeSetupUnlock(operation);
+    const native = nativeUnlockAttempt.current;
+    if (method === "password" && native) {
+      native.controller.abort();
+      await native.task;
+    }
+    return runPasskeySetup(() => operation());
+  };
+
   const completePasskeySetupWithPassword = (event: React.FormEvent) => {
     event.preventDefault();
     if (!password) return;
-    return runPasskeySetup(async () => {
+    return runSetupWithUnlock("password", async () => {
       if (setupAttempt.current) await finishPasskeySetup(setupAttempt.current, password);
       else if (resumeMethods.includes("password")) await resumePasskeySetup("password", password);
     });
   };
 
-  const resumePasskeyUnlock = (method: UnlockMethod, password?: string) => runPasskeySetup(() => resumePasskeySetup(method, password));
+  const resumePasskeyUnlock = (method: UnlockMethod, password?: string) =>
+    runSetupWithUnlock(method, (signal, onLocalUnlock) => resumePasskeySetup(method, password, undefined, signal, onLocalUnlock));
   const continuePasskeySetup = async (attempt: NonNullable<typeof setupAttempt.current>) => {
     if (!mounted.current) { attempt.discard(); return; }
     setupAttempt.current = attempt;
@@ -743,7 +784,7 @@ export function useLoginFlow() {
     setPasskeyDeviceLimit(undefined);
     if (attempt.canUsePasswordFallback()) {
       setSetupScreen("progress");
-      setPasswordOnly(attempt.method === "password");
+      setPasswordOnly(false);
       if (attempt.method === "passkey" && attempt.pending) {
         await attempt.persistUnlock();
         if (mounted.current) setSetupScreen("unlock");
@@ -754,20 +795,29 @@ export function useLoginFlow() {
 
   const beginUnlockSetup = () => {
     setSetupScreen("unlock");
-    setPasskeyPasswordRequired(passwordOnly);
+    setPasskeyPasswordRequired(passwordOnly || setupAttempt.current?.method === "password");
   };
-  const enrollPasskeySetupUnlock = () => runPasskeySetup(async () => {
+  const enrollPasskeySetupUnlock = () => {
     const attempt = setupAttempt.current;
     if (!attempt) return;
-    if (attempt.method !== "passkey") {
-      try { await attempt.persistUnlock(); }
-      catch (err) {
-        if (isUnlockPromptCancelled(err)) return;
-        throw err;
+    const enroll = async (signal?: AbortSignal) => {
+      if (attempt.method !== "passkey") {
+        try { await attempt.persistUnlock(undefined, signal); }
+        catch (err) {
+          if (signal?.aborted || isUnlockPromptCancelled(err)) return;
+          if (isNativeEnrollmentUnsupported(err) && attempt.canUsePasswordFallback()) {
+            setPasswordOnly(true);
+            setPasskeyPasswordRequired(true);
+            setError(localized("security.nativeEnrollmentUnsupported", { method: unlockMethodInfo("native").name }));
+            return;
+          }
+          throw err;
+        }
       }
-    }
-    setSetupScreen("backup");
-  });
+      if (!signal?.aborted) setSetupScreen("backup");
+    };
+    return attempt.method === "native" ? runNativeSetupUnlock(enroll) : runPasskeySetup(() => enroll());
+  };
   const handleBackupSetupFailure = async (err: unknown, attempt: SetupAttempt | null) => {
     const reason = (err as { body?: { error?: string } }).body?.error;
     const name = (err as Error)?.name;
@@ -1051,13 +1101,18 @@ export function useLoginFlow() {
       await cancelPasskeySetup();
       if (controller) {
         await waitForNativePasskeyHandoff(controller.signal);
-        controller.signal.throwIfAborted();
+        assertNotAborted(controller.signal);
         setNativeRestarting(false);
         nativeRestart.current = undefined;
         if (mounted.current && await preparePasskeyEntry(true)) await handlePasskeyEntry();
       }
     } catch (error) {
-      if (!controller?.signal.aborted) throw error;
+      if (controller?.signal.aborted) return;
+      if (error instanceof DOMException && error.name === "TimeoutError") {
+        if (mounted.current) setError(localized("passkeySetup.browserTimeout"));
+        return;
+      }
+      throw error;
     } finally {
       if (nativeRestart.current === controller) {
         nativeRestart.current = undefined;
@@ -1110,7 +1165,7 @@ export function useLoginFlow() {
 
   const replacePasskeyDevice = (revokeDeviceId: string | null, recoveryKeyProof?: string,
     unlock?: { method: UnlockMethod; password?: string },
-  ) => runPasskeySetup(async () => {
+  ) => runSetupWithUnlock(unlock?.method, async (signal, onLocalUnlock) => {
     const attempt = setupAttempt.current;
     if (attempt) {
       await attempt.replace(revokeDeviceId, recoveryKeyProof);
@@ -1118,7 +1173,7 @@ export function useLoginFlow() {
     } else {
       const limitTicket = passkeyDeviceLimit?.limitTicket;
       if (!unlock || !limitTicket) throw new Error("Unlock the saved setup before replacing a device");
-      await resumePasskeySetup(unlock.method, unlock.password, { limitTicket, revokeDeviceId, recoveryKeyProof });
+      await resumePasskeySetup(unlock.method, unlock.password, { limitTicket, revokeDeviceId, recoveryKeyProof }, signal, onLocalUnlock);
     }
   });
 
@@ -1272,7 +1327,12 @@ export function useLoginFlow() {
     setupScreen, passwordOnly, passkeyApproval, beginUnlockSetup, enrollPasskeySetupUnlock, finishWithBackupPassword,
     setupUnlockMethod: setupAttempt.current?.method ?? resumedBackup?.backupMethod,
     savedSetupDeviceName: t("passkeySetup.setupOtherDevice"),
-    chooseSetupPassword: () => { setPasswordOnly(true); setPasskeyPasswordRequired(true); },
+    nativeUnlockPending,
+    chooseSetupPassword: () => {
+      nativeUnlockAttempt.current?.controller.abort();
+      setPasswordOnly(true);
+      setPasskeyPasswordRequired(true);
+    },
     savedPasskeySetupId, resumeMethods, resumePasskeyUnlock, requestForgetSavedPasskeySetup,
     confirmingForgetSavedPasskeySetup: !!forgetSavedSetupId,
     cancelForgetSavedPasskeySetup: () => setForgetSavedSetupId(undefined),

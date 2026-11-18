@@ -11,7 +11,7 @@ import { capabilities } from "../../platform/capabilities.js";
 import { unlockMethodInfo } from "./unlockMethods.js";
 import { clearUnlockAttempts, readUnlockAttempts, recordUnlockFailure } from "./unlockAttempt.js";
 import { platformName } from "../../platform/environment.js";
-import { NativeBiometricError } from "../../platform/biometric-unlock.js";
+import { canProbeNativeUnlock, NativeBiometricError, nativeUnlockLabel, nativeUnlockStatus, useNativeUnlockStatus } from "../../platform/biometric-unlock.js";
 import { markUnlockOffer } from "./unlockOfferState.js";
 import { authAvatarSrc } from "./avatar.js";
 
@@ -33,22 +33,41 @@ export function useUnlock() {
   const [loading, setLoading] = useState(false);
   const [confirmForget, setConfirmForget] = useState(false);
   const passwordInput = useRef<HTMLInputElement>(null);
-  const submitting = useRef(false);
+  const submitting = useRef<{ native?: AbortController } | undefined>(undefined);
   const [methods, setMethods] = useState<UnlockMethod[]>([]);
   const [methodsRead, setMethodsRead] = useState<"reading" | "ready" | "failed">("reading");
   const [methodsReadAttempt, setMethodsReadAttempt] = useState(0);
-  const [chosenPassword, setChosenPassword] = useState(false);
+  const [chosenPassword, updateChosenPassword] = useState(false);
+  const passwordChosen = useRef(false);
+  const setChosenPassword = (chosen: boolean) => {
+    if (chosen && submitting.current?.native) {
+      submitting.current.native.abort();
+      submitting.current = undefined;
+      setLoading(false);
+      setUnlockPhase(null);
+    }
+    passwordChosen.current = chosen;
+    updateChosenPassword(chosen);
+  };
   const [unlockPhase, setUnlockPhase] = useState<"waiting" | "unlocking" | null>(null);
-  const [failureKind, setFailureKind] = useState<"temporary" | "invalidated" | "failed">();
+  const [failureKind, setFailureKind] = useState<"temporary" | "unsupported" | "invalidated" | "failed">();
   const invalidatedDevice = useRef<string | undefined>(undefined);
   const [until, setUntil] = useState(0);
   const [now, setNow] = useState(Date.now);
   const autoPrompted = useRef(false);
-  const native = methods.includes("native") ? capabilities.biometricUnlock : undefined;
-  const preferred: UnlockMethod | undefined = native ? "native" : methods.includes("passkey") && capabilities.passkeys ? "passkey" : undefined;
+  const { available: provenNative, probePending } = useNativeUnlockStatus();
+  const hasNative = methods.includes("native");
+  const canProbe = canProbeNativeUnlock();
+  const native = hasNative ? nativeUnlockLabel() : undefined;
+  const preferred: UnlockMethod | undefined = hasNative && (provenNative || canProbe) ? "native"
+    : methods.includes("passkey") && capabilities.passkeys ? "passkey" : undefined;
   const hasPassword = methods.includes("password");
   const showPassword = hasPassword && (!preferred || chosenPassword);
   const info = preferred && unlockMethodInfo(preferred, native);
+  const nativeRecovery = hasNative && !provenNative && (!hasPassword || !showPassword)
+    ? localized(native === "touchid" && platformName() === "macos" ? "unlock.touchIdRelaunch" : "unlock.nativeUnavailable",
+      { method: unlockMethodInfo("native", native).name })
+    : undefined;
   const retrySeconds = Math.max(0, Math.ceil((until - now) / 1000));
   const deviceId = auth.device?.id;
   useEffect(() => {
@@ -89,9 +108,12 @@ export function useUnlock() {
   const redirectTo = !auth.accessToken || !auth.device ? "/login" : keysLoaded() ? returnTo : null;
 
   const handleUnlockWith = async (method: UnlockMethod) => {
+    if (method === "password") setChosenPassword(true);
     if (submitting.current) return;
     if (method === "password" && until > Date.now()) return;
-    submitting.current = true;
+    if (method === "native") autoPrompted.current = true;
+    const attempt = { native: method === "native" ? new AbortController() : undefined };
+    submitting.current = attempt;
     setLoading(true);
     setError(null);
     setFailureKind(undefined);
@@ -107,10 +129,16 @@ export function useUnlock() {
           void clearUnlockAttempts(deviceId).catch(() => undefined);
           markUnlockOffer(deviceId, methods, invalidatedDevice.current === deviceId);
         }
-      } else await unlockLocalKeys(method, undefined, () => setUnlockPhase("unlocking"));
+      } else {
+        await unlockLocalKeys(method, undefined, () => {
+          if (submitting.current === attempt) setUnlockPhase("unlocking");
+        }, attempt.native?.signal);
+      }
+      if (submitting.current !== attempt) return;
       auth.bumpSessionState();
       navigate(returnTo, { replace: true });
     } catch (err) {
+      if (submitting.current !== attempt) return;
       if ((err as Error)?.name === "NotAllowedError" || (err instanceof NativeBiometricError && err.code === "cancelled")) return;
       if (method === "password") {
         if ((err as Error)?.name === "OperationError" && deviceId) {
@@ -126,36 +154,49 @@ export function useUnlock() {
       } else if (info) {
         const params = { method: info.name, device: platformName() === "ios" ? "iPhone" : platformName() === "macos" ? "Mac" : t("passkeySetup.setupOtherDevice") };
         const code = err instanceof NativeBiometricError ? err.code : "failed";
+        const recovery = !nativeUnlockStatus().available ? nativeRecovery : undefined;
         if (code === "invalidated" || code === "lockout") {
           if (code === "invalidated") invalidatedDevice.current = deviceId;
           setFailureKind(code === "invalidated" ? "invalidated" : "temporary");
-          if (hasPassword) setChosenPassword(true);
+          if (hasPassword) {
+            passwordChosen.current = true;
+            updateChosenPassword(true);
+          }
           setError(localized(code === "invalidated" ? hasPassword ? "unlock.invalidated" : "unlock.invalidatedNoBackup"
             : hasPassword ? "unlock.lockout" : "unlock.lockoutNoPassword", params));
+        } else if (code === "unavailable" || code === "unsupported" || (code === "failed" && recovery)) {
+          setFailureKind(code === "unsupported" ? "unsupported" : "temporary");
+          if (code === "unsupported" && hasPassword) {
+            passwordChosen.current = true;
+            updateChosenPassword(true);
+          }
+          setError(recovery ?? localized("unlock.nativeUnavailable", params));
         } else {
           setFailureKind("failed");
           setError(localized(hasPassword ? "unlock.orUsePassword" : "unlock.notRecognised", params));
         }
       }
     } finally {
-      submitting.current = false;
-      setLoading(false);
-      setUnlockPhase(null);
+      if (submitting.current === attempt) {
+        submitting.current = undefined;
+        setLoading(false);
+        setUnlockPhase(null);
+      }
     }
   };
   const autoUnlock = useRef(handleUnlockWith);
   autoUnlock.current = handleUnlockWith;
   useEffect(() => {
-    if (!native || redirectTo || autoPrompted.current) return;
+    if (!hasNative || !provenNative || chosenPassword || redirectTo || autoPrompted.current) return;
     const prompt = () => {
-      if (document.visibilityState !== "visible" || autoPrompted.current) return;
+      if (document.visibilityState !== "visible" || autoPrompted.current || passwordChosen.current) return;
       autoPrompted.current = true;
       void autoUnlock.current("native");
     };
     prompt();
     document.addEventListener("visibilitychange", prompt);
     return () => document.removeEventListener("visibilitychange", prompt);
-  }, [native, redirectTo]);
+  }, [hasNative, provenNative, chosenPassword, redirectTo]);
 
   const handleForgetDevice = async () => {
     if (!confirmForget) {
@@ -164,7 +205,7 @@ export function useUnlock() {
       return;
     }
     if (submitting.current) return;
-    submitting.current = true;
+    submitting.current = {};
     setLoading(true);
     setError(null);
     try {
@@ -176,7 +217,7 @@ export function useUnlock() {
       setError(toErrorMessage(err, "failedToForgetThisDevice"));
       setLoading(false);
     } finally {
-      submitting.current = false;
+      submitting.current = undefined;
     }
   };
 
@@ -186,7 +227,7 @@ export function useUnlock() {
     redirectTo,
     auth: { user: auth.user },
     password,
-    setPassword,
+    setPassword: (value: string) => { setChosenPassword(true); setPassword(value); },
     error: error ? renderMessage(error) : "",
     unlockPhase, failureKind, retrySeconds, preferred, info, hasPassword, showPassword,
     setChosenPassword,
@@ -197,7 +238,8 @@ export function useUnlock() {
     methodsRead,
     retryReadMethods: () => setMethodsReadAttempt(attempt => attempt + 1),
     passkeyUnlock: methods.includes("passkey") && capabilities.passkeys,
-    biometricUnlock: methods.includes("native") ? capabilities.biometricUnlock : undefined,
+    biometricUnlock: native,
+    nativeRecovery: nativeRecovery && !probePending && !error ? renderMessage(nativeRecovery) : undefined,
     handleUnlock: (event: React.FormEvent) => { event.preventDefault(); return handleUnlockWith("password"); },
     handleUnlockWith,
     handleForgetDevice

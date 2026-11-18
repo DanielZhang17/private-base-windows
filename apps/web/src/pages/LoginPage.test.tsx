@@ -3,6 +3,7 @@ import { getByRole, queryByRole } from "@testing-library/dom";
 import { DeviceApprovalRequiredError, forgetSavedPasskeySetup, preparePasskeyDeviceSetup, readPendingPasskeySetup, resumePasskeyDeviceSetup } from "../lib/passkey-provision.js";
 import { signInWithNativePasskey } from "../lib/native-passkeys.js";
 import { capabilities } from "../platform/capabilities.js";
+import { biometricUnlock, canEnrollNativeUnlock, refreshNativeUnlockCapability } from "../platform/biometric-unlock.js";
 import * as passkeyHandoff from "../platform/passkeyHandoff.js";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -639,6 +640,126 @@ it("shows neutral copy when a native user chooses password-only setup", async ()
   expect(persistUnlock).not.toHaveBeenCalled();
 });
 
+it("takes first-device setup straight to password when native enrollment is unsupported", async () => {
+  vi.spyOn(capabilities, "nativePasskeys", "get").mockReturnValue(true);
+  vi.spyOn(capabilities, "nativePasskeyProvisioning", "get").mockReturnValue(true);
+  const invoke = vi.fn().mockRejectedValue("unsupported");
+  vi.stubGlobal("__TAURI_INTERNALS__", { invoke });
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlock: "windows-hello" });
+  vi.stubGlobal("navigator", { userAgent: "Windows", locks: { request: vi.fn() } });
+  const persistUnlock = vi.fn(() => biometricUnlock.enroll("setup-slot", new Uint8Array(32)));
+  const complete = vi.fn().mockResolvedValue(auth);
+  preparedFixture({ method: "native", pending: { deviceName: "PC", user: { username: "alice" } } as never,
+    canUsePasswordFallback: () => true, persistUnlock, complete, discard: vi.fn() });
+  await act(async () => root.render(<MemoryRouter><LoginPage /></MemoryRouter>));
+  await click("Sign in with a passkey");
+  await click("Continue");
+  await click("Use Windows Hello");
+  await act(async () => { await persistUnlock.mock.results[0].value.catch(() => undefined); });
+  expect(getByRole(container, "heading", { name: "Enter your password once" })).toBeTruthy();
+  expect(container.textContent).toContain("This device doesn't support setting up Windows Hello for Private Base.");
+  expect(queryByRole(container, "button", { name: "Use Windows Hello" })).toBeNull();
+  expect(canEnrollNativeUnlock()).toBe(false);
+
+  await act(async () => {
+    const input = container.querySelector<HTMLInputElement>('input[type="password"]')!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "account-password");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await submit();
+  expect(complete).toHaveBeenCalledExactlyOnceWith("account-password");
+  expect(invoke).toHaveBeenCalledOnce();
+});
+
+it("keeps a native passkey setup resumable while its unlock capability is being probed", async () => {
+  const invoke = vi.fn().mockResolvedValue("fingerprint");
+  vi.stubGlobal("__TAURI_INTERNALS__", { invoke });
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { androidBiometricProbe: true });
+  vi.mocked(readPendingPasskeySetup).mockResolvedValue({ setupId: "setup", stage: "unlockReady", backupPending: "native" } as never);
+  vi.mocked(keyManager.listLocalUnlockMethods).mockResolvedValue(["native"]);
+  vi.mocked(resumePasskeyDeviceSetup).mockResolvedValueOnce({
+    setupId: "setup", backupMethod: "native", chooseBackupPassword: vi.fn(), complete: vi.fn(),
+  });
+  await act(async () => root.render(<MemoryRouter><LoginPage /></MemoryRouter>));
+  expect(getByRole(container, "button", { name: "Unlock with biometrics" })).toBeTruthy();
+  await act(async () => { await refreshNativeUnlockCapability(); });
+  await click("Unlock with fingerprint");
+  expect(resumePasskeyDeviceSetup).toHaveBeenCalledWith("native", undefined, undefined, expect.any(AbortSignal), expect.any(Function));
+  expect(getByRole(container, "heading", { name: "Add password unlock" })).toBeTruthy();
+});
+
+it.each(["fresh", "saved"] as const)("can use password during a stalled native %s setup prompt", async mode => {
+  vi.spyOn(capabilities, "nativePasskeys", "get").mockReturnValue(true);
+  vi.spyOn(capabilities, "nativePasskeyProvisioning", "get").mockReturnValue(true);
+  const invoke = vi.fn(() => new Promise<string>(() => {}));
+  vi.stubGlobal("__TAURI_INTERNALS__", { invoke });
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlock: "windows-hello" });
+  vi.stubGlobal("navigator", { userAgent: "Windows", locks: { request: vi.fn() } });
+  const complete = vi.fn().mockResolvedValue(auth);
+  if (mode === "fresh") {
+    preparedFixture({ method: "native", pending: { deviceName: "PC", user: { username: "alice" } } as never,
+      canUsePasswordFallback: () => true, complete, discard: vi.fn(),
+      persistUnlock: (_password?: string, signal?: AbortSignal) => biometricUnlock.enroll("setup-slot", new Uint8Array(32), signal),
+    });
+  } else {
+    vi.mocked(readPendingPasskeySetup).mockResolvedValue({ setupId: "setup", stage: "unlockReady" } as never);
+    vi.mocked(keyManager.listLocalUnlockMethods).mockResolvedValue(["native", "password"]);
+    vi.mocked(resumePasskeyDeviceSetup)
+      .mockImplementationOnce(async (_method, _password, _replacement, signal) => {
+        await biometricUnlock.unlock("setup-slot", signal);
+        return auth as never;
+      })
+      .mockResolvedValueOnce(auth as never);
+  }
+  await act(async () => root.render(<MemoryRouter><LoginPage /></MemoryRouter>));
+  if (mode === "fresh") {
+    await click("Sign in with a passkey");
+    await click("Continue");
+    await click("Use Windows Hello");
+  } else await click("Unlock with Windows Hello");
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+
+  if (mode === "fresh") await click("Use password only");
+  await act(async () => {
+    const input = container.querySelector<HTMLInputElement>('input[type="password"]')!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "account-password");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(getByRole<HTMLButtonElement>(container, "button", { name: "Continue" }).disabled).toBe(false);
+  await submit();
+  if (mode === "fresh") expect(complete).toHaveBeenCalledExactlyOnceWith("account-password");
+  else expect(resumePasskeyDeviceSetup).toHaveBeenLastCalledWith("password", "account-password", undefined);
+  expect(applyAuthResponse).toHaveBeenCalledWith(auth);
+  expect(invoke).toHaveBeenCalledOnce();
+});
+
+it("consumes the native activation result when password is submitted after local unlock", async () => {
+  vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("windows-hello");
+  vi.mocked(readPendingPasskeySetup).mockResolvedValue({ setupId: "setup", stage: "unlockReady" } as never);
+  vi.mocked(keyManager.listLocalUnlockMethods).mockResolvedValue(["native", "password"]);
+  let finish!: (result: Awaited<ReturnType<typeof resumePasskeyDeviceSetup>>) => void;
+  const activating = new Promise<Awaited<ReturnType<typeof resumePasskeyDeviceSetup>>>(resolve => { finish = resolve; });
+  vi.mocked(resumePasskeyDeviceSetup).mockImplementationOnce(async (_method, _password, _replacement, _signal, onLocalUnlock) => {
+    onLocalUnlock?.();
+    return activating;
+  });
+  await act(async () => root.render(<MemoryRouter><LoginPage /></MemoryRouter>));
+  await act(async () => {
+    const input = container.querySelector<HTMLInputElement>('input[type="password"]')!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "account-password");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await click("Unlock with Windows Hello");
+  expect(getByRole<HTMLButtonElement>(container, "button", { name: "Continue" }).disabled).toBe(true);
+  // A queued submit must respect the phase change even if it bypasses the disabled button.
+  await submit();
+  expect(vi.mocked(resumePasskeyDeviceSetup).mock.calls[0][3]?.aborted).toBe(false);
+  expect(resumePasskeyDeviceSetup).toHaveBeenCalledOnce();
+  await act(async () => { finish(auth as never); });
+  expect(applyAuthResponse).toHaveBeenCalledExactlyOnceWith(auth);
+  expect(resumePasskeyDeviceSetup).toHaveBeenCalledOnce();
+});
+
 it.each(["add", "skip", "activation retry", "invalid password", "locked vault"])("restores the backup choice after reload (%s)", async choice => {
   vi.spyOn(capabilities, "passkeys", "get").mockReturnValue(true);
   vi.mocked(keyManager.listLocalUnlockMethods).mockResolvedValue(["passkey"]);
@@ -858,13 +979,15 @@ it("does not offer to erase an active vault after native redeem tries a differen
   expect(applyAuthResponse).not.toHaveBeenCalled();
 });
 
-it("waits for the native handoff to settle before restarting sign-in", async () => {
+it.each(["released", "timed out"] as const)("waits for the native handoff before restarting sign-in (%s)", async result => {
   vi.spyOn(capabilities, "passkeys", "get").mockReturnValue(false);
   vi.spyOn(capabilities, "nativePasskeys", "get").mockReturnValue(true);
   useAuthStore.setState({ device: { id: "existing-device" } } as never);
   vi.mocked(keyManager.hasLocalKeyMaterial).mockResolvedValue(true);
   let settle!: () => void;
-  const launcher = new Promise<void>(resolve => { settle = resolve; });
+  const launcher = new Promise<void>((resolve, reject) => {
+    settle = () => { if (result === "released") resolve(); else reject(new DOMException("Timed out", "TimeoutError")); };
+  });
   vi.spyOn(passkeyHandoff, "waitForNativePasskeyHandoff").mockReturnValue(launcher);
   vi.mocked(signInWithNativePasskey).mockImplementationOnce(async (_, handoff) => {
     handoff!.onHandoff("browser");
@@ -876,8 +999,14 @@ it("waits for the native handoff to settle before restarting sign-in", async () 
   expect(signInWithNativePasskey).toHaveBeenCalledOnce();
   expect(getByRole<HTMLButtonElement>(container, "button", { name: "Restart sign-in" }).disabled).toBe(true);
   await act(async () => settle());
-  expect(signInWithNativePasskey).toHaveBeenCalledTimes(2);
-  expect(applyAuthResponse).toHaveBeenCalledWith(linkedAuth);
+  if (result === "released") {
+    expect(signInWithNativePasskey).toHaveBeenCalledTimes(2);
+    expect(applyAuthResponse).toHaveBeenCalledWith(linkedAuth);
+  } else {
+    expect(signInWithNativePasskey).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Signing in wasn't finished in time.");
+    expect(getByRole(container, "button", { name: "Retry" })).toBeTruthy();
+  }
 });
 
 it("pauses approved-link requests at the cap and resumes the same request on manual retry", async () => {

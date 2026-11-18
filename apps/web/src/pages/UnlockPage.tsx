@@ -10,7 +10,7 @@ export default function UnlockPage() {
   const {
     redirectTo, auth, avatarSrc, passwordInput, password, setPassword, error,
     loading, confirmForget, setConfirmForget, handleUnlock, handleForgetDevice,
-    methodsRead, retryReadMethods,
+    methodsRead, retryReadMethods, nativeRecovery,
     unlockPhase, failureKind, retrySeconds, preferred, info, hasPassword, showPassword: usePassword, setChosenPassword, handleUnlockWith,
   } = useUnlock();
   const [showPassword, setShowPassword] = useState(false);
@@ -32,13 +32,14 @@ export default function UnlockPage() {
           {methodsRead === "failed" && <Notice tone="danger" action={<Button variant="secondary" onClick={retryReadMethods}>{t("retry")}</Button>}>
             {t("failedToUnlockThisDevice")}
           </Notice>}
+          {nativeRecovery && <Notice tone="warning">{nativeRecovery}</Notice>}
           {preferred && info && !usePassword && failureKind !== "invalidated" && <>
             <p className="text-center text-ink-muted">{preferred === "passkey" ? t("unlock.bodyPasskey") : t("unlock.bodyMethod", { method: info.name })}</p>
-            {error && !confirmForget && <Notice tone={failureKind === "temporary" ? "warning" : "danger"}>{error}</Notice>}
+            {error && !confirmForget && <Notice tone={failureKind === "temporary" || failureKind === "unsupported" ? "warning" : "danger"}>{error}</Notice>}
             <Button className="mt-auto sm:mt-0" size="lg" leadingIcon={info.icon} loading={loading} onClick={() => void handleUnlockWith(preferred)}>
               {unlockPhase === "unlocking" ? t("unlock.unlocking") : failureKind ? t("unlock.tryAgain") : info.label}
             </Button>
-            {hasPassword && <Button variant="ghost" disabled={loading} onClick={() => setChosenPassword(true)}>{t("unlock.usePasswordInstead")}</Button>}
+            {hasPassword && <Button variant="ghost" disabled={loading && preferred !== "native"} onClick={() => setChosenPassword(true)}>{t("unlock.usePasswordInstead")}</Button>}
           </>}
           {unlockPhase === "waiting" && info && <p role="status" className="text-sm text-ink-muted">{t("unlock.waiting", { method: info.name })}</p>}
           {usePassword ? <>

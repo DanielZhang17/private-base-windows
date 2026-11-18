@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { capabilities } from "./capabilities.js";
-import { createPasskeyHandoff, startPasskeyHandoff } from "./passkeyHandoff.js";
+import { createPasskeyHandoff, startPasskeyHandoff, waitForNativePasskeyHandoff } from "./passkeyHandoff.js";
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 const { webcrypto } = await vi.importActual<{ webcrypto: Crypto }>("node:crypto");
@@ -10,7 +10,7 @@ beforeEach(() => {
   vi.stubGlobal("window", { __TAURI_INTERNALS__: {}, __PRIVATEBASE_NATIVE_CAPABILITIES__: { passkeyHandoff: true } });
   invoke.mockReset();
 });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 it("generates independent state and a 32-byte verifier with its correct S256 challenge", async () => {
   const result = await createPasskeyHandoff();
   expect(result.state).toMatch(/^[A-Za-z0-9_-]{43}$/);
@@ -97,4 +97,40 @@ it("ignores the aborted callback and releases the native command before starting
   expect((await restarted).searchParams.get("code")).toBe("new");
   expect(invoke).toHaveBeenCalledTimes(2);
   expect(capabilities.nativePasskeys).toBe(true);
+});
+
+it("ends the web wait while reserving the launcher until the native session settles", async () => {
+  vi.useFakeTimers();
+  let release!: (error: string) => void;
+  invoke.mockImplementationOnce(() => new Promise<string>((_, reject) => { release = reject; }));
+  const expired = expect(startPasskeyHandoff(url)).rejects.toMatchObject({ localizedMessage: { key: "nativePasskeyFailed" } });
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+  await vi.advanceTimersByTimeAsync(180_000);
+  await expired;
+  expect(waitForNativePasskeyHandoff()).toBeDefined();
+
+  invoke.mockResolvedValueOnce(`privatebase://passkey?code=retry&state=${state}`);
+  const retry = startPasskeyHandoff(url);
+  await vi.advanceTimersByTimeAsync(119_000);
+  expect(invoke).toHaveBeenCalledOnce();
+  release("unsupported");
+  expect((await retry).searchParams.get("code")).toBe("retry");
+  expect(invoke).toHaveBeenCalledTimes(2);
+  expect(capabilities.nativePasskeys).toBe(true);
+});
+
+it("also bounds a standalone wait without releasing the native session", async () => {
+  vi.useFakeTimers();
+  let finish!: (result: string) => void;
+  invoke.mockImplementationOnce(() => new Promise<string>(resolve => { finish = resolve; }));
+  const expired = expect(startPasskeyHandoff(url)).rejects.toMatchObject({ localizedMessage: { key: "nativePasskeyFailed" } });
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+  const reservation = expect(waitForNativePasskeyHandoff()).rejects.toMatchObject({ name: "TimeoutError" });
+  await vi.advanceTimersByTimeAsync(180_000);
+  await Promise.all([expired, reservation]);
+  const stillOwned = waitForNativePasskeyHandoff();
+  expect(stillOwned).toBeDefined();
+  finish(`privatebase://passkey?code=old&state=${state}`);
+  await stillOwned;
+  expect(waitForNativePasskeyHandoff()).toBeUndefined();
 });

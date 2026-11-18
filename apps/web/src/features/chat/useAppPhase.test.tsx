@@ -1,7 +1,7 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { useAuthPhase } from "./useAppPhase.js";
+import { useAppLifecycle, useAuthPhase } from "./useAppPhase.js";
 import { updatePendingSetupRecord, readPendingSetupRecord } from "../../db/index.js";
-import { getLocalKeyOwner, hasLocalKeyMaterial, keysLoaded } from "../../lib/key-manager.js";
+import { getLocalKeyOwner, hasLocalKeyMaterial, keysLoaded, retryNativeKeyCleanup } from "../../lib/key-manager.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { setupDom } from "../../ui/test-utils.js";
 
@@ -44,4 +44,16 @@ it("rejects an old session paired with loaded keys from a different vault", asyn
   vi.mocked(keysLoaded).mockReturnValue(true);
   await render(<Probe />);
   await vi.waitFor(() => expect(container().textContent).toBe("anonymous"));
+});
+
+it("reconciles removals before sign-in and on focus with only removal support", async () => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlockRemove: true });
+  vi.mocked(retryNativeKeyCleanup).mockResolvedValue();
+  vi.mocked(retryNativeKeyCleanup).mockClear();
+  function Lifecycle() { useAppLifecycle("anonymous"); return null; }
+  await render(<Lifecycle />);
+  expect(retryNativeKeyCleanup).toHaveBeenCalledTimes(1);
+  window.dispatchEvent(new Event("focus"));
+  expect(retryNativeKeyCleanup).toHaveBeenCalledTimes(2);
 });

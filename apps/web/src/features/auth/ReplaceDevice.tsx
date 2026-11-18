@@ -18,6 +18,7 @@ export function ReplaceDevice({ flow, selectedId, select }: {
   const [password, setPassword] = useState("");
   const [selectedUnlock, setUnlock] = useState<UnlockMethod>();
   const unlock = selectedUnlock && flow.resumeMethods.includes(selectedUnlock) ? selectedUnlock : flow.resumeMethods[0];
+  const unlockLoading = flow.loading && !(unlock === "password" && flow.nativeUnlockPending);
   const selected = cap.devices.find(device => device.id === selectedId);
   const problem = flow.passkeySetupProblem;
   const replacementUnchanged = problem?.error === "replacement_not_needed";
@@ -33,7 +34,7 @@ export function ReplaceDevice({ flow, selectedId, select }: {
   const resumeFields = flow.savedPasskeySetupId && <>
     {flow.resumeMethods.length > 1 && <Field label={t("passkeySetup.chooseUnlock")}>
       <Select value={unlock} onChange={event => setUnlock(event.target.value as UnlockMethod)}>
-        {flow.resumeMethods.map(method => <option key={method} value={method}>{unlockMethodInfo(method, flow.capabilities.biometricUnlock).name}</option>)}
+        {flow.resumeMethods.map(method => <option key={method} value={method}>{unlockMethodInfo(method).name}</option>)}
       </Select>
     </Field>}
     {unlock === "password" && <Field label={t("passkeySetup.accountPassword")}>
@@ -49,7 +50,7 @@ export function ReplaceDevice({ flow, selectedId, select }: {
     {!canReplace && flow.error && problem?.error !== "limit_ticket_expired" && <Notice tone="danger">{flow.error}</Notice>}
     {canReplace
       ? <Button variant="secondary" onClick={() => setStep("choose")}>{t("replace.action")}</Button>
-      : <Button variant="secondary" loading={flow.loading}
+      : <Button variant="secondary" loading={unlockLoading}
         disabled={!!flow.savedPasskeySetupId && (!unlock || (unlock === "password" && !password))} onClick={() => {
         if (flow.savedPasskeySetupId) void flow.resumePasskeyUnlock(unlock, password);
         else if (flow.passkeySetup?.pending) void flow.retryPasskeySetup();
@@ -92,7 +93,7 @@ export function ReplaceDevice({ flow, selectedId, select }: {
     {problem?.error === "limit_ticket_expired" && <Notice tone="warning" action={<Button variant="secondary" onClick={() => void restart()}>
       {t("replace.usePasskey")}</Button>}>{t("replace.ticketExpired")}</Notice>}
     {replacementUnavailable && <Notice tone="warning" action={problem?.canContinue
-      ? <Button variant="secondary" loading={flow.loading} onClick={() => void flow.replacePasskeyDevice(null, undefined, resume)}>{t("continue")}</Button> : undefined}>
+      ? <Button variant="secondary" loading={unlockLoading} onClick={() => void flow.replacePasskeyDevice(null, undefined, resume)}>{t("continue")}</Button> : undefined}>
       {t(replacementUnchanged ? "replace.slotAvailable" : problem?.canContinue ? "replace.alreadyGone" : "deviceAlert.alreadyRemoved", { deviceName: selected.name })}
     </Notice>}
     <form className="grid gap-4" onSubmit={event => { event.preventDefault(); void flow.replacePasskeyDevice(selected.id, key.trim(), resume); }}>
@@ -101,7 +102,7 @@ export function ReplaceDevice({ flow, selectedId, select }: {
         <Textarea value={key} onChange={event => setKey(event.target.value)} autoComplete="off" spellCheck={false} required />
       </Field>
       {resumeFields}
-      <Button type="submit" variant="danger" size="lg" loading={flow.loading} disabled={problem?.error === "limit_ticket_expired" || replacementUnchanged}>
+      <Button type="submit" variant="danger" size="lg" loading={unlockLoading} disabled={problem?.error === "limit_ticket_expired" || replacementUnchanged}>
         {t("replace.confirm", { deviceName: selected.name })}
       </Button>
     </form>

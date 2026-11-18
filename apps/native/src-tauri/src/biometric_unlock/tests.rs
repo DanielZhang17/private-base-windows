@@ -74,36 +74,89 @@ fn only_definitive_public_key_export_errors_are_unsupported() {
 }
 
 #[test]
-fn hello_stays_available_after_a_transient_probe_failure() {
-    for probe in [Ok(true), Err(FAILED), Err("lockout")] {
-        assert!(offer_hello_at_startup(probe, || panic!(
-            "no slot lookup needed"
-        )));
-    }
-    for probe in [Ok(false), Err(UNSUPPORTED)] {
-        assert!(offer_hello_at_startup(probe, || true));
-        assert!(!offer_hello_at_startup(probe, || false));
-    }
+fn probe_distinguishes_supported_unavailable_and_retryable_failure() {
+    assert_eq!(probe_result(Ok(true)), Ok(Some("windows-hello")));
+    assert_eq!(probe_result(Ok(false)), Ok(None));
+    assert_eq!(probe_result(Err(UNSUPPORTED)), Ok(None));
+    assert_eq!(probe_result(Err(FAILED)), Err(FAILED));
 }
 
 #[test]
-fn a_stalled_probe_releases_startup_with_hello_still_retryable() {
+fn a_stalled_probe_releases_startup_and_can_be_retried() {
+    let probe = ReadinessProbe::default();
     let (release, blocked) = mpsc::channel();
-    let (finished, done) = mpsc::channel();
-    assert!(offer_hello_with_deadline(
-        Duration::from_millis(20),
-        move || {
-            // A deadline regression eventually returns false instead of hanging
-            // the test suite. The real path returns while this worker is blocked.
+    let (started, running) = mpsc::channel();
+    assert_eq!(
+        probe.check(Duration::from_millis(20), move || {
+            started.send(()).unwrap();
             let _ = blocked.recv_timeout(Duration::from_secs(2));
-            let _ = finished.send(());
-            false
-        }
-    ));
-    assert!(done.try_recv().is_err());
+            Ok(false)
+        }),
+        Err(FAILED)
+    );
+    running.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        probe.check(Duration::from_secs(1), || panic!("one OS query at a time")),
+        Err(FAILED)
+    );
     release.send(()).unwrap();
-    done.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(!offer_hello_with_deadline(Duration::from_secs(2), || false));
+    drop(probe.active.lock().unwrap());
+    assert_eq!(probe.check(Duration::from_secs(1), || Ok(true)), Ok(true));
+}
+
+#[test]
+fn enrollment_arguments_accept_locale_without_affecting_the_key() {
+    let body = serde_json::json!({
+        "vaultId": VAULT_ID,
+        "key": URL_SAFE_NO_PAD.encode([37; 32]),
+        "locale": "fr-CA",
+    });
+    let (vault, key) = enrollment_arguments(&body.into()).unwrap();
+    assert_eq!(vault, VAULT_ID);
+    assert_eq!(*key, [37; 32]);
+}
+
+#[test]
+fn queued_enrollment_excludes_cleanup_across_processes_until_it_settles() {
+    const LOCK_ROOT: &str = "PRIVATEBASE_TEST_BIOMETRIC_LOCK_ROOT";
+    if let Some(root) = std::env::var_os(LOCK_ROOT) {
+        assert!(matches!(
+            StoreLease::try_acquire(Path::new(&root)),
+            Err(FAILED)
+        ));
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let lease = StoreLease::try_acquire(root).unwrap();
+    let path = current_slot_path(root, VAULT_ID);
+    let slot = path.clone();
+    let enrollment = async move {
+        let _lease = lease;
+        fs::write(slot, b"wrapped fixture").unwrap();
+    };
+    // The enrollment is admitted even though its response future has never
+    // been polled. A restarted document or another process must retry removal.
+    assert!(matches!(StoreLease::try_acquire(root), Err(FAILED)));
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "biometric_unlock::tests::queued_enrollment_excludes_cleanup_across_processes_until_it_settles"])
+        .env(LOCK_ROOT, root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        child.status.success() && stdout.contains("1 passed"),
+        "{stdout}"
+    );
+    assert!(!path.exists());
+
+    tauri::async_runtime::block_on(enrollment);
+    for _ in 0..2 {
+        let _lease = StoreLease::try_acquire(root).unwrap();
+        remove_slot(&path, || Ok(())).unwrap();
+        assert!(!path.exists());
+    }
 }
 
 #[test]
@@ -403,7 +456,7 @@ fn removal_preserves_an_unidentifiable_legacy_slot_for_retry() {
 }
 
 #[test]
-fn ipc_rejects_all_three_commands_when_hello_is_unavailable() {
+fn ipc_rejects_all_four_commands_without_a_local_store() {
     use tauri::{
         ipc::CallbackFn,
         test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY},
@@ -413,14 +466,18 @@ fn ipc_rejects_all_three_commands_when_hello_is_unavailable() {
 
     // Supply unavailable state without running the OS probe or a Hello prompt.
     let state = BiometricUnlock(None);
-    assert_eq!(state.capability(), None);
+    assert_eq!(state.initial_readiness(), None);
+    let other_commands: fn(Invoke<tauri::test::MockRuntime>) -> bool = tauri::generate_handler![
+        biometric_unlock_probe,
+        biometric_unlock,
+        biometric_unlock_remove
+    ];
     let app = mock_builder()
         .manage(state)
-        .invoke_handler(tauri::generate_handler![
-            biometric_unlock_enroll,
-            biometric_unlock,
-            biometric_unlock_remove
-        ])
+        .invoke_handler(move |invoke| match invoke.message.command() {
+            "biometric_unlock_enroll" => dispatch_enrollment(invoke),
+            _ => other_commands(invoke),
+        })
         .build(mock_context(noop_assets()))
         .unwrap();
     let main = WebviewWindowBuilder::new(&app, "main", Default::default())
@@ -429,16 +486,17 @@ fn ipc_rejects_all_three_commands_when_hello_is_unavailable() {
     for (command, args) in [
         (
             "biometric_unlock_enroll",
-            serde_json::json!({ "vaultId": VAULT_ID, "key": URL_SAFE_NO_PAD.encode([0; 32]) }),
+            serde_json::json!({ "vaultId": VAULT_ID, "key": URL_SAFE_NO_PAD.encode([0; 32]), "locale": "de-DE" }),
         ),
         (
             "biometric_unlock",
-            serde_json::json!({ "vaultId": VAULT_ID }),
+            serde_json::json!({ "vaultId": VAULT_ID, "locale": "de-DE" }),
         ),
         (
             "biometric_unlock_remove",
             serde_json::json!({ "vaultId": VAULT_ID }),
         ),
+        ("biometric_unlock_probe", serde_json::json!({})),
     ] {
         let response = get_ipc_response(
             &main,

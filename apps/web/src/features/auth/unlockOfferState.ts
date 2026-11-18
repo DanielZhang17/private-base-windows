@@ -1,21 +1,6 @@
-import { useSyncExternalStore } from "react";
 import type { UnlockMethod } from "../../lib/device-key-vault.js";
-import { notifyUnlockMethodsChanged, subscribeToUnlockMethodChanges } from "../../lib/unlock-method-changes.js";
-import { NativeBiometricError, type BiometricUnlock } from "../../platform/biometric-unlock.js";
 import { capabilities } from "../../platform/capabilities.js";
-
-let unsupportedEnrollment: BiometricUnlock | undefined;
-
-export function useNativeEnrollmentUnsupported(native?: BiometricUnlock): boolean {
-  return useSyncExternalStore(subscribeToUnlockMethodChanges, () => !!native && native === unsupportedEnrollment);
-}
-
-export function reportUnsupportedNativeEnrollment(native: BiometricUnlock | undefined, error: unknown): boolean {
-  if (!native || !(error instanceof NativeBiometricError) || error.code !== "unsupported") return false;
-  unsupportedEnrollment = native;
-  notifyUnlockMethodsChanged();
-  return true;
-}
+import { canEnrollNativeUnlock, canProbeNativeUnlock } from "../../platform/biometric-unlock.js";
 
 export function unlockOfferFor(deviceId: string): "new" | "restore" | null {
   try {
@@ -25,7 +10,8 @@ export function unlockOfferFor(deviceId: string): "new" | "restore" | null {
 }
 
 export function markUnlockOffer(deviceId: string, methods: UnlockMethod[], invalidated: boolean) {
-  if (!invalidated && (!(capabilities.passkeys || capabilities.biometricUnlock) || methods.includes("passkey") || methods.includes("native"))) return;
+  if (!invalidated && (!(capabilities.passkeys || canEnrollNativeUnlock() || canProbeNativeUnlock()) ||
+    methods.includes("passkey") || methods.includes("native"))) return;
   try {
     if (invalidated || !localStorage.getItem(`unlock-offer-seen:${deviceId}`)) {
       sessionStorage.setItem(`unlock-offer:${deviceId}`, invalidated ? "restore" : "new");

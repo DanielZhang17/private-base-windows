@@ -3,7 +3,7 @@ import { useAuthStore } from "../../stores/authStore.js";
 import { getLocalKeyOwner, hasLocalKeyMaterial, keysLoaded, onKeysLocked, retryNativeKeyCleanup } from "../../lib/key-manager.js";
 import { isDatabaseUpgradeBlocked, readPendingSetupRecord, subscribeDatabaseUpgrade } from "../../db/index.js";
 import { useKeyMaintenance } from "../../components/app/useKeyMaintenance.js";
-import { capabilities } from "../../platform/capabilities.js";
+import { canRemoveNativeUnlock, refreshNativeUnlockCapability } from "../../platform/biometric-unlock.js";
 
 export type AuthPhase = "checking" | "database-blocked" | "database-error" | "anonymous" | "locked" | "unlocked";
 
@@ -52,6 +52,15 @@ export function useAuthPhase(): AuthPhase {
 
 export function useAppLifecycle(phase: AuthPhase) {
   useEffect(() => onKeysLocked(() => useAuthStore.getState().bumpSessionState()), []);
-  useEffect(() => { if (capabilities.biometricUnlock) void retryNativeKeyCleanup().catch(() => undefined); }, []);
+  useEffect(() => {
+    const refresh = () => {
+      if (canRemoveNativeUnlock()) void retryNativeKeyCleanup().catch(() => undefined);
+      void refreshNativeUnlockCapability();
+    };
+    refresh();
+    if (!canRemoveNativeUnlock()) return;
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, []);
   useKeyMaintenance(phase === "unlocked");
 }

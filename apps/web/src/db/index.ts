@@ -1473,6 +1473,7 @@ export async function updatePendingSetupRecord(
 }
 
 type ExpectedLocalKey = { id: string; type?: string; data?: string };
+type NativeJournalChange = { enrolled: string } | { remove: string };
 
 async function localKeysMatch(
   store: { get(id: string): Promise<LocalKey | undefined> },
@@ -1487,10 +1488,10 @@ export async function saveKeys(
   expected: ExpectedLocalKey[] = [],
   setup?: PendingSetupRecord,
   assertCurrent?: () => void,
-  nativeEnrollmentId?: string,
+  nativeJournal?: NativeJournalChange,
 ): Promise<void> {
   const db = await getAppDB();
-  const tx = db.transaction(["deviceKeys", "accountState"], "readwrite");
+  const tx = db.transaction(["deviceKeys", "accountState"], "readwrite", nativeJournal ? { durability: "strict" } : undefined);
   const keysStore = tx.objectStore("deviceKeys");
   const syncStore = tx.objectStore("accountState");
   if (setup && (await syncStore.get(setup.id))?.setupId !== setup.setupId) {
@@ -1501,14 +1502,22 @@ export async function saveKeys(
     await tx.done;
     throw new Error("Local keys changed in another session");
   }
-  const cleanupId = nativeEnrollmentId && NATIVE_REMOVAL_PREFIX + nativeEnrollmentId;
-  if (cleanupId && !await syncStore.getKey(cleanupId)) {
-    await tx.done;
-    throw new Error("Native unlock enrollment changed");
+  const enrollmentId = nativeJournal && "enrolled" in nativeJournal ? NATIVE_ENROLLMENT_PREFIX + nativeJournal.enrolled : undefined;
+  if (enrollmentId) {
+    const pending = await syncStore.get(enrollmentId) as NativeEnrollmentIntent | undefined;
+    if (!pending || pending.discarded) {
+      await tx.done;
+      throw new Error("Native unlock enrollment no longer owns the slot");
+    }
   }
   assertCurrent?.();
-  await Promise.all([...keys.map((key) => keysStore.put(key)), ...(setup ? [syncStore.put(setup)] : []),
-    ...(cleanupId ? [syncStore.delete(cleanupId)] : []), tx.done]);
+  await Promise.all([
+    ...keys.map((key) => keysStore.put(key)),
+    ...(setup ? [syncStore.put(setup)] : []),
+    ...(enrollmentId ? [syncStore.delete(enrollmentId)] : []),
+    ...(nativeJournal && "remove" in nativeJournal ? [syncStore.put({ id: NATIVE_REMOVAL_PREFIX + nativeJournal.remove })] : []),
+    tx.done,
+  ]);
 }
 
 export function sameLocalKey(a: LocalKey | undefined, b: LocalKey | undefined): boolean {
@@ -1516,26 +1525,56 @@ export function sameLocalKey(a: LocalKey | undefined, b: LocalKey | undefined): 
 }
 
 const NATIVE_REMOVAL_PREFIX = "native-unlock:remove:";
+// Legacy clients can drain every removal ID without taking the enrollment lock.
+const NATIVE_ENROLLMENT_PREFIX = "native-unlock:enroll:";
+const NATIVE_CLEANUP_CLAIM_ID = "native-unlock:cleanup-claim";
+const NATIVE_CLEANUP_CLAIM_MS = 30_000;
 
-function nativeRemovalRange() {
-  return IDBKeyRange.bound(NATIVE_REMOVAL_PREFIX, `${NATIVE_REMOVAL_PREFIX}\uffff`);
+type NativeEnrollmentIntent = { id: string; discarded?: true };
+
+function nativeJournalRange(prefix: string) {
+  return IDBKeyRange.bound(prefix, `${prefix}\uffff`);
 }
 
-export async function pendingResetNativeKeyIds(): Promise<string[]> {
-  const keys = await (await getAppDB()).getAllKeys("accountState", nativeRemovalRange());
-  return keys.map(id => String(id).slice(NATIVE_REMOVAL_PREFIX.length));
+async function nativeJournalKeyIds(prefix: string): Promise<string[]> {
+  const keys = await (await getAppDB()).getAllKeys("accountState", nativeJournalRange(prefix));
+  return keys.map(id => String(id).slice(prefix.length));
+}
+
+export const pendingResetNativeKeyIds = () => nativeJournalKeyIds(NATIVE_REMOVAL_PREFIX);
+export const pendingNativeEnrollmentIds = () => nativeJournalKeyIds(NATIVE_ENROLLMENT_PREFIX);
+
+export async function recordNativeEnrollment(keyId: string): Promise<void> {
+  const tx = (await getAppDB()).transaction("accountState", "readwrite", { durability: "strict" });
+  await Promise.all([tx.store.add({ id: NATIVE_ENROLLMENT_PREFIX + keyId }), tx.done]);
+}
+
+export async function abandonNativeEnrollment(keyId: string): Promise<void> {
+  const tx = (await getAppDB()).transaction("accountState", "readwrite", { durability: "strict" });
+  const id = NATIVE_ENROLLMENT_PREFIX + keyId;
+  if (await tx.store.getKey(id) !== undefined) {
+    await Promise.all([tx.store.put({ id: NATIVE_REMOVAL_PREFIX + keyId }), tx.store.delete(id), tx.done]);
+  } else await tx.done;
+}
+
+export async function claimNativeCleanup(owner: string, renew = false): Promise<boolean> {
+  const tx = (await getAppDB()).transaction("accountState", "readwrite");
+  const claim = await tx.store.get(NATIVE_CLEANUP_CLAIM_ID) as { owner: string; expiresAt: number } | undefined;
+  const now = Date.now();
+  const allowed = claim?.owner === owner || (!renew && (!claim || claim.expiresAt <= now));
+  if (allowed) await tx.store.put({ id: NATIVE_CLEANUP_CLAIM_ID, owner, expiresAt: now + NATIVE_CLEANUP_CLAIM_MS });
+  await tx.done;
+  return allowed;
+}
+
+export async function releaseNativeCleanup(owner: string): Promise<void> {
+  const tx = (await getAppDB()).transaction("accountState", "readwrite");
+  if ((await tx.store.get(NATIVE_CLEANUP_CLAIM_ID))?.owner === owner) await tx.store.delete(NATIVE_CLEANUP_CLAIM_ID);
+  await tx.done;
 }
 
 export async function clearResetNativeKeyId(keyId: string): Promise<void> {
   await (await getAppDB()).delete("accountState", NATIVE_REMOVAL_PREFIX + keyId);
-}
-
-export async function recordNativeKeyCleanup(keyId: string): Promise<void> {
-  await (await getAppDB()).add("accountState", { id: NATIVE_REMOVAL_PREFIX + keyId });
-}
-
-export async function hasNativeKeyCleanup(keyId: string): Promise<boolean> {
-  return !!(await (await getAppDB()).getKey("accountState", NATIVE_REMOVAL_PREFIX + keyId));
 }
 
 type NativeKeyForCleanup = (record: LocalKey | undefined) => string | undefined;
@@ -1543,18 +1582,21 @@ type NativeKeyForCleanup = (record: LocalKey | undefined) => string | undefined;
 export async function clearAll(expectedKey?: LocalKey, beforeClear?: () => void, nativeKeyForCleanup?: NativeKeyForCleanup): Promise<boolean> {
   const db = await getAppDB();
   const stores = Array.from(db.objectStoreNames);
-  const tx = db.transaction(stores, "readwrite");
+  const tx = db.transaction(stores, "readwrite", nativeKeyForCleanup ? { durability: "strict" } : undefined);
   if (expectedKey && !sameLocalKey(await tx.objectStore("deviceKeys").get(expectedKey.id), expectedKey)) {
     await tx.done;
     return false;
   }
   const sync = tx.objectStore("accountState");
-  const cleanupIds = await sync.getAllKeys(nativeRemovalRange());
+  const cleanup = await sync.getAll(nativeJournalRange(NATIVE_REMOVAL_PREFIX));
+  const enrolling = await sync.getAll(nativeJournalRange(NATIVE_ENROLLMENT_PREFIX)) as NativeEnrollmentIntent[];
+  const cleanupClaim = await sync.get(NATIVE_CLEANUP_CLAIM_ID);
   const nativeKeyId = nativeKeyForCleanup?.(await tx.objectStore("deviceKeys").get("dbKey"));
-  if (nativeKeyId) cleanupIds.push(NATIVE_REMOVAL_PREFIX + nativeKeyId);
+  if (nativeKeyId) cleanup.push({ id: NATIVE_REMOVAL_PREFIX + nativeKeyId });
   beforeClear?.();
   const clears = stores.map(name => tx.objectStore(name).clear());
-  await Promise.all([...clears, ...cleanupIds.map(id => sync.put({ id })),
+  await Promise.all([...clears, ...cleanup.map(row => sync.put(row)), ...(cleanupClaim ? [sync.put(cleanupClaim)] : []),
+    ...enrolling.map(row => sync.put({ ...row, discarded: true })),
     sync.put({ id: EDIT_KEY_RESET_ID, token: crypto.randomUUID() }), tx.done]);
   return true;
 }
@@ -1731,7 +1773,8 @@ export async function clearCryptoState(
   const recovered = new Map<string, { edit: LocalEditState; revision: Awaited<ReturnType<typeof recoverEditRevision>> }>();
   const stores = ["receiveSessions", "deviceKeys", "receiveSenderKeys", "receiveSenderKeyRecipients"] as const;
   for (;;) {
-    const tx = db.transaction([...stores, ...EDIT_MESSAGE_STORES, "accountState"], "readwrite");
+    const tx = db.transaction([...stores, ...EDIT_MESSAGE_STORES, "accountState"], "readwrite",
+      nativeKeyForCleanup ? { durability: "strict" } : undefined);
     const state = tx.objectStore("accountState");
     const currentVault = await tx.objectStore("deviceKeys").get("dbKey");
     if ((expectedSetupId && (await state.get("setup:pending"))?.setupId !== expectedSetupId)
@@ -1770,8 +1813,10 @@ export async function clearCryptoState(
       continue;
     }
     const nativeKeyId = nativeKeyForCleanup?.(currentVault);
+    const enrolling = await state.getAll(nativeJournalRange(NATIVE_ENROLLMENT_PREFIX)) as NativeEnrollmentIntent[];
     await Promise.all([...stores.map((name) => tx.objectStore(name).clear()),
       ...(nativeKeyId ? [state.put({ id: NATIVE_REMOVAL_PREFIX + nativeKeyId })] : []),
+      ...enrolling.map(row => state.put({ ...row, discarded: true })),
       state.delete("setup:pending"),
       state.delete(outgoingKeyRange(undefined, LOCKED_EDIT_PREFIX)),
       state.delete(outgoingKeyRange(undefined, OUTGOING_EDIT_PREFIX)),

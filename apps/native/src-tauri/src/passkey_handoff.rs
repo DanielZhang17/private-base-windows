@@ -315,7 +315,7 @@ pub(super) mod windows {
                 let biometrics = crate::biometric_unlock::BiometricUnlock::probe(
                     app.path().app_local_data_dir().ok(),
                 );
-                let biometric_capability = biometrics.capability();
+                let hello_readiness = biometrics.initial_readiness();
                 app.manage(biometrics);
                 let config = app
                     .config()
@@ -331,7 +331,7 @@ pub(super) mod windows {
                     .visible(false)
                     .initialization_script(crate::native_capabilities_script(
                         available,
-                        biometric_capability,
+                        hello_readiness,
                     ))
                     .build()?;
                 #[cfg(windows)]

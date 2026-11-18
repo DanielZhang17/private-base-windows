@@ -1,8 +1,8 @@
 use std::{
     fs::{self, File},
+    future::IntoFuture,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
     time::Duration,
 };
 
@@ -32,46 +32,53 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     check_credential, copy_and_wipe_signature, current_slot_path, hello_status, journal_enrollment,
-    offer_hello_at_startup, offer_hello_with_deadline, public_key_export_error, remove_vault_slots,
-    retry_pending_enrollments, seal, unseal, vault_challenge, vault_credential,
-    with_reproducible_signature, Key, Result, FAILED, INVALIDATED, RECORD_LEN, UNSUPPORTED,
+    public_key_export_error, remove_vault_slots, retry_pending_enrollments, seal, unseal,
+    vault_challenge, vault_credential, with_reproducible_signature, Key, ReadinessProbe, Result,
+    StoreLease, FAILED, INVALIDATED, RECORD_LEN, UNSUPPORTED,
 };
 
 const INSTALLATION_ID_FILE: &str = "installation-id";
 const MAX_DPAPI_BYTES: u64 = 4096;
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) struct Keystore {
     root: PathBuf,
-    operations: Mutex<()>,
-    offer_hello: bool,
+    probe: ReadinessProbe,
+    initial_readiness: bool,
 }
 
 impl Keystore {
     pub(super) fn probe(root: PathBuf) -> Option<Self> {
         // Use a dedicated MTA thread for the silent readiness query. Windows
         // credentials and attestation are handled only by explicit commands.
-        let probe_root = root.clone();
-        let offer_hello = offer_hello_with_deadline(STARTUP_PROBE_TIMEOUT, move || {
-            let readiness = (|| {
-                let _apartment = Apartment::initialize()?;
-                hello_supported()
-            })();
-            offer_hello_at_startup(readiness, || has_saved_slot(&probe_root))
-        });
+        let probe = ReadinessProbe::default();
+        let initial_readiness = probe
+            .check(STARTUP_PROBE_TIMEOUT, || {
+                hello_supported(STARTUP_PROBE_TIMEOUT)
+            })
+            .unwrap_or(false);
         Some(Self {
             root,
-            operations: Mutex::new(()),
-            offer_hello,
+            probe,
+            initial_readiness,
         })
     }
 
-    pub(super) fn offer_hello(&self) -> bool {
-        self.offer_hello
+    pub(super) fn initial_readiness(&self) -> bool {
+        self.initial_readiness
     }
 
-    pub(super) fn enroll(&self, vault: String, key: Key) -> Result<()> {
-        let _operation = self.operations.lock().map_err(|_| FAILED)?;
+    pub(super) fn check_readiness(&self) -> Result<bool> {
+        self.probe
+            .check(LIVE_PROBE_TIMEOUT, || hello_supported(LIVE_PROBE_TIMEOUT))
+    }
+
+    pub(super) fn admit(&self) -> Result<StoreLease> {
+        StoreLease::try_acquire(&self.root)
+    }
+
+    pub(super) fn enroll(&self, vault: String, key: Key, _lease: StoreLease) -> Result<()> {
         let _apartment = Apartment::initialize()?;
         let delete = |name: &str| delete_credential(&HSTRING::from(name));
         retry_pending_enrollments(&self.root, delete);
@@ -125,7 +132,7 @@ impl Keystore {
     }
 
     pub(super) fn unlock(&self, vault: String) -> Result<Key> {
-        let _operation = self.operations.lock().map_err(|_| FAILED)?;
+        let _operation = self.admit()?;
         let _apartment = Apartment::initialize()?;
         let installation = self.installation_id(false)?.ok_or(INVALIDATED)?;
         let challenge = vault_challenge(&installation, &vault);
@@ -146,7 +153,7 @@ impl Keystore {
     }
 
     pub(super) fn remove(&self, vault: String) -> Result<()> {
-        let _operation = self.operations.lock().map_err(|_| FAILED)?;
+        let _operation = self.admit()?;
         let _apartment = Apartment::initialize()?;
         remove_vault_slots(
             &self.root,
@@ -194,30 +201,25 @@ impl Keystore {
     }
 }
 
-fn hello_supported() -> Result<bool> {
-    KeyCredentialManager::IsSupportedAsync()
-        .and_then(|work| work.join())
-        .map_err(hello_service_error)
+fn hello_supported(timeout: Duration) -> Result<bool> {
+    let _apartment = Apartment::initialize()?;
+    let work = KeyCredentialManager::IsSupportedAsync().map_err(hello_service_error)?;
+    let result = tauri::async_runtime::block_on(async {
+        tokio::time::timeout(timeout, work.clone().into_future()).await
+    });
+    match result {
+        Ok(result) => result.map_err(hello_service_error),
+        Err(_) => {
+            let _ = work.Cancel();
+            Err(FAILED)
+        }
+    }
 }
 
 fn hello_service_error(error: Error) -> &'static str {
     match error.code() {
         REGDB_E_CLASSNOTREG | E_NOINTERFACE | E_NOTIMPL => UNSUPPORTED,
         _ => FAILED,
-    }
-}
-
-fn has_saved_slot(root: &Path) -> bool {
-    match fs::read_dir(root) {
-        Ok(mut entries) => entries.any(|entry| {
-            entry.map_or(true, |entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "dpapi" || ext == "pending-hello")
-            })
-        }),
-        Err(error) => error.kind() != io::ErrorKind::NotFound,
     }
 }
 
@@ -303,7 +305,13 @@ fn take_signature(buffer: IBuffer) -> Result<Zeroizing<Vec<u8>>> {
     if length > buffer.Capacity().map_err(|_| FAILED)? as usize || length > isize::MAX as usize {
         return Err(FAILED);
     }
-    let access: IBufferByteAccess = buffer.cast().map_err(|_| UNSUPPORTED)?;
+    let access: IBufferByteAccess = buffer.cast().map_err(|error| {
+        if error.code() == E_NOINTERFACE {
+            UNSUPPORTED
+        } else {
+            FAILED
+        }
+    })?;
     // SAFETY: the interface returns the address of its backing storage.
     let pointer = unsafe { access.Buffer() }.map_err(|_| FAILED)?;
     if pointer.is_null() {

@@ -12,7 +12,7 @@ mod updater;
 mod updater_policy;
 
 #[cfg(any(windows, test))]
-fn native_capabilities_script(passkey_handoff: bool, biometric_unlock: Option<&str>) -> String {
+fn native_capabilities_script(passkey_handoff: bool, hello_readiness: Option<bool>) -> String {
     let mut capabilities = serde_json::json!({
         "captureProtection": "full",
         "fileOpen": true,
@@ -21,8 +21,13 @@ fn native_capabilities_script(passkey_handoff: bool, biometric_unlock: Option<&s
     if passkey_handoff {
         capabilities["passkeyHandoff"] = true.into();
     }
-    if let Some(capability) = biometric_unlock {
-        capabilities["biometricUnlock"] = capability.into();
+    if let Some(ready) = hello_readiness {
+        capabilities["biometricUnlockKind"] = biometric_unlock::WINDOWS_HELLO.into();
+        capabilities["biometricUnlockProbe"] = true.into();
+        capabilities["biometricUnlockRemove"] = true.into();
+        if ready {
+            capabilities["biometricUnlock"] = biometric_unlock::WINDOWS_HELLO.into();
+        }
     }
     format!(
         "window.__PRIVATEBASE_NATIVE_CAPABILITIES__ = Object.assign(window.__PRIVATEBASE_NATIVE_CAPABILITIES__ || {{}}, {capabilities});"
@@ -39,7 +44,7 @@ fn native_invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync 
         #[cfg(any(windows, test))]
         capture_protection::set_capture_protection,
         #[cfg(any(windows, test))]
-        biometric_unlock::biometric_unlock_enroll,
+        biometric_unlock::biometric_unlock_probe,
         #[cfg(any(windows, test))]
         biometric_unlock::biometric_unlock,
         #[cfg(any(windows, test))]
@@ -54,6 +59,8 @@ fn native_invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync 
     move |invoke| match invoke.message.command() {
         #[cfg(any(windows, test))]
         "open_file" | "save_file" | "clear_open_cache" => files::dispatch(invoke),
+        #[cfg(any(windows, test))]
+        "biometric_unlock_enroll" => biometric_unlock::dispatch_enrollment(invoke),
         _ => other_commands(invoke),
     }
 }
@@ -110,9 +117,12 @@ mod tests {
 
     #[test]
     fn supported_biometric_script_preserves_existing_native_flags() {
-        let script = super::native_capabilities_script(true, Some("windows-hello"));
+        let script = super::native_capabilities_script(true, Some(true));
         for flag in [
             r#""biometricUnlock":"windows-hello""#,
+            r#""biometricUnlockKind":"windows-hello""#,
+            r#""biometricUnlockProbe":true"#,
+            r#""biometricUnlockRemove":true"#,
             r#""captureProtection":"full""#,
             r#""fileOpen":true"#,
             r#""fileSave":"dialog""#,
@@ -121,6 +131,16 @@ mod tests {
             assert!(script.contains(flag));
         }
         assert!(script.contains("Object.assign(window.__PRIVATEBASE_NATIVE_CAPABILITIES__ || {}"));
+    }
+
+    #[test]
+    fn advertises_probe_and_removal_even_without_initial_hello_readiness() {
+        let script = super::native_capabilities_script(false, Some(false));
+        assert!(script.contains(r#""biometricUnlockKind":"windows-hello""#));
+        assert!(script.contains(r#""biometricUnlockProbe":true"#));
+        assert!(script.contains(r#""biometricUnlockRemove":true"#));
+        assert!(!script.contains(r#""biometricUnlock":"#));
+        assert!(!script.contains(r#""biometricUnlockSingleDocument""#));
     }
 
     #[test]

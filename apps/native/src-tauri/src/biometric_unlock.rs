@@ -1,12 +1,17 @@
 use std::{
-    fs, io,
+    fs::{self, File},
+    io,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::{aead, hkdf};
+use tauri::{
+    ipc::{Invoke, InvokeBody, InvokeError},
+    Manager, Runtime,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(windows)]
@@ -19,6 +24,7 @@ type Key = Zeroizing<[u8; 32]>;
 const UNSUPPORTED: &str = "unsupported";
 const FAILED: &str = "failed";
 const INVALIDATED: &str = "invalidated";
+pub(crate) const WINDOWS_HELLO: &str = "windows-hello";
 
 pub(crate) struct BiometricUnlock(Option<Arc<Keystore>>);
 
@@ -31,11 +37,10 @@ impl BiometricUnlock {
         )
     }
 
-    pub(crate) fn capability(&self) -> Option<&'static str> {
-        self.0
-            .as_ref()
-            .filter(|keystore| keystore.offer_hello())
-            .map(|_| "windows-hello")
+    // None means the shell cannot access a local store. Some(false) still
+    // supports cleanup and live probes, independently of initial readiness.
+    pub(crate) fn initial_readiness(&self) -> Option<bool> {
+        self.0.as_ref().map(|keystore| keystore.initial_readiness())
     }
 
     fn keystore(&self) -> Result<Arc<Keystore>> {
@@ -52,11 +57,19 @@ impl Keystore {
         None
     }
 
-    fn enroll(&self, _: String, _: Key) -> Result<()> {
+    fn admit(&self) -> Result<StoreLease> {
         match *self {}
     }
 
-    fn offer_hello(&self) -> bool {
+    fn enroll(&self, _: String, _: Key, _: StoreLease) -> Result<()> {
+        match *self {}
+    }
+
+    fn initial_readiness(&self) -> bool {
+        match *self {}
+    }
+
+    fn check_readiness(&self) -> Result<bool> {
         match *self {}
     }
 
@@ -119,28 +132,62 @@ fn public_key_export_error(hresult: i32) -> &'static str {
     }
 }
 
-fn offer_hello_at_startup(probe: Result<bool>, has_saved_slot: impl FnOnce() -> bool) -> bool {
-    match probe {
-        Ok(false) | Err(UNSUPPORTED) => has_saved_slot(),
-        // An inconclusive probe must leave the action available. The command
-        // performs the live operation and can be retried after a failure.
-        Ok(true) | Err(_) => true,
+struct StoreLease {
+    _file: File,
+}
+
+impl StoreLease {
+    fn try_acquire(root: &Path) -> Result<Self> {
+        fs::create_dir_all(root).map_err(|_| FAILED)?;
+        // Keep the lock file at a stable path. All processes must lock the
+        // same file, including during journal recovery or after a crash.
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join("operations.lock"))
+            .map_err(|_| FAILED)?;
+        file.try_lock().map_err(|_| FAILED)?;
+        Ok(Self { _file: file })
     }
 }
 
-fn offer_hello_with_deadline(
-    timeout: Duration,
-    probe: impl FnOnce() -> bool + Send + 'static,
-) -> bool {
-    let (reply, result) = mpsc::sync_channel(1);
-    // A stuck OS query must not keep setup waiting. A late result is ignored
-    // and explicit commands query the live Windows state on their own workers.
-    let _ = std::thread::Builder::new()
-        .name("windows-hello-probe".into())
-        .spawn(move || {
-            let _ = reply.send(probe());
-        });
-    result.recv_timeout(timeout).unwrap_or(true)
+#[derive(Default)]
+struct ReadinessProbe {
+    active: Arc<Mutex<()>>,
+}
+
+impl ReadinessProbe {
+    fn check(
+        &self,
+        timeout: Duration,
+        probe: impl FnOnce() -> Result<bool> + Send + 'static,
+    ) -> Result<bool> {
+        let (reply, result) = mpsc::sync_channel(1);
+        let active = Arc::clone(&self.active);
+        // Bound the caller even if Windows stalls during the initial API call.
+        // One stuck OS call cannot accumulate workers across IPC retries.
+        std::thread::Builder::new()
+            .name("windows-hello-probe".into())
+            .spawn(move || {
+                let result = match active.try_lock() {
+                    Ok(_guard) => probe(),
+                    Err(_) => Err(FAILED),
+                };
+                let _ = reply.send(result);
+            })
+            .map_err(|_| FAILED)?;
+        result.recv_timeout(timeout).map_err(|_| FAILED)?
+    }
+}
+
+fn probe_result(readiness: Result<bool>) -> Result<Option<&'static str>> {
+    match readiness {
+        Ok(true) => Ok(Some(WINDOWS_HELLO)),
+        Ok(false) | Err(UNSUPPORTED) => Ok(None),
+        Err(_) => Err(FAILED),
+    }
 }
 
 fn copy_and_wipe_signature(source: &mut [u8]) -> Result<Zeroizing<Vec<u8>>> {
@@ -352,18 +399,51 @@ fn remove_record(path: &Path) -> Result<()> {
     }
 }
 
+fn enrollment_arguments(body: &InvokeBody) -> Result<(String, Key)> {
+    let InvokeBody::Json(args) = body else {
+        return Err(FAILED);
+    };
+    let vault = args
+        .get("vaultId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(FAILED)?;
+    validate_vault_id(vault)?;
+    let key = args
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(FAILED)?;
+    Ok((vault.to_owned(), decode_key(key)?))
+}
+
+pub(crate) fn dispatch_enrollment<R: Runtime>(invoke: Invoke<R>) -> bool {
+    let prepare = || -> Result<_> {
+        let window = invoke.message.webview_ref();
+        let state = window.try_state::<BiometricUnlock>().ok_or(UNSUPPORTED)?;
+        let keystore = state.keystore()?;
+        let (vault, key) = enrollment_arguments(invoke.message.payload())?;
+        // Admission runs after Tauri's ACL check and before scheduling the
+        // response. The lease is moved to the worker and survives web timeouts.
+        let lease = keystore.admit()?;
+        Ok((keystore, vault, key, lease))
+    };
+    match prepare() {
+        Ok((keystore, vault, key, lease)) => invoke.resolver.respond_async(async move {
+            tauri::async_runtime::spawn_blocking(move || keystore.enroll(vault, key, lease))
+                .await
+                .map_err(|_| InvokeError::from(FAILED))?
+                .map_err(InvokeError::from)
+        }),
+        Err(error) => invoke.resolver.reject(error),
+    }
+    true
+}
+
 #[tauri::command]
-pub(crate) async fn biometric_unlock_enroll(
+pub(crate) async fn biometric_unlock_probe(
     state: tauri::State<'_, BiometricUnlock>,
-    vault_id: String,
-    key: String,
-) -> Result<()> {
-    let key = Zeroizing::new(key);
+) -> Result<Option<&'static str>> {
     let keystore = state.keystore()?;
-    validate_vault_id(&vault_id)?;
-    let decoded = decode_key(&key)?;
-    drop(key);
-    tauri::async_runtime::spawn_blocking(move || keystore.enroll(vault_id, decoded))
+    tauri::async_runtime::spawn_blocking(move || probe_result(keystore.check_readiness()))
         .await
         .map_err(|_| FAILED)?
 }

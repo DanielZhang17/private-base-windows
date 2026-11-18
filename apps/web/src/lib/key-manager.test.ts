@@ -10,6 +10,20 @@ let db: typeof import("../db/index.js");
 let api: typeof import("../services/api.js")["api"];
 const password = "correct horse battery staple";
 
+function mockWebLocks() {
+  const held = new Set<string>();
+  const request = async <T>(name: string, options: LockOptions | LockGrantedCallback<T>, callback?: LockGrantedCallback<T>) => {
+    const run = typeof options === "function" ? options : callback!;
+    if (held.has(name) && typeof options !== "function" && options.ifAvailable) return run(null);
+    if (held.has(name)) throw new Error(`Unexpected overlapping lock: ${name}`);
+    held.add(name);
+    try { return await run({ name, mode: "exclusive" }); }
+    finally { held.delete(name); }
+  };
+  vi.stubGlobal("navigator", { userAgent: navigator.userAgent, locks: { request } });
+  return { request };
+}
+
 async function reload() {
   keys.lockLocalCryptoState();
   (await db.getAppDB()).close();
@@ -97,7 +111,564 @@ it("checks the captured vault inside the all-store reset transaction", async () 
   expect(await db.getMessageById("message")).toBeUndefined();
 });
 
+it.each(["Web Locks", "one privileged document"] as const)("journals before native IPC and commits the slot under %s", async mode => {
+  if (mode === "Web Locks") mockWebLocks();
+  else {
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlockSingleDocument: true });
+  }
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const remove = vi.spyOn(biometricUnlock, "remove").mockResolvedValue();
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockImplementation(async keyId => {
+    expect(await db.pendingNativeEnrollmentIds()).toEqual([keyId]);
+    const legacyRange = IDBKeyRange.bound("native-unlock:remove:", "native-unlock:remove:\uffff");
+    const legacyIds = await (await db.getAppDB()).getAllKeys("accountState", legacyRange);
+    expect(legacyIds).toEqual([]);
+    expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+    await keys.retryNativeKeyCleanup();
+    expect(remove).not.toHaveBeenCalled();
+  });
+  await keys.initializeKeys(password);
+  await keys.enrollLocalUnlockMethod({ method: "native" });
+  expect(enroll).toHaveBeenCalledOnce();
+  expect(await keys.listLocalUnlockMethods()).toEqual(["password", "native"]);
+  expect(await db.pendingNativeEnrollmentIds()).toEqual([]);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+  await keys.retryNativeKeyCleanup();
+  expect(remove).not.toHaveBeenCalled();
+});
+
+it.each(["existing vault", "new device", "native failure"] as const)("recovers journaled enrollment after an interrupted %s", async mode => {
+  mockWebLocks();
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const fresh = mode === "new device";
+  if (!fresh) await keys.initializeKeys(password);
+  const commit = fresh ? (await keys.prepareDeviceKeySetup("Phone", "ios")).commit : keys.enrollLocalUnlockMethod;
+  const items = new Set<string>();
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockImplementation(async id => {
+    expect(await db.pendingNativeEnrollmentIds()).toEqual([id]);
+    expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+    items.add(id);
+    if (mode === "native failure") throw new Error("native verification failed");
+  });
+  const failedRemove = vi.spyOn(biometricUnlock, "remove").mockRejectedValue(new Error("keystore unavailable"));
+  const deleteRecord = IDBObjectStore.prototype.delete;
+  const interrupt = vi.spyOn(IDBObjectStore.prototype, "delete").mockImplementation(function (this: IDBObjectStore, id) {
+    const request = deleteRecord.call(this, id);
+    if (this.name === "accountState" && this.transaction.objectStoreNames.contains("deviceKeys") &&
+        id === `native-unlock:enroll:${enroll.mock.calls[0]?.[0]}`) {
+      request.addEventListener("success", () => this.transaction.abort(), { once: true });
+    }
+    return request;
+  });
+  try { await expect(commit({ method: "native" })).rejects.toThrow(); }
+  finally { interrupt.mockRestore(); }
+  const id = enroll.mock.calls[0][0];
+  expect(failedRemove).toHaveBeenCalledExactlyOnceWith(id);
+  expect(await db.pendingNativeEnrollmentIds()).toEqual([]);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([id]);
+  expect(await keys.listLocalUnlockMethods()).toEqual(fresh ? [] : ["password"]);
+
+  keys.lockLocalCryptoState();
+  (await db.getAppDB()).close();
+  vi.resetModules();
+  keys = await import("./key-manager.js");
+  db = await import("../db/index.js");
+  const retry = vi.spyOn((await import("../platform/biometric-unlock.js")).biometricUnlock, "remove")
+    .mockImplementation(async keyId => { items.delete(keyId); });
+  await keys.retryNativeKeyCleanup();
+  expect(retry).toHaveBeenCalledExactlyOnceWith(id);
+  expect(items.size).toBe(0);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+});
+
+it("does not enroll without an exclusive claim and preserves unresolved intents during a removal-only reset", async () => {
+  vi.stubGlobal("navigator", {});
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockResolvedValue();
+  const remove = vi.spyOn(biometricUnlock, "remove").mockResolvedValue();
+  await keys.initializeKeys(password);
+  await expect(keys.enrollLocalUnlockMethod({ method: "native" })).rejects.toMatchObject({ code: "unsupported" });
+  expect(enroll).not.toHaveBeenCalled();
+  expect(await db.pendingNativeEnrollmentIds()).toEqual([]);
+  await db.recordNativeEnrollment("possibly-live");
+  await db.recordNativeEnrollment("retired");
+  await db.abandonNativeEnrollment("retired");
+  await expect(keys.resetLocalDevice()).resolves.toBe(true);
+  await vi.waitFor(() => expect(remove).toHaveBeenCalledExactlyOnceWith("retired"));
+  expect(await db.pendingNativeEnrollmentIds()).toEqual(["possibly-live"]);
+  await vi.waitFor(async () => expect(await db.pendingResetNativeKeyIds()).toEqual([]));
+  mockWebLocks();
+  await keys.retryNativeKeyCleanup({ background: false });
+  expect(remove).toHaveBeenLastCalledWith("possibly-live");
+  expect(await db.pendingNativeEnrollmentIds()).toEqual([]);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+});
+
+it.each(["device reset", "crypto reset"] as const)("fences a fresh native enrollment during %s", async mode => {
+  mockWebLocks();
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  let announce!: (id: string) => void;
+  let finish!: () => void;
+  const started = new Promise<string>(resolve => { announce = resolve; });
+  const prompt = new Promise<void>(resolve => { finish = resolve; });
+  vi.spyOn(biometricUnlock, "enroll").mockImplementation(async id => { announce(id); await prompt; });
+  const remove = vi.spyOn(biometricUnlock, "remove").mockResolvedValue();
+  const prepared = await keys.prepareDeviceKeySetup("Phone", "ios");
+  const commit = prepared.commit({ method: "native" }).catch((error: unknown) => error);
+  const id = await started;
+  try {
+    await expect(mode === "device reset" ? keys.resetLocalDevice() : keys.resetLocalCryptoState()).resolves.toBe(true);
+    expect(await db.pendingNativeEnrollmentIds()).toEqual([id]);
+    expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+    expect(remove).not.toHaveBeenCalled();
+  } finally { finish(); }
+  expect(await commit).toBeInstanceOf(keys.KeysLockedError);
+  expect(remove).toHaveBeenCalledExactlyOnceWith(id);
+  expect(await keys.listLocalUnlockMethods()).toEqual([]);
+  expect(await db.pendingNativeEnrollmentIds()).toEqual([]);
+  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+});
+
+it("claims lockless cleanup across documents, recovers an expired claim, and drains IDs in sequence", async () => {
+  vi.stubGlobal("navigator", {});
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  for (const id of ["a-fails", "b-cleared", "c-cleared"]) {
+    await db.recordNativeEnrollment(id);
+    await db.abandonNativeEnrollment(id);
+  }
+  const remove = vi.spyOn(biometricUnlock, "remove").mockImplementation(async id => {
+    // Simulate a competing document through its IndexedDB claim.
+    expect(await db.claimNativeCleanup("competing-document")).toBe(false);
+    await keys.retryNativeKeyCleanup();
+    if (id === "a-fails") throw new Error("temporary removal failure");
+  });
+  expect(await db.claimNativeCleanup("old-document")).toBe(true);
+  await keys.retryNativeKeyCleanup();
+  expect(remove).not.toHaveBeenCalled();
+  vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
+  await keys.retryNativeKeyCleanup();
+  expect(remove.mock.calls).toEqual([["a-fails"], ["b-cleared"], ["c-cleared"]]);
+  expect(await db.pendingResetNativeKeyIds()).toEqual(["a-fails"]);
+  remove.mockResolvedValue();
+  await keys.retryNativeKeyCleanup();
+  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+});
+
+it("reconciles a crashed cleanup claim on the next fresh enrollment attempt after it expires", async () => {
+  mockWebLocks();
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const remove = vi.spyOn(biometricUnlock, "remove").mockResolvedValue();
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockImplementation(async () => {
+    expect(remove).toHaveBeenCalledExactlyOnceWith("orphan");
+  });
+  const prepared = await keys.prepareDeviceKeySetup("Phone", "ios");
+  await db.recordNativeEnrollment("orphan");
+  expect(await db.claimNativeCleanup("crashed")).toBe(true);
+  await keys.retryNativeKeyCleanup();
+  await expect(prepared.commit({ method: "native" })).rejects.toThrow("Finish removing");
+  expect(remove).not.toHaveBeenCalled();
+  expect(enroll).not.toHaveBeenCalled();
+
+  vi.spyOn(Date, "now").mockReturnValue(Date.now() + 31_000);
+  await prepared.commit({ method: "native" });
+  expect(enroll).toHaveBeenCalledOnce();
+  expect(await keys.hasPendingNativeUnlockRemoval()).toBe(false);
+  expect(await keys.listLocalUnlockMethods()).toEqual(["native"]);
+});
+
+it("rechecks the cleanup journal after a concurrent enrollment commits without turning off the new slot", async () => {
+  mockWebLocks();
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  let announce!: () => void;
+  let finish!: () => void;
+  const started = new Promise<void>(resolve => { announce = resolve; });
+  const prompt = new Promise<void>(resolve => { finish = resolve; });
+  vi.spyOn(biometricUnlock, "enroll").mockImplementation(async () => { announce(); await prompt; });
+  const remove = vi.spyOn(biometricUnlock, "remove").mockResolvedValue();
+  await keys.initializeKeys(password);
+  const enrollment = keys.enrollLocalUnlockMethod({ method: "native" });
+  await started;
+  let retry: Promise<void>;
+  try {
+    expect(await keys.hasPendingNativeUnlockRemoval()).toBe(true);
+    retry = keys.retryNativeKeyCleanup({ background: false });
+  } finally { finish(); }
+  await Promise.all([enrollment, retry]);
+  expect(await keys.listLocalUnlockMethods()).toEqual(["password", "native"]);
+  expect(await keys.hasPendingNativeUnlockRemoval()).toBe(false);
+  expect(remove).not.toHaveBeenCalled();
+});
+
+it.each(["slot", "vault unlock", "account session"] as const)("rejects a queued turn-off when its initiating %s changes", async changed => {
+  mockWebLocks();
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const { readVault, vaultRecord } = await import("./device-key-vault.js");
+  const { removeAccountNativeUnlock } = await import("./passkey-provision.js");
+  const { useAuthStore } = await import("../stores/authStore.js");
+  useAuthStore.setState({ accessToken: "token", sessionId: "starting-session" });
+  vi.spyOn(biometricUnlock, "enroll").mockResolvedValue();
+  await keys.initializeKeys(password);
+  await keys.enrollLocalUnlockMethod({ method: "native" });
+  await db.recordNativeEnrollment("retired");
+  await db.abandonNativeEnrollment("retired");
+
+  let announce!: () => void;
+  let finish!: () => void;
+  const started = new Promise<void>(resolve => { announce = resolve; });
+  const hold = new Promise<void>(resolve => { finish = resolve; });
+  const remove = vi.spyOn(biometricUnlock, "remove").mockImplementationOnce(async () => { announce(); await hold; }).mockResolvedValue();
+  const cleanup = keys.retryNativeKeyCleanup({ background: false });
+  await started;
+  let outcome: Promise<unknown>;
+  try {
+    let captured!: () => void;
+    const snapshotCaptured = new Promise<void>(resolve => { captured = resolve; });
+    const getState = useAuthStore.getState;
+    vi.spyOn(useAuthStore, "getState").mockImplementation(() => { captured(); return getState(); });
+    // The first read captures the account, and the second validates the vault snapshot.
+    const getSession = vi.mocked(useAuthStore.getState);
+    outcome = removeAccountNativeUnlock().catch((error: unknown) => error);
+    await snapshotCaptured;
+    await vi.waitFor(() => expect(getSession).toHaveBeenCalledTimes(2));
+    if (changed === "slot") {
+      const vault = readVault(await db.getKey("dbKey"))!;
+      vault.slots.find(slot => slot.method === "native")!.keyId = "replacement";
+      await db.saveKeys([vaultRecord(vault)]);
+    } else if (changed === "vault unlock") {
+      await keys.loadKeys(password);
+    } else useAuthStore.setState({ sessionId: "different-session" });
+  } finally { finish(); }
+  await cleanup;
+  expect(await outcome).toBeInstanceOf(Error);
+  expect(await keys.listLocalUnlockMethods()).toEqual(["password", "native"]);
+  expect(remove).toHaveBeenCalledExactlyOnceWith("retired");
+});
+
+it("skips a different document's active Web Lock and recovers its journal once the lock is released", async () => {
+  const locks = mockWebLocks();
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const remove = vi.spyOn(biometricUnlock, "remove").mockResolvedValue();
+  await locks.request("privatebase-native-unlock", async () => {
+    await db.recordNativeEnrollment("uncommitted");
+    await keys.retryNativeKeyCleanup();
+    expect(remove).not.toHaveBeenCalled();
+  });
+  await keys.retryNativeKeyCleanup();
+  expect(remove).toHaveBeenCalledExactlyOnceWith("uncommitted");
+  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+});
+
+it("moves a pending removal written by an older client to the journal before startup cleanup", async () => {
+  mockWebLocks();
+  const { readVault, vaultRecord } = await import("./device-key-vault.js");
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  await keys.initializeKeys(password);
+  const vault = readVault(await db.getKey("dbKey"))!;
+  vault.pendingNativeRemoval = "legacy-slot";
+  await db.saveKeys([vaultRecord(vault)]);
+  keys.lockLocalCryptoState();
+  const remove = vi.spyOn(biometricUnlock, "remove").mockImplementationOnce(async id => {
+    expect(await db.pendingResetNativeKeyIds()).toEqual([id]);
+    expect(readVault(await db.getKey("dbKey"))?.pendingNativeRemoval).toBeUndefined();
+  });
+  await keys.retryNativeKeyCleanup();
+  expect(remove).toHaveBeenCalledExactlyOnceWith("legacy-slot");
+  expect(await keys.hasPendingNativeUnlockRemoval()).toBe(false);
+  expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+});
+
+it("enrolls on the first attempt after migrating legacy removal metadata in the vault", async () => {
+  mockWebLocks();
+  const { readVault, vaultRecord } = await import("./device-key-vault.js");
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  await keys.initializeKeys(password);
+  const vault = readVault(await db.getKey("dbKey"))!;
+  vault.pendingNativeRemoval = "legacy-slot";
+  await db.saveKeys([vaultRecord(vault)]);
+  const remove = vi.spyOn(biometricUnlock, "remove").mockResolvedValue();
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockImplementation(async () => {
+    expect(remove).toHaveBeenCalledExactlyOnceWith("legacy-slot");
+  });
+  await keys.enrollLocalUnlockMethod({ method: "native" });
+  expect(enroll).toHaveBeenCalledOnce();
+  expect(await keys.listLocalUnlockMethods()).toEqual(["password", "native"]);
+  expect(await keys.hasPendingNativeUnlockRemoval()).toBe(false);
+  expect(remove).toHaveBeenCalledOnce();
+});
+
+it.each(["password", "native"] as const)("offers %s during native passkey setup according to enrollment coordination", async method => {
+  if (method === "native") mockWebLocks();
+  else vi.stubGlobal("navigator", { userAgent: "Macintosh" });
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlock: "touchid", passkeyHandoff: true, passkeyProvisionHandoff: true });
+  const nativePasskeys = await import("./native-passkeys.js");
+  const { beginPasskeyDeviceSetup } = await import("./passkey-provision.js");
+  const authorize = vi.spyOn(nativePasskeys, "authorizeNativePasskeyProvision").mockImplementation(async (_hash, _bundle, setupId) => async () => ({
+    setupId, user: { id: "user", username: "alice" }, deviceId: "linked", deviceName: "Mac",
+    platform: "macos", expiresAt: Date.now() + 60_000, setupToken: "setup-token",
+  }));
+  const attempt = await beginPasskeyDeviceSetup("Mac");
+  try {
+    expect(authorize).toHaveBeenCalledOnce();
+    expect(attempt.pending?.deviceId).toBe("linked");
+    expect(attempt.method).toBe(method);
+  } finally { await attempt.discard(); }
+});
+
+it("uses a capability discovered during the native passkey handoff", async () => {
+  vi.stubGlobal("navigator", { userAgent: "Android" });
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { androidBiometricProbe: true, passkeyHandoff: true, passkeyProvisionHandoff: true });
+  const invoke = vi.fn().mockResolvedValue("fingerprint");
+  vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
+  try {
+    const { refreshNativeUnlockCapability } = await import("../platform/biometric-unlock.js");
+    const nativePasskeys = await import("./native-passkeys.js");
+    const { beginPasskeyDeviceSetup } = await import("./passkey-provision.js");
+    vi.spyOn(nativePasskeys, "authorizeNativePasskeyProvision").mockImplementation(async (_hash, _bundle, setupId) => {
+      await refreshNativeUnlockCapability();
+      return async () => ({
+        setupId, user: { id: "user", username: "alice" }, deviceId: "linked", deviceName: "Phone",
+        platform: "android", expiresAt: Date.now() + 60_000, setupToken: "setup-token",
+      });
+    });
+    const attempt = await beginPasskeyDeviceSetup("Phone");
+    try {
+      expect(invoke).toHaveBeenCalledExactlyOnceWith("biometric_unlock_probe", undefined);
+      expect(attempt.method).toBe("native");
+    } finally { attempt.discard(); }
+  } finally { vi.doUnmock("@tauri-apps/api/core"); }
+});
+
+it.each(["stalled", "available"] as const)("returns the redeemed attempt without waiting for the optional probe (%s)", async result => {
+  vi.stubGlobal("navigator", { userAgent: "Android" });
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { androidBiometricProbe: true, passkeyHandoff: true, passkeyProvisionHandoff: true });
+  let finishProbe!: (kind: string | null) => void;
+  const probe = new Promise<string | null>(resolve => { finishProbe = resolve; });
+  let announceProbe!: () => void;
+  const probeStarted = new Promise<void>(resolve => { announceProbe = resolve; });
+  const invoke = vi.fn(() => { announceProbe(); return probe; });
+  vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
+  try {
+    const nativePasskeys = await import("./native-passkeys.js");
+    const { preparePasskeyDeviceSetup } = await import("./passkey-provision.js");
+    const { refreshNativeUnlockCapability } = await import("../platform/biometric-unlock.js");
+    const prepared = await preparePasskeyDeviceSetup("Phone");
+    const redeem = vi.fn().mockResolvedValue({
+      setupId: prepared.setupId, user: { id: "user", username: "alice" }, deviceId: "linked", deviceName: "Phone",
+      platform: "android", expiresAt: Date.now() + 60_000, setupToken: "setup-token",
+    });
+    vi.spyOn(nativePasskeys, "authorizeNativePasskeyProvision").mockResolvedValue(redeem);
+    const attempt = await prepared.authorize();
+    await probeStarted;
+    expect(redeem).toHaveBeenCalledOnce();
+    expect(await db.readPendingSetupRecord()).toMatchObject({ stage: "provisioned" });
+    expect(attempt.method).toBe("password");
+    if (result === "available") {
+      finishProbe("fingerprint");
+      await refreshNativeUnlockCapability();
+      expect(attempt.method).toBe("native");
+    } else {
+      vi.mocked(api.post).mockResolvedValueOnce({ verified: true });
+      await attempt.persistUnlock(password);
+      expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+    }
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("biometric_unlock_probe", undefined);
+    attempt.discard();
+  } finally {
+    finishProbe(null);
+    vi.doUnmock("@tauri-apps/api/core");
+  }
+});
+
+it("switches fresh setup to password without waiting on the native enrollment or its cleanup", async () => {
+  mockWebLocks();
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlock: "touchid", passkeyHandoff: true, passkeyProvisionHandoff: true });
+  let finishEnroll!: () => void;
+  let finishRemoval!: () => void;
+  const enroll = new Promise<void>(resolve => { finishEnroll = resolve; });
+  const removal = new Promise<void>(resolve => { finishRemoval = resolve; });
+  const invoke = vi.fn((command: string, _args?: { vaultId: string }) => command === "biometric_unlock_enroll" ? enroll : removal);
+  vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
+  try {
+    const nativePasskeys = await import("./native-passkeys.js");
+    const { beginPasskeyDeviceSetup } = await import("./passkey-provision.js");
+    vi.spyOn(nativePasskeys, "authorizeNativePasskeyProvision").mockImplementation(async (_hash, _bundle, setupId) => async () => ({
+      setupId, user: { id: "user", username: "alice" }, deviceId: "linked", deviceName: "Mac",
+      platform: "macos", expiresAt: Date.now() + 60_000, setupToken: "setup-token",
+    }));
+    const attempt = await beginPasskeyDeviceSetup("Mac");
+    const controller = new AbortController();
+    const stopped = expect(attempt.persistUnlock(undefined, controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("biometric_unlock_enroll", expect.any(Object)));
+    controller.abort();
+    await stopped;
+    vi.mocked(api.post).mockResolvedValueOnce({ verified: true });
+    await attempt.persistUnlock(password);
+    expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+    const { vaultId } = invoke.mock.calls[0][1]!;
+    expect(await db.pendingResetNativeKeyIds()).toEqual([vaultId]);
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("biometric_unlock_remove", { vaultId }));
+    finishEnroll();
+    finishRemoval();
+    await vi.waitFor(async () => expect(await keys.hasPendingNativeUnlockRemoval()).toBe(false));
+    expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+    attempt.discard();
+  } finally {
+    finishEnroll();
+    finishRemoval();
+    vi.doUnmock("@tauri-apps/api/core");
+  }
+});
+
+it.each(["password only", "backup password"] as const)("honors %s when the native slot is already committed", async choice => {
+  mockWebLocks();
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlock: "touchid", passkeyHandoff: true, passkeyProvisionHandoff: true });
+  const { beginPasskeyDeviceSetup } = await import("./passkey-provision.js");
+  const nativePasskeys = await import("./native-passkeys.js");
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  vi.spyOn(nativePasskeys, "authorizeNativePasskeyProvision").mockImplementation(async (_hash, _bundle, setupId) => async () => ({
+    setupId, user: { id: "user", username: "alice" }, deviceId: "linked", deviceName: "Mac",
+    platform: "macos", expiresAt: Date.now() + 60_000, setupToken: "setup-token",
+  }));
+  const enroll = vi.spyOn(biometricUnlock, "enroll").mockResolvedValue();
+  let finishRemoval!: () => void;
+  const remove = vi.spyOn(biometricUnlock, "remove").mockReturnValue(new Promise<void>(resolve => { finishRemoval = resolve; }));
+  const attempt = await beginPasskeyDeviceSetup("Mac");
+  try {
+    const controller = new AbortController();
+    const put = IDBObjectStore.prototype.put;
+    const abortDuringCommit = vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (this: IDBObjectStore, value, key) {
+      const request = put.call(this, value, key);
+      if (choice === "password only" && this.name === "deviceKeys" && value.id === "dbKey") controller.abort();
+      return request;
+    });
+    try { await attempt.persistUnlock(undefined, controller.signal); }
+    finally { abortDuringCommit.mockRestore(); }
+    expect(await keys.listLocalUnlockMethods()).toEqual(["native"]);
+    expect(controller.signal.aborted).toBe(choice === "password only");
+
+    const keyId = enroll.mock.calls[0][0];
+    vi.mocked(api.post).mockImplementation(async path => {
+      if (path === "/auth/password/verify") return { verified: true };
+      expect(path).toBe("/auth/passkey/provision/complete");
+      expect(await keys.listLocalUnlockMethods()).toEqual(choice === "password only" ? ["password"] : ["native", "password"]);
+      expect(await db.pendingResetNativeKeyIds()).toEqual(choice === "password only" ? [keyId] : []);
+      return { device: { id: "linked" } };
+    });
+    if (choice === "password only") {
+      await expect(attempt.complete(password)).resolves.toMatchObject({ device: { id: "linked" } });
+      await vi.waitFor(() => expect(remove).toHaveBeenCalledExactlyOnceWith(keyId));
+      keys.lockLocalCryptoState();
+      await expect(keys.loadKeys(password)).resolves.toBeUndefined();
+      finishRemoval();
+      await vi.waitFor(async () => expect(await db.pendingResetNativeKeyIds()).toEqual([]));
+    } else {
+      await attempt.chooseBackupPassword(password);
+      await expect(attempt.complete()).resolves.toMatchObject({ device: { id: "linked" } });
+      expect(remove).not.toHaveBeenCalled();
+    }
+  } finally {
+    finishRemoval();
+    attempt.discard();
+  }
+});
+
+it.each([false, true])("ends native takeover before resumed setup reaches the server (replacement=%s)", async replace => {
+  mockWebLocks();
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const { resumePasskeyDeviceSetup } = await import("./passkey-provision.js");
+  let key!: Uint8Array;
+  vi.spyOn(biometricUnlock, "enroll").mockImplementation(async (_id, raw) => { key = raw.slice(); });
+  vi.spyOn(biometricUnlock, "unlock").mockImplementation(async () => key.slice());
+  const prepared = await keys.prepareDeviceKeySetup("Mac", "macos");
+  const checkpoint = { id: "setup:pending" as const, setupId: "setup", bundleHash: "digest", createdAt: Date.now() };
+  await db.updatePendingSetupRecord({ ...checkpoint, stage: "prepared" });
+  await prepared.commit({ method: "native" }, {
+    record: { ...checkpoint, deviceId: "linked", stage: "unlockReady", backupPending: false },
+    owner: { userId: "user", username: "alice", deviceId: "linked" },
+  });
+  keys.lockLocalCryptoState();
+
+  const pending = { ...checkpoint, user: { id: "user", username: "alice" }, deviceId: "linked", deviceName: "Mac",
+    platform: "macos", expiresAt: Date.now() + 60_000, setupToken: "setup-token" };
+  const localUnlockEnded = vi.fn();
+  vi.mocked(api.post).mockImplementation(async path => {
+    expect(localUnlockEnded).toHaveBeenCalledOnce();
+    if (path.endsWith("/resume-options")) return { challengeId: "challenge" };
+    if (path.endsWith("/complete")) return { device: { id: "linked" } };
+    return pending;
+  });
+  const replacement = replace ? { limitTicket: "ticket", revokeDeviceId: "other" } : undefined;
+  await expect(resumePasskeyDeviceSetup("native", undefined, replacement, new AbortController().signal, localUnlockEnded))
+    .resolves.toMatchObject({ device: { id: "linked" } });
+  expect(vi.mocked(api.post).mock.calls.map(([path]) => path)).toEqual([
+    "/auth/passkey/provision/resume-options", "/auth/passkey/provision/resume",
+    ...(replace ? ["/auth/passkey/provision/replace"] : []), "/auth/passkey/provision/complete",
+  ]);
+});
+
+it("remembers unsupported native setup and persists the same attempt with a password", async () => {
+  mockWebLocks();
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlock: "windows-hello", passkeyHandoff: true, passkeyProvisionHandoff: true });
+  const invoke = vi.fn().mockRejectedValueOnce({ code: "unsupported" }).mockResolvedValueOnce(undefined);
+  vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
+  try {
+    const { canEnrollNativeUnlock } = await import("../platform/biometric-unlock.js");
+    const nativePasskeys = await import("./native-passkeys.js");
+    const { beginPasskeyDeviceSetup } = await import("./passkey-provision.js");
+    vi.spyOn(nativePasskeys, "authorizeNativePasskeyProvision").mockImplementation(async (_hash, _bundle, setupId) => async () => ({
+      setupId, user: { id: "user", username: "alice" }, deviceId: "linked", deviceName: "PC",
+      platform: "windows", expiresAt: Date.now() + 60_000, setupToken: "setup-token",
+    }));
+    vi.mocked(api.post).mockResolvedValue({ verified: true });
+    const attempt = await beginPasskeyDeviceSetup("PC");
+    try {
+      expect(attempt.method).toBe("native");
+      await expect(attempt.persistUnlock()).rejects.toMatchObject({ code: "unsupported" });
+      expect(attempt.method).toBe("password");
+      expect(canEnrollNativeUnlock()).toBe(false);
+      await expect(attempt.persistUnlock(password)).resolves.toBeUndefined();
+      await expect(keys.listLocalUnlockMethods()).resolves.toEqual(["password"]);
+      expect(invoke.mock.calls.map(([command]) => command)).toEqual(["biometric_unlock_enroll", "biometric_unlock_remove"]);
+    } finally { attempt.discard(); }
+  } finally { vi.doUnmock("@tauri-apps/api/core"); }
+});
+
+it("refreshes capability after the slot commits and keeps cleanup available if the refresh loses the capability", async () => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlock: "android-biometric", androidBiometricProbe: true });
+  vi.stubGlobal("navigator", { userAgent: "Android" });
+  const invoke = vi.fn()
+    .mockResolvedValueOnce(undefined)
+    .mockImplementationOnce(async () => {
+      expect(await keys.listLocalUnlockMethods()).toEqual(["password", "native"]);
+      expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+      throw { code: "failed" };
+    })
+    .mockResolvedValueOnce(undefined);
+  vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
+  try {
+    const { nativeUnlockStatus } = await import("../platform/biometric-unlock.js");
+    await keys.initializeKeys(password);
+    await keys.enrollLocalUnlockMethod({ method: "native" });
+    await vi.waitFor(() => expect(nativeUnlockStatus()).toMatchObject({ available: undefined, probeFailed: true }));
+    const { vaultId } = invoke.mock.calls[0][1];
+    await keys.removeLocalUnlockMethod("native");
+    expect(invoke).toHaveBeenNthCalledWith(2, "biometric_unlock_probe", undefined);
+    expect(invoke).toHaveBeenNthCalledWith(3, "biometric_unlock_remove", { vaultId });
+    expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
+  } finally { vi.doUnmock("@tauri-apps/api/core"); }
+});
+
 it("persists a native key removal retry across reloads without keeping the slot usable", async () => {
+  mockWebLocks();
   const { biometricUnlock } = await import("../platform/biometric-unlock.js");
   const enroll = vi.spyOn(biometricUnlock, "enroll").mockResolvedValue();
   await keys.initializeKeys(password);
@@ -123,65 +694,8 @@ it("persists a native key removal retry across reloads without keeping the slot 
   expect(retry).toHaveBeenCalledOnce();
 });
 
-it("journals native enrollment before IPC and protects an active enrollment from recovery", async () => {
-  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
-  const remove = vi.spyOn(biometricUnlock, "remove").mockResolvedValue();
-  const enroll = vi.spyOn(biometricUnlock, "enroll").mockImplementation(async keyId => {
-    expect(await db.pendingResetNativeKeyIds()).toEqual([keyId]);
-    expect(await keys.listLocalUnlockMethods()).toEqual(["password"]);
-    await keys.retryNativeKeyCleanup();
-    expect(remove).not.toHaveBeenCalled();
-  });
-  await keys.initializeKeys(password);
-  await keys.enrollLocalUnlockMethod({ method: "native" });
-  expect(enroll).toHaveBeenCalledOnce();
-  expect(await keys.listLocalUnlockMethods()).toEqual(["password", "native"]);
-  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
-  await keys.retryNativeKeyCleanup();
-  expect(remove).not.toHaveBeenCalled();
-});
-
-it.each(["existing vault", "fresh setup"])("recovers native enrollment after an aborted slot commit for %s", async mode => {
-  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
-  const enroll = vi.spyOn(biometricUnlock, "enroll").mockImplementation(async id => {
-    expect(await db.pendingResetNativeKeyIds()).toEqual([id]);
-  });
-  const remove = vi.spyOn(biometricUnlock, "remove").mockRejectedValue(new Error("keystore unavailable"));
-  const setup = { method: "native" } as const;
-  let commit: () => Promise<void>;
-  if (mode === "existing vault") {
-    await keys.initializeKeys(password);
-    commit = () => keys.enrollLocalUnlockMethod(setup);
-  } else {
-    const prepared = await keys.prepareDeviceKeySetup("Laptop", "web");
-    commit = () => prepared.commit(setup);
-  }
-  const before = await db.getKey("dbKey");
-  const originalDelete = IDBObjectStore.prototype.delete;
-  const interrupt = vi.spyOn(IDBObjectStore.prototype, "delete").mockImplementation(function (this: IDBObjectStore, id) {
-    const request = originalDelete.call(this, id);
-    if (typeof id === "string" && id.startsWith("native-unlock:remove:")) this.transaction.abort();
-    return request;
-  });
-  await expect(commit()).rejects.toThrow();
-  interrupt.mockRestore();
-  const keyId = enroll.mock.calls[0][0];
-  expect(remove).toHaveBeenCalledExactlyOnceWith(keyId);
-  expect(await db.getKey("dbKey")).toEqual(before);
-  expect(await db.pendingResetNativeKeyIds()).toEqual([keyId]);
-
-  keys.lockLocalCryptoState();
-  (await db.getAppDB()).close();
-  vi.resetModules();
-  db = await import("../db/index.js");
-  keys = await import("./key-manager.js");
-  const retry = vi.spyOn((await import("../platform/biometric-unlock.js")).biometricUnlock, "remove").mockResolvedValue();
-  await keys.retryNativeKeyCleanup();
-  expect(retry).toHaveBeenCalledExactlyOnceWith(keyId);
-  expect(await db.pendingResetNativeKeyIds()).toEqual([]);
-});
-
 it.each(["device reset", "crypto reset"])("keeps the native cleanup handle across %s and a restart", async mode => {
+  mockWebLocks();
   const { biometricUnlock } = await import("../platform/biometric-unlock.js");
   const enroll = vi.spyOn(biometricUnlock, "enroll").mockResolvedValue();
   await keys.initializeKeys(password);
@@ -194,7 +708,7 @@ it.each(["device reset", "crypto reset"])("keeps the native cleanup handle acros
   });
   const reset = mode === "device reset" ? keys.resetLocalDevice : keys.resetLocalCryptoState;
   await expect(reset()).resolves.toBe(true);
-  expect(remove).toHaveBeenCalledExactlyOnceWith(keyId);
+  await vi.waitFor(() => expect(remove).toHaveBeenCalledExactlyOnceWith(keyId));
   expect(await db.pendingResetNativeKeyIds()).toEqual([keyId]);
   await db.clearAll();
   (await db.getAppDB()).close();
@@ -206,6 +720,44 @@ it.each(["device reset", "crypto reset"])("keeps the native cleanup handle acros
   await keys.retryNativeKeyCleanup();
   expect(retry).toHaveBeenCalledExactlyOnceWith(keyId);
   expect(await db.pendingResetNativeKeyIds()).toEqual([]);
+});
+
+it("can set up and unlock a password vault while reset cleanup is still running", async () => {
+  mockWebLocks();
+  await keys.initializeKeys(password);
+  await db.recordNativeEnrollment("orphan");
+  await db.abandonNativeEnrollment("orphan");
+  let finish!: () => void;
+  const { biometricUnlock } = await import("../platform/biometric-unlock.js");
+  const remove = vi.spyOn(biometricUnlock, "remove").mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  try {
+    await expect(keys.resetLocalCryptoState()).resolves.toBe(true);
+    await vi.waitFor(() => expect(remove).toHaveBeenCalledExactlyOnceWith("orphan"));
+    await keys.initializeKeys(password);
+    keys.lockLocalCryptoState();
+    await keys.loadKeys(password);
+    expect(keys.keysLoaded()).toBe(true);
+    expect(await db.pendingResetNativeKeyIds()).toEqual(["orphan"]);
+  } finally { finish(); }
+  await vi.waitFor(async () => expect(await db.pendingResetNativeKeyIds()).toEqual([]));
+});
+
+it("bounds a queued native lock wait without holding up password setup", async () => {
+  const request = vi.fn(async (name: string, options: LockOptions | LockGrantedCallback<unknown>, callback?: LockGrantedCallback<unknown>) => {
+    if (name === "privatebase-native-unlock" && typeof options !== "function") {
+      const signal = options.signal!;
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    }
+    return (typeof options === "function" ? options : callback!)({ name, mode: "exclusive" });
+  });
+  vi.stubGlobal("navigator", { userAgent: navigator.userAgent, locks: { request } });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const stopped = expect(keys.retryNativeKeyCleanup({ background: false })).rejects.toMatchObject({ code: "failed" });
+  await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+  await keys.initializeKeys(password);
+  expect(keys.keysLoaded()).toBe(true);
+  await vi.advanceTimersByTimeAsync(60_000);
+  await stopped;
 });
 
 it("registers and reloads private keys and a wrapped edit key with strict BufferSources", async () => {
@@ -817,7 +1369,8 @@ describe("device KEK and unlock slots", () => {
       getClientExtensionResults: () => ({ prf: { results: { first: new Uint8Array(32).fill(35).buffer } } }),
     }));
     const create = vi.fn();
-    vi.stubGlobal("navigator", { credentials: { get, create } });
+    const locks = mockWebLocks();
+    vi.stubGlobal("navigator", { credentials: { get, create }, locks });
     vi.stubGlobal("PublicKeyCredential", class {});
     try {
       await keys.initializeKeys(password);
@@ -1235,6 +1788,33 @@ it("verifies a backup account password while unlocked and protects a sole PRF pa
   await expect(keys.loadKeys(password)).resolves.toBeUndefined();
 });
 
+it("requires reported native availability before counting a native slot as backup for a passkey", async () => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { androidBiometricProbe: true });
+  const invoke = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce("fingerprint");
+  vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
+  try {
+    const { canUseNativeUnlock, refreshNativeUnlockCapability } = await import("../platform/biometric-unlock.js");
+    const { readVault, vaultRecord } = await import("./device-key-vault.js");
+    const prepared = await keys.prepareDeviceKeySetup("Phone", "android");
+    await prepared.commit({ method: "passkey", credentialId: "AQID", rpId: "localhost",
+      salt: new Uint8Array(32).fill(12), output: new Uint8Array(32).fill(24) });
+    const vault = readVault(await db.getKey("dbKey"))!;
+    vault.slots.push({ method: "native", keyId: "native-slot" });
+    await db.saveKeys([vaultRecord(vault)]);
+
+    expect(await keys.isOnlyLocalPasskeyUnlock("AQID")).toBe(true);
+    await refreshNativeUnlockCapability();
+    expect(canUseNativeUnlock()).toBe(true);
+    expect(await keys.isOnlyLocalPasskeyUnlock("AQID")).toBe(true);
+    await expect(keys.removeLocalUnlockMethod("passkey")).rejects.toThrow("Keep at least one unlock method");
+    expect(await keys.listLocalUnlockMethods()).toEqual(["passkey", "native"]);
+
+    await refreshNativeUnlockCapability();
+    expect(await keys.isOnlyLocalPasskeyUnlock("AQID")).toBe(false);
+  } finally { vi.doUnmock("@tauri-apps/api/core"); }
+});
+
 it("clears pending setup metadata only when forgetting the matching local vault", async () => {
   const { forgetSavedPasskeySetup } = await import("./passkey-provision.js");
   const setupId = crypto.randomUUID();
@@ -1314,6 +1894,7 @@ async function signInForUnlockEnrollment() {
 }
 
 it("keeps the password slot until a supported alternative proves it can open the actual vault", async () => {
+  mockWebLocks();
   const { capabilities } = await import("../platform/capabilities.js");
   const { biometricUnlock } = await import("../platform/biometric-unlock.js");
   const native = vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("touchid");

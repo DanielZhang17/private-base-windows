@@ -1,13 +1,19 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 import UnlockPage from "./UnlockPage.js";
 import { listLocalUnlockMethods, loadKeys, resetLocalDevice, unlockLocalKeys } from "../lib/key-manager.js";
 import { capabilities } from "../platform/capabilities.js";
-import { NativeBiometricError } from "../platform/biometric-unlock.js";
+import { NativeBiometricError, refreshNativeUnlockCapability } from "../platform/biometric-unlock.js";
 import { useAuthStore } from "../stores/authStore.js";
+import { UnlockOffer } from "../features/auth/UnlockOffer.js";
+import { unlockOfferFor } from "../features/auth/unlockOfferState.js";
+import { ToastProvider } from "../ui/index.js";
 
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("../stores/authStore.js", async () => {
   const { create } = await import("zustand");
   return { useAuthStore: create(() => ({ user: { username: "alice", displayName: "Alice" }, accessToken: "token", device: { id: "device" }, bumpSessionState: vi.fn(), logout: vi.fn() })) };
@@ -128,28 +134,163 @@ it("auto-prompts once for Face ID and offers retry without reset during a tempor
   expect(unlockLocalKeys).toHaveBeenCalledTimes(1);
 });
 
-it("labels the Windows unlock action Windows Hello", async () => {
+it("offers Touch ID recovery before reset when a native-only Mac starts without availability", async () => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Macintosh");
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["native"]);
+  await act(async () => root.render(<MemoryRouter key="touch-id-unavailable"><UnlockPage /></MemoryRouter>));
+  const recovery = container.querySelector('[role="alert"]')!;
+  expect(recovery.textContent).toContain("quit and reopen Private Base before resetting this device");
+  expect(recovery.compareDocumentPosition(button("Forget this device…")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(unlockLocalKeys).not.toHaveBeenCalled();
+  expect(resetLocalDevice).not.toHaveBeenCalled();
+});
+
+it.each(["touchid", null] as const)("waits for the initial Touch ID probe before showing recovery (%s)", async kind => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlockProbe: true });
+  vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Macintosh");
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["native"]);
+  vi.mocked(unlockLocalKeys).mockRejectedValueOnce(new NativeBiometricError("cancelled"));
+  let finishProbe!: (kind: string | null) => void;
+  vi.mocked(invoke).mockImplementationOnce(() => new Promise(resolve => { finishProbe = resolve; }));
+  const probe = refreshNativeUnlockCapability();
+  await act(async () => root.render(<MemoryRouter key="pending-touch-id"><UnlockPage /></MemoryRouter>));
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+  expect(unlockLocalKeys).not.toHaveBeenCalled();
+  expect(container.textContent).not.toContain("quit and reopen Private Base");
+
+  await act(async () => { finishProbe(kind); await probe; });
+  if (kind) {
+    expect(unlockLocalKeys).toHaveBeenCalledExactlyOnceWith("native", undefined, expect.any(Function), expect.any(AbortSignal));
+    expect(container.textContent).not.toContain("quit and reopen Private Base");
+  } else {
+    expect(unlockLocalKeys).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("quit and reopen Private Base");
+  }
+});
+
+it("keeps a Windows Hello-only vault retryable after a temporary failure", async () => {
   vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("windows-hello");
   vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
   vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["native"]);
-  await act(async () => root.render(<MemoryRouter key="windows-hello"><UnlockPage /></MemoryRouter>));
-  expect(button("Unlock with Windows Hello")).toBeTruthy();
-});
-
-it("retries a temporarily unavailable Windows Hello-only slot without resetting the device", async () => {
-  vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("windows-hello");
-  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
-  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["native"]);
-  vi.mocked(unlockLocalKeys)
-    .mockRejectedValueOnce(new NativeBiometricError("failed"))
-    .mockResolvedValueOnce(undefined);
+  vi.mocked(unlockLocalKeys).mockRejectedValueOnce(new NativeBiometricError("failed")).mockResolvedValueOnce();
   await act(async () => root.render(<MemoryRouter key="hello-retry"><UnlockPage /></MemoryRouter>));
-  expect(unlockLocalKeys).toHaveBeenCalledTimes(1);
+  expect(container.textContent).not.toContain("Biometrics");
+  await act(async () => button("Unlock with Windows Hello").click());
   expect(button("Reset this device")).toBeUndefined();
   await act(async () => button("Try again").click());
   expect(unlockLocalKeys).toHaveBeenCalledTimes(2);
   expect(useAuthStore.getState().bumpSessionState).toHaveBeenCalledTimes(1);
   expect(resetLocalDevice).not.toHaveBeenCalled();
+});
+
+it("offers recovery when a native-only Android vault cannot probe its biometric method", async () => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { androidBiometricProbe: true });
+  vi.mocked(invoke).mockResolvedValueOnce(null);
+  await act(async () => { await refreshNativeUnlockCapability(); });
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["native"]);
+  vi.mocked(unlockLocalKeys).mockRejectedValueOnce(new NativeBiometricError("unavailable")).mockResolvedValueOnce();
+  await act(async () => root.render(<MemoryRouter key="android-retry"><UnlockPage /></MemoryRouter>));
+  expect(unlockLocalKeys).not.toHaveBeenCalled();
+  expect(container.textContent).toContain("is unavailable. Check your device’s unlock settings and try again.");
+  await act(async () => button("Unlock with biometrics").click());
+  expect(button("Forget this device…")).toBeUndefined();
+  await act(async () => button("Try again").click());
+  expect(unlockLocalKeys).toHaveBeenCalledTimes(2);
+  expect(resetLocalDevice).not.toHaveBeenCalled();
+});
+
+it("keeps the password form selected when a pending probe succeeds", async () => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { androidBiometricProbe: true });
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["password", "native"]);
+  let finish!: (kind: string) => void;
+  vi.mocked(invoke).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const probe = refreshNativeUnlockCapability();
+  await act(async () => root.render(<MemoryRouter key="android-password"><UnlockPage /></MemoryRouter>));
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+  await act(async () => button("Use password instead").click());
+  const input = container.querySelector<HTMLInputElement>('input[type="password"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "my password");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    finish("fingerprint");
+    await probe;
+  });
+  expect(unlockLocalKeys).not.toHaveBeenCalled();
+  expect(container.querySelector('input[type="password"]')).toBe(input);
+  expect(input.value).toBe("my password");
+  await act(async () => button("Unlock with fingerprint").click());
+  expect(unlockLocalKeys).toHaveBeenCalledExactlyOnceWith("native", undefined, expect.any(Function), expect.any(AbortSignal));
+});
+
+it("can complete password unlock while an automatic native prompt is still outstanding", async () => {
+  vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("touchid");
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["password", "native"]);
+  let finish!: () => void;
+  vi.mocked(unlockLocalKeys).mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+  vi.mocked(loadKeys).mockResolvedValueOnce(undefined);
+  await act(async () => root.render(<MemoryRouter key="native-pending" initialEntries={["/unlock"]}><Routes>
+    <Route path="/unlock" element={<UnlockPage />} /><Route path="/" element={<Destination />} />
+  </Routes></MemoryRouter>));
+  expect(unlockLocalKeys).toHaveBeenCalledOnce();
+  await act(async () => button("Use password instead").click());
+  expect(vi.mocked(unlockLocalKeys).mock.calls[0][3]?.aborted).toBe(true);
+  await enterPassword();
+  expect(loadKeys).toHaveBeenCalledWith("password");
+  expect(pathname).toBe("/");
+  await act(async () => { finish(); });
+  expect(useAuthStore.getState().bumpSessionState).toHaveBeenCalledOnce();
+});
+
+it("keeps confirmed recovery reachable when the only native slot reports unsupported", async () => {
+  vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("windows-hello");
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["native"]);
+  vi.mocked(unlockLocalKeys).mockRejectedValueOnce(new NativeBiometricError("unsupported"));
+  await act(async () => root.render(<MemoryRouter key="unsupported-native"><UnlockPage /></MemoryRouter>));
+  expect(container.textContent).toContain("Windows Hello is unavailable");
+  expect(button("Reset this device")).toBeUndefined();
+  await act(async () => button("Forget this device…").click());
+  expect(button("Forget keys").disabled).toBe(true);
+  expect(resetLocalDevice).not.toHaveBeenCalled();
+  await act(async () => document.querySelector<HTMLInputElement>('[role="alertdialog"] input[type="checkbox"]')!.click());
+  await act(async () => button("Forget keys").click());
+  expect(resetLocalDevice).toHaveBeenCalledOnce();
+});
+
+it("preserves the enrollment offer when password unlock completes before the probe", async () => {
+  sessionStorage.removeItem("unlock-offer:device");
+  localStorage.removeItem("unlock-offer-seen:device");
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { androidBiometricProbe: true });
+  let finish!: (kind: string) => void;
+  vi.mocked(invoke).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const probe = refreshNativeUnlockCapability();
+  const client = new QueryClient();
+  try {
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+    await act(async () => root.render(<QueryClientProvider client={client}><ToastProvider>
+      <MemoryRouter key="pending-offer" initialEntries={["/unlock"]}><Routes>
+        <Route path="/unlock" element={<UnlockPage />} />
+        <Route path="/" element={<UnlockOffer />} />
+      </Routes></MemoryRouter>
+    </ToastProvider></QueryClientProvider>));
+    await enterPassword();
+    expect(unlockOfferFor("device")).toBe("new");
+    expect(button("Turn on Fingerprint")).toBeUndefined();
+    await act(async () => { finish("fingerprint"); await probe; });
+    expect(button("Turn on Fingerprint")).toBeDefined();
+  } finally {
+    finish?.("fingerprint");
+    sessionStorage.removeItem("unlock-offer:device");
+    client.clear();
+  }
 });
 
 it("offers a confirmed reset only after the sole native method reports permanent invalidation", async () => {

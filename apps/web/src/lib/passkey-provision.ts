@@ -4,11 +4,13 @@ import {
   type AuthResponse, type DeviceLimitResponse, type PasskeyLoginOptionsResponse, type PendingPasskeySetup,
 } from "@e2ee-chat/shared";
 import { claimPasskeySetupLease, matchesPendingSetup, releasePasskeySetupLease, readPendingSetupRecord, updatePendingSetupRecord, type PendingSetupRecord } from "../db/index.js";
-import { bindLocalUnlockEnrollment, buildDeviceLinkPublicBundle, getUnlockGeneration, KeysLockedError, keysLoaded, listLocalUnlockMethods, prepareDeviceKeySetup, resetLocalCryptoState, signWithIdentityKey, unlockLocalKeys } from "./key-manager.js";
+import { bindLocalUnlockEnrollment, buildDeviceLinkPublicBundle, getUnlockGeneration, KeysLockedError, keysLoaded, listLocalUnlockMethods, prepareDeviceKeySetup, removeLocalUnlockMethod, resetLocalCryptoState, signWithIdentityKey, unlockLocalKeys } from "./key-manager.js";
 import type { UnlockMethod, UnlockSetup } from "./device-key-vault.js";
 import { authorizeNativePasskeyProvision } from "./native-passkeys.js";
 import { getPasskeyAssertionWithPrf, PasskeyUnsupportedError } from "./webauthn.js";
+import { canEnrollNativeUnlock, isNativeEnrollmentUnsupported, nativeUnlockStatus, refreshNativeUnlockCapability } from "../platform/biometric-unlock.js";
 import { capabilities } from "../platform/capabilities.js";
+import { assertNotAborted } from "../platform/native-wait.js";
 import { platformName } from "../platform/environment.js";
 import { api } from "../services/api.js";
 import { isSameSession } from "../services/session-identity.js";
@@ -60,13 +62,21 @@ export async function verifySetupPassword(password: string, setupToken?: string)
   if (response.verified !== true) throw new Error("Account password could not be verified");
 }
 
-export function bindAccountUnlockEnrollment() {
+function captureAccountUnlockSession() {
   const session = useAuthStore.getState();
-  return bindLocalUnlockEnrollment(() => {
+  return () => {
     const current = useAuthStore.getState();
     return isSameSession(session, current) && session.user?.id === current.user?.id &&
       session.device?.id === current.device?.id;
-  });
+  };
+}
+
+export function bindAccountUnlockEnrollment() {
+  return bindLocalUnlockEnrollment(captureAccountUnlockSession());
+}
+
+export function removeAccountNativeUnlock() {
+  return removeLocalUnlockMethod("native", captureAccountUnlockSession());
 }
 
 export async function addAccountPasswordUnlock(password: string) {
@@ -177,7 +187,7 @@ async function finishSetup(pending: PendingPasskeySetup, record: PendingSetupRec
 }
 
 async function chooseBackupPassword(
-  pending: PendingPasskeySetup, record: PendingSetupRecord, assertUnlocked: () => void, password?: string,
+  pending: PendingPasskeySetup, record: PendingSetupRecord, assertUnlocked: () => void, password?: string, retireNative = false,
 ) {
   assertUnlocked();
   if (pending.deviceId !== record.deviceId || !matchesPendingSetup(await readPendingSetupRecord(), record)) {
@@ -189,7 +199,7 @@ async function chooseBackupPassword(
     await verifySetupPassword(password, pending.setupToken);
     if (!matchesPendingSetup(await readPendingSetupRecord(), record)) throw new StalePasskeySetupError();
     assertUnlocked();
-    await bindLocalUnlockEnrollment()({ method: "password", password });
+    await bindLocalUnlockEnrollment()({ method: "password", password }, { retireNative });
     assertUnlocked();
   }
   const next = { ...record, backupPending: false as const };
@@ -222,20 +232,23 @@ export interface ResumedSetupBackup {
 }
 
 export async function resumePasskeyDeviceSetup(
-  method: UnlockMethod, password?: string, replacement?: PasskeyReplacement,
+  method: UnlockMethod, password?: string, replacement?: PasskeyReplacement, signal?: AbortSignal, onLocalUnlock?: () => void,
 ): Promise<AuthResponse | ResumedSetupBackup> {
   return withSetupLock(async () => {
     const record = await readPendingSetupRecord();
     if (!record || (record.stage !== "unlockReady" && record.stage !== "complete")) throw new Error("No local device setup to finish");
-    await unlockLocalKeys(method, password);
+    await unlockLocalKeys(method, password, undefined, signal);
+    assertNotAborted(signal);
+    onLocalUnlock?.();
     const assertUnlocked = captureSetupUnlock();
     const { setupId } = record;
-    const { challengeId } = await api.post<{ challengeId: string }>("/auth/passkey/provision/resume-options", { setupId });
+    const requestOptions = signal ? { signal } : undefined;
+    const { challengeId } = await api.post<{ challengeId: string }>("/auth/passkey/provision/resume-options", { setupId }, requestOptions);
     assertUnlocked();
     const signature = await signWithIdentityKey(createDeviceActionPayload("resume_setup", setupId, challengeId));
     assertUnlocked();
     try {
-      let pending = await api.post<PendingPasskeySetup>("/auth/passkey/provision/resume", { setupId, challengeId, signature });
+      let pending = await api.post<PendingPasskeySetup>("/auth/passkey/provision/resume", { setupId, challengeId, signature }, requestOptions);
       assertUnlocked();
       if (pending.deviceId !== record.deviceId) throw new StalePasskeySetupError();
       if (record.stage === "unlockReady" && record.backupPending !== false) {
@@ -296,7 +309,7 @@ export async function preparePasskeyDeviceSetup(deviceName: string, signal?: Abo
     try {
       const options = capabilities.nativePasskeyProvisioning ? null :
         await api.post<PasskeyLoginOptionsResponse>("/auth/passkey/provision-options", { bundleHash }, signal ? { signal } : undefined);
-      signal?.throwIfAborted();
+      assertNotAborted(signal);
       const salt = crypto.getRandomValues(new Uint8Array(32));
       let started = false;
       return {
@@ -339,7 +352,8 @@ async function authorizeDeviceSetup(
   release: () => void,
   ceremony?: SetupCeremony,
 ) {
-  let method: UnlockMethod;
+  let method: UnlockMethod | undefined;
+  const setupMethod = () => method ?? (canEnrollNativeUnlock() ? "native" : "password");
   let prf: Uint8Array | undefined;
   let credentialId = "";
   const setupId = record.setupId;
@@ -355,7 +369,6 @@ async function authorizeDeviceSetup(
       setupId, challengeId: options.challengeId, credential: assertion.credential, bundle: keys.bundle,
     }, ceremony?.signal ? { signal: ceremony.signal } : undefined);
   } else {
-    method = capabilities.biometricUnlock ? "native" : "password";
     ceremony?.onHandoff?.("browser");
     submit = await authorizeNativePasskeyProvision(record.bundleHash, keys.bundle, setupId, ceremony?.signal);
     ceremony?.onHandoff?.("redeeming");
@@ -381,7 +394,7 @@ async function authorizeDeviceSetup(
     await assertCurrent();
     try {
       pending = await request();
-      ceremony?.signal?.throwIfAborted();
+      assertNotAborted(ceremony?.signal);
       if (record.deviceId && record.deviceId !== pending.deviceId) throw new StalePasskeySetupError();
       const next = { ...record, deviceId: pending.deviceId, stage: record.stage === "prepared" ? "provisioned" as const : record.stage };
       if (!await updatePendingSetupRecord(next, record)) throw new StalePasskeySetupError();
@@ -395,6 +408,8 @@ async function authorizeDeviceSetup(
       authorizationError = err;
       throw err;
     }
+    // The local password path can proceed as soon as redemption is complete.
+    if (!options && !nativeUnlockStatus().available) void refreshNativeUnlockCapability();
   };
   try { await authorize(submit); }
   catch (err) {
@@ -426,7 +441,8 @@ async function authorizeDeviceSetup(
     }
   };
 
-  const persistUnlock = async (password?: string) => {
+  const persistUnlock = async (password?: string, signal?: AbortSignal) => {
+    assertNotAborted(signal);
     await assertCurrent();
     if (!pending) await retryAuthorization();
     if (record.stage !== "provisioned") return;
@@ -434,35 +450,40 @@ async function authorizeDeviceSetup(
     if (password !== undefined) {
       await verifySetupPassword(password, pending!.setupToken);
       slot = { method: "password", password };
-    } else if (method === "native") slot = { method: "native" };
+    } else if (setupMethod() === "native") slot = { method: "native" };
     else if (prf && options) slot = { method: "passkey", credentialId, rpId: options.options.rpId, salt, output: prf };
     else throw new Error("Password unlock is required for this device");
     const durable = { ...record, stage: "unlockReady" as const, backupPending: slot.method === "password" ? false as const : slot.method };
     try {
-      await keys.commit(slot, { record: durable, owner: { userId: pending!.user.id, username: pending!.user.username, deviceId: pending!.deviceId } });
+      await keys.commit(slot, { record: durable, owner: { userId: pending!.user.id, username: pending!.user.username, deviceId: pending!.deviceId } }, signal);
       assertUnlocked = captureSetupUnlock();
     } catch (error) {
       // A lock can interrupt in-memory publication after the vault has committed.
       const current = await readPendingSetupRecord().catch(() => undefined);
       if (current?.setupId === setupId && current.deviceId === durable.deviceId && current.stage === "unlockReady") {
+        method = slot.method;
         Object.assign(record, durable);
         dropMemory();
+      } else if (slot.method === "native" && isNativeEnrollmentUnsupported(error)) {
+        method = "password";
       }
       throw error;
     }
+    method = slot.method;
     Object.assign(record, durable);
     dropMemory();
   };
 
   return {
-    setupId, method,
+    setupId,
+    get method() { return setupMethod(); },
     get pending() { return pending; },
     get deviceLimit() { return deviceLimit; },
     get authorizationError() { return authorizationError; },
     get closed() { return stopped; },
     get backupPending() { return record.backupPending; },
     canUsePasswordFallback: () => !stopped && record.stage !== "unlockReady" && record.stage !== "complete",
-    persistUnlock: (password?: string) => run(() => persistUnlock(password)),
+    persistUnlock: (password?: string, signal?: AbortSignal) => run(() => persistUnlock(password, signal)),
     chooseBackupPassword: (password?: string) => run(async () => {
       if (!pending || record.stage !== "unlockReady") throw new Error("Set up the first unlock method before adding a backup");
       if (!assertUnlocked) throw new KeysLockedError();
@@ -493,6 +514,9 @@ async function authorizeDeviceSetup(
       await persistUnlock(password);
       try {
         if (!assertUnlocked) throw new KeysLockedError();
+        if (password !== undefined && record.backupPending) {
+          await chooseBackupPassword(pending!, record, assertUnlocked, password, record.backupPending === "native");
+        }
         const auth = await finishSetup(pending!, record, assertUnlocked);
         record.stage = "complete";
         dispose();

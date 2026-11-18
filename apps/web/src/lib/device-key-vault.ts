@@ -1,6 +1,6 @@
 import { asArrayBufferView, fromBase64Url, toBase64Url } from "@e2ee-chat/crypto";
 import { PBKDF2_ITERATIONS } from "@e2ee-chat/shared";
-import { biometricUnlock } from "../platform/biometric-unlock.js";
+import { biometricUnlock, nativeUnlockStatus } from "../platform/biometric-unlock.js";
 import { capabilities } from "../platform/capabilities.js";
 import { evaluatePasskeyPrf } from "./webauthn.js";
 import { decryptData, encryptData } from "./local-key-encryption.js";
@@ -27,7 +27,7 @@ export async function deriveEncryptionKey(password: string, salt: Uint8Array): P
 export type UnlockMethod = "password" | "passkey" | "native";
 
 export function unlockMethodAvailable(method: UnlockMethod): boolean {
-  return method === "password" || (method === "passkey" ? capabilities.passkeys : !!capabilities.biometricUnlock);
+  return method === "password" || (method === "passkey" ? capabilities.passkeys : !!nativeUnlockStatus().available);
 }
 
 type PrfCredential = { credentialId: string; rpId: string };
@@ -81,18 +81,17 @@ async function prfWrappingKey(output: Uint8Array, salt: Uint8Array): Promise<Cry
   }, input, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
 }
 
-export async function enrollNativeUnlockSlot(key: CryptoKey, keyId: string): Promise<UnlockSlot> {
-  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", key));
-  try {
-    await biometricUnlock.enroll(keyId, raw);
-    return { method: "native", keyId };
-  } finally { raw.fill(0); }
-}
+type SlotWrappingSetup = Exclude<UnlockSetup, { method: "native" }> | { method: "native"; keyId: string };
 
-export async function wrapUnlockSlot(key: CryptoKey, setup: Exclude<UnlockSetup, { method: "native" }>): Promise<UnlockSlot> {
+export async function wrapUnlockSlot(key: CryptoKey, setup: SlotWrappingSetup, signal?: AbortSignal): Promise<UnlockSlot> {
   const raw = new Uint8Array(await crypto.subtle.exportKey("raw", key));
   try {
     switch (setup.method) {
+      case "native": {
+        const { keyId } = setup;
+        await biometricUnlock.enroll(keyId, raw, signal);
+        return { method: "native", keyId };
+      }
       case "password": {
         if (!setup.password) throw new Error("Password is required");
         const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -114,10 +113,10 @@ export async function wrapUnlockSlot(key: CryptoKey, setup: Exclude<UnlockSetup,
   } finally { raw.fill(0); }
 }
 
-export async function unwrapUnlockSlot(slot: UnlockSlot, password?: string): Promise<CryptoKey> {
+export async function unwrapUnlockSlot(slot: UnlockSlot, password?: string, signal?: AbortSignal): Promise<CryptoKey> {
   let raw: Uint8Array;
   if (slot.method === "native") {
-    raw = await biometricUnlock.unlock(slot.keyId);
+    raw = await biometricUnlock.unlock(slot.keyId, signal);
   } else {
     const salt = fromBase64Url(slot.salt);
     let wrappingKey: CryptoKey;

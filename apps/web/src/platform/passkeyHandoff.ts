@@ -1,13 +1,18 @@
 import { isNative } from "./environment.js";
 import { LocalizedError } from "../i18n/messages.js";
+import { abortReason, assertNotAborted, withNativeDeadline } from "./native-wait.js";
 
 export const PASSKEY_HANDOFF_ORIGIN = "https://chat.718788.xyz";
+const HANDOFF_WAIT_MS = 180_000;
 let nativeHandoffPending: Promise<void> | undefined;
 
 function waitForHandoffResult<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return pending;
   return new Promise<T>((resolve, reject) => {
-    const cancel = () => reject(signal.reason);
+    const cancel = () => {
+      signal.removeEventListener("abort", cancel);
+      reject(abortReason(signal));
+    };
     signal.addEventListener("abort", cancel, { once: true });
     if (signal.aborted) cancel();
     void pending.then(resolve, reject).finally(() => signal.removeEventListener("abort", cancel));
@@ -15,7 +20,8 @@ function waitForHandoffResult<T>(pending: Promise<T>, signal?: AbortSignal): Pro
 }
 
 export function waitForNativePasskeyHandoff(signal?: AbortSignal): Promise<void> | undefined {
-  return nativeHandoffPending && waitForHandoffResult(nativeHandoffPending, signal);
+  const pending = nativeHandoffPending;
+  return pending && withNativeDeadline(HANDOFF_WAIT_MS, waiting => waitForHandoffResult(pending, waiting), signal);
 }
 
 // Tauri has no synchronous command discovery. Phase 2 launchers advertise this only
@@ -27,6 +33,12 @@ declare global {
       passkeyProvisionHandoff?: boolean;
       androidBiometricKind?: "fingerprint" | "biometrics";
       biometricUnlock?: import("./biometric-unlock.js").BiometricUnlock;
+      biometricUnlockKind?: import("./biometric-unlock.js").BiometricUnlock;
+      biometricUnlockRemove?: boolean;
+      biometricUnlockCleanup?: boolean;
+      biometricUnlockProbe?: boolean;
+      biometricUnlockSingleDocument?: boolean;
+      androidBiometricProbe?: true;
       autoUpdate?: "desktop" | "android";
       fileOpen?: boolean;
       fileSave?: "dialog" | "downloads" | "share";
@@ -77,23 +89,24 @@ export async function startPasskeyHandoff(url: string, signal?: AbortSignal): Pr
     throw new LocalizedError("nativePasskeyInvalidRequest");
   }
   if (provisionHash && !supportsPasskeyProvisionHandoff()) throw new LocalizedError("nativePasskeyUnsupported");
-  const { invoke } = await import("@tauri-apps/api/core");
   let callbackUrl: string;
   try {
-    // Aborting the WebView waiter does not release the launcher. Let the old
-    // callback or native timeout settle before invoking the command again.
-    while (nativeHandoffPending) await waitForNativePasskeyHandoff(signal);
-    signal?.throwIfAborted();
-    if (!supportsPasskeyHandoff() || (provisionHash && !supportsPasskeyProvisionHandoff())) {
-      throw new LocalizedError("nativePasskeyUnsupported");
-    }
-    const pending = invoke<string>("passkey_handoff_start", { url, callbackScheme: "privatebase" });
-    nativeHandoffPending = pending.then(() => undefined, () => undefined).finally(() => {
-      nativeHandoffPending = undefined;
-    });
-    callbackUrl = await waitForHandoffResult(pending, signal);
+    callbackUrl = await withNativeDeadline(HANDOFF_WAIT_MS, async waiting => {
+      const { invoke } = await import("@tauri-apps/api/core");
+      // The UI deadline ends the wait. The launcher owns its session until the IPC settles.
+      while (nativeHandoffPending) await waitForHandoffResult(nativeHandoffPending, waiting);
+      assertNotAborted(waiting);
+      if (!supportsPasskeyHandoff() || (provisionHash && !supportsPasskeyProvisionHandoff())) {
+        throw new LocalizedError("nativePasskeyUnsupported");
+      }
+      const pending = invoke<string>("passkey_handoff_start", { url, callbackScheme: "privatebase" });
+      nativeHandoffPending = pending.then(() => undefined, () => undefined).finally(() => {
+        nativeHandoffPending = undefined;
+      });
+      return waitForHandoffResult(pending, waiting);
+    }, signal);
   } catch (error) {
-    if (signal?.aborted) throw signal.reason;
+    assertNotAborted(signal);
     if (error instanceof LocalizedError) throw error;
     if (error === "cancelled") throw new LocalizedError("nativePasskeyCancelled");
     if (error === "unsupported" || (typeof error === "string" && /command.*not found/i.test(error))) {

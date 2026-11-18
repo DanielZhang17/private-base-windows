@@ -12,3 +12,8 @@ commands.allow = ["biometric_unlock"]
 identifier = "allow-biometric-unlock-remove"
 description = "Remove a local biometric unlock slot."
 commands.allow = ["biometric_unlock_remove"]
+
+[[permission]]
+identifier = "allow-biometric-unlock-probe"
+description = "Check Windows Hello readiness without prompting."
+commands.allow = ["biometric_unlock_probe"]

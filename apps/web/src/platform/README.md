@@ -223,9 +223,10 @@ adapter in `biometric-unlock.ts` exposes enroll, unlock, and remove.
 
 | Command | Arguments | Success |
 | --- | --- | --- |
-| `biometric_unlock_enroll` | `{ vaultId, key }` | No value |
-| `biometric_unlock` | `{ vaultId }` | The stored key |
+| `biometric_unlock_enroll` | `{ vaultId, key, locale? }` | No value |
+| `biometric_unlock` | `{ vaultId, locale? }` | The stored key |
 | `biometric_unlock_remove` | `{ vaultId }` | No value, including if the item is absent |
+| `biometric_unlock_probe` (optional) | No arguments | A method kind, `"fingerprint"`, `"biometric"`, or `null` |
 
 The vault ID is a random local identifier for this keystore slot. The key is exactly 32 bytes encoded
 as unpadded base64url. Enroll and unlock require fresh biometric authentication.
@@ -250,11 +251,64 @@ risk. Removing one of several enrolled biometrics need not invalidate it.
 errors, or persistent IPC state. IndexedDB stores only the vault ID and slot
 metadata for native unlock. The app can use any other enrolled method if a
 biometric item is invalidated.
-Turning off native unlock stores its key identifier for cleanup in the same
-IndexedDB write that removes the slot. Security settings can retry removal
-after a failure or restart. The identifier is cleared after the command succeeds.
-Vault and device resets retain the same cleanup identifier in IndexedDB. A
-supported shell retries cleanup at app startup, including before sign-in.
+Before invoking enrollment, the web client commits a cleanup journal entry
+with the new slot identifier. It removes that entry in the IndexedDB
+transaction that saves the vault slot. Turning off native unlock writes its
+identifier to the same journal in the transaction that removes the slot.
+Vault and device resets retain cleanup entries and discard outstanding
+enrollment commits. The app drains the journal one item at a time at startup,
+after reset, on focus, and when the user retries in Security settings. A
+successful, idempotent removal retires its entry. The web client bounds probe,
+prompt, and removal waits to 1.5 seconds, 60 seconds, and 8 seconds respectively.
+An expired or cancelled web wait does not cancel native IPC already in flight.
+Cleanup uses the journal and the existing ordering guarantee for the slot ID.
+
+#### NATIVE-CONTRACT-CHANGES
+
+- Advertise `biometricUnlockRemove: true` whenever removal is available
+  independently of the ability to enroll or unlock. The app also accepts the
+  macOS branch’s `biometricUnlockCleanup: true` and infers removal support
+  from the existing `biometricUnlock` advertisement or an advertised probe.
+  Removal requires no authentication prompt. It must either finish after any
+  earlier admitted enrollment of that ID has settled, or reject with `failed`
+  while that enrollment can still write. This applies across document reloads
+  and processes sharing the same native store.
+- Advertise `biometricUnlockProbe: true` when the optional, non-interactive
+  `biometric_unlock_probe` is registered. The app also accepts the Android
+  branch’s `androidBiometricProbe: true`. Return a value valid for
+  `biometricUnlock`, or return `"fingerprint"` for a fingerprint-only Android
+  prompt and `"biometric"` for a generic Android prompt. Return `null` or
+  reject with `unsupported` when the method is unavailable. Reject transient
+  probe errors with `failed` so the app can offer a retry. The web client calls
+  the probe at startup, on focus, after saving a native slot, and on retry.
+  A probe result only describes present availability. The unlock command
+  determines whether an individual slot has been invalidated. An explicit
+  unlock of a saved slot can invoke the unlock command while a probe is pending.
+- A shell without Web Locks may advertise `biometricUnlockSingleDocument: true`
+  if only one live privileged document can access the native key store and
+  its IndexedDB journal at any time. The existing Android branch’s
+  `androidBiometricProbe: true` also opts into this single-document fallback.
+  Without either form of exclusive enrollment coordination, the web client
+  allows unlock and cleanup of retired keys. Recovery of a journal entry
+  whose enrollment may still be active requires Web Locks or the
+  single-document guarantee.
+- On macOS, enroll and unlock may receive the optional `locale` argument
+  containing the web app’s current BCP 47 locale. Older handlers can ignore
+  it. The existing argument names, key encoding, and success values for
+  enroll, unlock, and remove continue to work.
+- The client recognizes `unsupported` from enrollment as a durable limitation
+  for that method in the current document. Settings and the unlock offer use
+  this result to stop offering enrollment. The wire error codes are
+  `cancelled`, `lockout`, `invalidated`, `unsupported`, and `failed`, encoded
+  as a string or an object with a `code` field. Use `invalidated` only for a
+  slot confirmed permanently unavailable. Unknown errors are retryable.
+- The existing `androidBiometricKind: "fingerprint"` hint still selects the
+  fingerprint-only label alongside `biometricUnlock: "android-biometric"`.
+  A cleanup-only shell can advertise `biometricUnlockKind` using the same
+  values as `biometricUnlock` to keep the method label without enabling
+  authentication. For example, an iOS Touch ID device can identify its method
+  even with the sensor unavailable. Windows uses the Windows Hello label when
+  the capability is unavailable and the shell is identified as Windows.
 
 ### Native passkey provisioning capability
 
@@ -262,5 +316,3 @@ Advertise `passkeyProvisionHandoff: true` alongside `passkeyHandoff: true`
 when the launcher accepts `mode=provision&bundleHash=<base64url SHA-256>`
 on the existing sign-in path while retaining the state and callback checks.
 Older launchers can continue ordinary passkey sign-in and registration.
-
-The biometric commands may reject with `cancelled`, `lockout`, `invalidated` or `failed` (a string or an object carrying `code`). Use `invalidated` only when the enrolled key is confirmed permanently unavailable. Unknown failures are retryable. An Android shell may advertise `androidBiometricKind: "fingerprint"` next to `biometricUnlock: "android-biometric"` when its prompt is fingerprint-only. Otherwise the app displays the generic biometric label.

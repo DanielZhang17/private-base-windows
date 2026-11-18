@@ -2,16 +2,16 @@ import { useCallback, useEffect, useId, useState } from "react";
 import type { PasskeyInfo } from "@e2ee-chat/shared";
 import { t } from "../../i18n/index.js";
 import { localized } from "../../i18n/messages.js";
-import { hasPendingNativeUnlockRemoval, localPasskeyUnlockId, listLocalUnlockMethods, removeLocalUnlockMethod } from "../../lib/key-manager.js";
-import { bindAccountUnlockEnrollment } from "../../lib/passkey-provision.js";
+import { hasPendingNativeUnlockRemoval, localPasskeyUnlockId, listLocalUnlockMethods, removeLocalUnlockMethod, retryNativeKeyCleanup } from "../../lib/key-manager.js";
+import { bindAccountUnlockEnrollment, removeAccountNativeUnlock } from "../../lib/passkey-provision.js";
 import { subscribeToUnlockMethodChanges } from "../../lib/unlock-method-changes.js";
 import { evaluatePasskeyPrf } from "../../lib/webauthn.js";
 import { unlockMethodAvailable, type UnlockMethod } from "../../lib/device-key-vault.js";
-import { isUnlockPromptCancelled } from "../../platform/biometric-unlock.js";
+import { canEnrollNativeUnlock, canProbeNativeUnlock, canRemoveNativeUnlock, isNativeEnrollmentUnsupported, isUnlockPromptCancelled,
+  nativeUnlockLabel, refreshNativeUnlockCapability, useNativeUnlockStatus } from "../../platform/biometric-unlock.js";
 import { capabilities } from "../../platform/capabilities.js";
 import { Button, ConfirmDialog, Dialog, Icon, Notice, useToast } from "../../ui/index.js";
 import { unlockMethodInfo } from "../auth/unlockMethods.js";
-import { reportUnsupportedNativeEnrollment, useNativeEnrollmentUnsupported } from "../auth/unlockOfferState.js";
 import { PasswordUnlockDialog } from "./PasswordUnlockDialog.js";
 
 export function useUnlockSettings(active: boolean) {
@@ -62,30 +62,44 @@ export function UnlockSettings({ vault, passkeys, onLock, addPassword, closePass
   }, []);
   const [confirmOff, setConfirmOff] = useState(false);
   const [choosePasskey, setChoosePasskey] = useState(false);
-  const native = capabilities.biometricUnlock;
-  const nativeEnrollmentUnsupported = useNativeEnrollmentUnsupported(native);
-  const alternate = unlockMethodInfo(vault.methods.includes("native") || native ? "native" : "passkey", native);
+  const { available, unsupported: nativeUnsupported, probeFailed } = useNativeUnlockStatus();
+  const canEnroll = canEnrollNativeUnlock();
+  const canRemove = canRemoveNativeUnlock();
+  const hasNative = vault.methods.includes("native");
+  const showNative = canEnroll || nativeUnsupported || (canRemove && (hasNative || vault.nativeRemovalPending || probeFailed));
+  const native = nativeUnlockLabel();
+  const alternate = unlockMethodInfo(hasNative || showNative ? "native" : "passkey", native);
   const passkey = passkeys.find(item => item.credentialId === vault.passkeyId);
+  const [retryingProbe, setRetryingProbe] = useState(false);
 
   async function change(method: UnlockMethod, on: boolean, credentialId?: string) {
     setBusy(method);
     setError("");
     const info = unlockMethodInfo(method, native);
     try {
-      if (!on) await removeLocalUnlockMethod(method);
+      if (!on && method === "native") await removeAccountNativeUnlock();
+      else if (!on) await removeLocalUnlockMethod(method);
       else if (method === "native") await bindAccountUnlockEnrollment()({ method: "native" });
       else if (credentialId) await enrollPasskeyUnlock(credentialId);
       toast.show({ tone: "success", message: localized(on ? "security.methodTurnedOn" : "security.methodTurnedOff", { method: info.name }) });
       setChoosePasskey(false);
       setConfirmOff(false);
     } catch (err) {
-      if (!(on && method === "native" && reportUnsupportedNativeEnrollment(native, err)) && !isUnlockPromptCancelled(err)) {
+      if (!(on && method === "native" && isNativeEnrollmentUnsupported(err)) && !isUnlockPromptCancelled(err)) {
         setError(t("passkeySetup.enrolFailed", { method: info.name }));
       }
     } finally { vault.refresh(); setBusy(undefined); }
   }
 
-  const methods: UnlockMethod[] = native ? ["native", "password"] : ["passkey", "password"];
+  async function retryRemoval() {
+    setBusy("native");
+    setError("");
+    try { await retryNativeKeyCleanup({ background: false }); }
+    catch { setError(t("genericError")); }
+    finally { vault.refresh(); setBusy(undefined); }
+  }
+
+  const methods: UnlockMethod[] = showNative ? ["native", "password"] : ["passkey", "password"];
   const isLast = (method: UnlockMethod) => vault.methods.includes(method) && !vault.methods.some(other => other !== method &&
     unlockMethodAvailable(other) && (other !== "passkey" || !prfUnsupported));
   return <section className="space-y-3">
@@ -96,18 +110,18 @@ export function UnlockSettings({ vault, passkeys, onLock, addPassword, closePass
         const info = unlockMethodInfo(method, native);
         const on = vault.methods.includes(method);
         const last = isLast(method);
-        const nativeUnsupported = method === "native" && !on && nativeEnrollmentUnsupported;
-        const unsupported = nativeUnsupported || (method === "passkey" && !on && (!capabilities.passkeys || prfUnsupported));
+        const unsupported = method === "passkey" && !on && (!capabilities.passkeys || prfUnsupported);
         const detail = method === "password" ? t("security.passwordSubtitle") : method === "passkey"
           ? unsupported ? t("security.prfUnsupported") : passkey ? t("security.passkeyUses", { credentialName: passkey.friendlyName })
             : vault.passkeyId ? t("security.removedPasskeyInUse") : t("security.methodOff")
-          : nativeUnsupported ? t("security.nativeEnrollmentUnsupported", { method: info.name }) : t(on ? "security.methodOn" : "security.methodOff");
+          : !on && nativeUnsupported ? t("security.nativeEnrollmentUnsupported", { method: info.name }) : t(on ? "security.methodOn" : "security.methodOff");
         return <label key={method} className="flex min-h-14 cursor-pointer items-center gap-3 px-4 py-2" aria-busy={busy === method}>
           <Icon name={info.icon} /><span className="min-w-0 grow"><span className="block font-semibold">{info.name}</span>
             <span className="block text-sm text-ink-muted" aria-live={method === "native" ? "polite" : undefined}>{detail}</span></span>
           <input type="checkbox" role="switch" className="peer sr-only forced-colors:not-sr-only forced-colors:size-5 forced-colors:shrink-0" aria-label={info.name} checked={on}
             aria-describedby={last ? help : undefined} disabled={!!busy || last || unsupported || !vault.methods.length ||
-              (method === "native" && vault.nativeRemovalPending) || (method === "passkey" && !on && !passkeys.length)}
+              (method === "native" && (on ? !canRemove : vault.nativeRemovalPending || !canEnroll)) ||
+              (method === "passkey" && !on && !passkeys.length)}
             onChange={event => {
               const next = event.target.checked;
               if (method === "password") { if (next) openPassword(); else setConfirmOff(true); }
@@ -122,11 +136,17 @@ export function UnlockSettings({ vault, passkeys, onLock, addPassword, closePass
       })}
     </div>
     {methods.some(isLast) && <p id={help} className="text-sm text-ink-muted">{t("security.keepOne")}</p>}
-    {native && vault.nativeRemovalPending
-      ? <Notice tone="warning" action={<Button variant="secondary" disabled={!!busy} onClick={() => void change("native", false)}>{t("retry")}</Button>}>
+    {canRemove && vault.nativeRemovalPending
+      ? <Notice tone="warning" action={<Button variant="secondary" disabled={!!busy} onClick={() => void retryRemoval()}>{t("retry")}</Button>}>
         {t("genericError")}
       </Notice>
       : error && !confirmOff && !choosePasskey && <Notice tone="danger">{error}</Notice>}
+    {!available && canProbeNativeUnlock() && (hasNative || probeFailed) && <Notice tone="warning" action={
+      <Button variant="secondary" loading={retryingProbe} onClick={() => {
+        setRetryingProbe(true);
+        void refreshNativeUnlockCapability().finally(() => setRetryingProbe(false));
+      }}>{t("unlock.tryAgain")}</Button>
+    }>{t("unlock.nativeUnavailable", { method: alternate.name })}</Notice>}
     <Button variant="secondary" onClick={onLock}>{t("lockNow")}</Button>
     <PasswordUnlockDialog open={addPassword} method={alternate.name} onClose={closePassword} onSaved={vault.refresh} />
     <ConfirmDialog open={confirmOff} tone="danger" title={t("security.turnOffPasswordTitle")}

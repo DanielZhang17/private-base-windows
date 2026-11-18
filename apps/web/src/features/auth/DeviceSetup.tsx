@@ -11,7 +11,7 @@ export function DeviceSetup({ flow }: { flow: ReturnType<typeof useLoginFlow> })
   const pending = flow.passkeySetup?.pending;
   const { error, loading, password, setPassword } = flow;
   const method = flow.setupUnlockMethod ?? "password";
-  const info = unlockMethodInfo(method, flow.capabilities.biometricUnlock);
+  const info = unlockMethodInfo(method);
 
   if (flow.savedPasskeySetupId && !flow.setupScreen) return <>
     <AuthHeading title={t("passkeySetup.finishSetupTitle")} />
@@ -23,13 +23,13 @@ export function DeviceSetup({ flow }: { flow: ReturnType<typeof useLoginFlow> })
       </Notice>
       : error && <Notice tone="danger">{error}</Notice>}
     {flow.resumeMethods.filter(method => method !== "password").map(method => {
-      const option = unlockMethodInfo(method, flow.capabilities.biometricUnlock);
+      const option = unlockMethodInfo(method);
       return <Button key={method} size="lg" leadingIcon={option.icon} disabled={loading}
         onClick={() => void flow.resumePasskeyUnlock(method)}>{option.label}</Button>;
     })}
     {flow.resumeMethods.includes("password") && <form onSubmit={flow.completePasskeySetupWithPassword} className="grid gap-4">
       <Field label={t("passkeySetup.accountPassword")}><Input type="password" value={password} onChange={event => setPassword(event.target.value)} required autoComplete="current-password" /></Field>
-      <Button type="submit" size="lg" loading={loading}>{t("continue")}</Button>
+      <Button type="submit" size="lg" loading={loading && !flow.nativeUnlockPending}>{t("continue")}</Button>
     </form>}
     {!flow.passkeyApproval && <Button variant="danger-ghost" disabled={loading} onClick={flow.requestForgetSavedPasskeySetup}>{t("forgetThisDevice")}</Button>}
     <ForgetLocalKeysDialog open={flow.confirmingForgetSavedPasskeySetup} loading={loading} error={error}
@@ -80,7 +80,7 @@ export function DeviceSetup({ flow }: { flow: ReturnType<typeof useLoginFlow> })
       onConfirm={() => { setConfirmSkip(false); void flow.finishWithBackupPassword(); }} />
   </>;
 
-  if (flow.passwordOnly || flow.passkeyPasswordRequired) return <>
+  if (flow.passwordOnly || flow.passkeyPasswordRequired || method === "password") return <>
     <AuthHeading title={t("passkeySetup.passwordOnceTitle")} />
     <p className="text-ink-muted">{t(method === "password" && !flow.capabilities.nativePasskeyProvisioning
       ? "passkeySetup.passwordOnceBody" : "passkeySetup.choosePasswordBody")}</p>
@@ -89,7 +89,7 @@ export function DeviceSetup({ flow }: { flow: ReturnType<typeof useLoginFlow> })
     <form onSubmit={flow.completePasskeySetupWithPassword} className="grid gap-4">
       <Field label={t("passkeySetup.accountPassword")}><Input type="password" value={password}
         onChange={event => setPassword(event.target.value)} required autoComplete="current-password" /></Field>
-      <Button type="submit" size="lg" loading={loading}>{t(loading ? "passkeySetup.finishing" : "continue")}</Button>
+      <Button type="submit" size="lg" loading={loading && !flow.nativeUnlockPending}>{t(loading && !flow.nativeUnlockPending ? "passkeySetup.finishing" : "continue")}</Button>
     </form>
     <Button variant="ghost" disabled={loading} onClick={() => void flow.cancelPasskeySetup()}>{t("cancel")}</Button>
   </>;
@@ -106,6 +106,6 @@ export function DeviceSetup({ flow }: { flow: ReturnType<typeof useLoginFlow> })
     </Button>
     {method === "passkey"
       ? <Button variant="ghost" disabled={loading} onClick={() => void flow.cancelPasskeySetup()}>{t("cancel")}</Button>
-      : <Button variant="ghost" disabled={loading} onClick={flow.chooseSetupPassword}>{t("passkeySetup.usePasswordOnly")}</Button>}
+      : <Button variant="ghost" onClick={flow.chooseSetupPassword}>{t("passkeySetup.usePasswordOnly")}</Button>}
   </>;
 }

@@ -49,7 +49,8 @@ it("preserves region-specific Portuguese UI vocabulary", () => {
 
 it("localizes the new setup, approval, replacement and permanent-loss copy in each supported locale", () => {
   const keys = ["passkeySetup.passkeyHelp", "passkeySetup.skipPasswordBody", "replace.body",
-    "deviceAlert.warning", "privacy.requireApprovalHelp", "unlock.invalidatedNoBackup",
+    "deviceAlert.warning", "privacy.requireApprovalHelp", "unlock.invalidatedNoBackup", "unlock.touchIdRelaunch",
+    "unlock.nativeUnavailable", "security.nativeEnrollmentUnsupported",
     "security.passkeySignInBody", "security.passwordUnlockOn", "unlock.bodyPasskey",
     "devices.clientOnPlatform", "passkeySetup.otherDevicesWillSee", "passkeySetup.receiptTime",
     "passkeySetup.passwordOnceBody", "passkeySetup.choosePasswordBody", "chats.emptyLinkedConversation", "chats.historyOnOtherDevices"] as const;

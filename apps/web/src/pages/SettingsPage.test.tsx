@@ -1,4 +1,4 @@
-import { getByLabelText, getByRole, getByText } from "@testing-library/dom";
+import { getByLabelText, getByRole, getByText, queryByRole } from "@testing-library/dom";
 import { loadLocale, LOCALE_STORAGE_KEY, setLocalePreference, t } from "../i18n/index.js";
 import { act } from "react";
 import { MemoryRouter } from "react-router-dom";
@@ -11,9 +11,10 @@ import { api } from "../services/api.js";
 import { publishDeviceAlertsChanged } from "../services/device-alerts.js";
 import { capabilities } from "../platform/capabilities.js";
 import { copyText } from "../platform/clipboard.js";
-import { hasPendingNativeUnlockRemoval, listLocalUnlockMethods, localPasskeyUnlockId, removeLocalUnlockMethod, resetLocalCryptoState } from "../lib/key-manager.js";
+import { bindLocalUnlockEnrollment, hasPendingNativeUnlockRemoval, listLocalUnlockMethods, localPasskeyUnlockId, removeLocalUnlockMethod, resetLocalCryptoState, retryNativeKeyCleanup } from "../lib/key-manager.js";
 import { notifyUnlockMethodsChanged } from "../lib/unlock-method-changes.js";
 import { invoke } from "@tauri-apps/api/core";
+import { biometricUnlock, refreshNativeUnlockCapability } from "../platform/biometric-unlock.js";
 import { requestNotificationPermission } from "../platform/notifications.js";
 import { startBackgroundSession } from "../platform/android-background-service.js";
 import { click, setupDom } from "../ui/test-utils.js";
@@ -22,7 +23,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("../platform/notifications.js", () => ({ requestNotificationPermission: vi.fn() }));
 vi.mock("../services/api.js", () => ({ api: { get: vi.fn(), patch: vi.fn(), post: vi.fn(), delete: vi.fn(), put: vi.fn(async () => ({})) }, resolveApiUrl: (path: string) => path }));
 vi.mock("../stores/authStore.js", async () => { const { create } = await import("zustand"); return { useAuthStore: create(() => ({ user: { id: "sam", displayName: "Sam Rivera", username: "sam" }, device: { id: "this-device" }, logout: vi.fn(), bumpSessionState: vi.fn(), updateProfile: vi.fn() })) }; });
-vi.mock("../lib/key-manager.js", () => ({ lockLocalCryptoState: vi.fn(), listLocalUnlockMethods: vi.fn(async () => ["password"]), localPasskeyUnlockId: vi.fn(async () => undefined), hasPendingNativeUnlockRemoval: vi.fn(async () => false), removeLocalUnlockMethod: vi.fn(), resetLocalCryptoState: vi.fn(async () => { }), signWithIdentityKey: vi.fn(async () => "signature") }));
+vi.mock("../lib/key-manager.js", () => ({ bindLocalUnlockEnrollment: vi.fn(), lockLocalCryptoState: vi.fn(), listLocalUnlockMethods: vi.fn(async () => ["password"]), localPasskeyUnlockId: vi.fn(async () => undefined), hasPendingNativeUnlockRemoval: vi.fn(async () => false), removeLocalUnlockMethod: vi.fn(), resetLocalCryptoState: vi.fn(async () => { }), retryNativeKeyCleanup: vi.fn(), signWithIdentityKey: vi.fn(async () => "signature") }));
 vi.mock("../platform/session.js", () => ({ clearAccountScopedState: vi.fn() }));
 vi.mock("../platform/clipboard.js", () => ({ copyText: vi.fn(async () => { }) }));
 vi.mock("../lib/device-link.js", () => ({ generateRecoveryKey: () => "abcd-efgh-ijkl-mnop" }));
@@ -103,17 +104,128 @@ it("refreshes mounted Security switches and fallback copy after local unlock cha
   expect(passkey.checked).toBe(false);
   expect(document.body.textContent).not.toContain("Unlocks this device");
 });
+
+it("guards the local passkey from deletion when the native backup probe reports no availability", async () => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { androidBiometricProbe: true });
+  vi.spyOn(capabilities, "nativePasskeys", "get").mockReturnValue(true);
+  vi.mocked(invoke).mockResolvedValueOnce(null);
+  await refreshNativeUnlockCapability();
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["passkey", "native"]);
+  vi.mocked(localPasskeyUnlockId).mockResolvedValueOnce("local-passkey");
+  vi.mocked(api.get).mockImplementation(async path => path === "/api/passkeys"
+    ? [{ id: "account-passkey", credentialId: "local-passkey", friendlyName: "Laptop", createdAt: Date.now() }] as never
+    : [] as never);
+
+  await show("security");
+  await click(getByRole(document.body, "button", { name: "Remove Laptop" }));
+  expect(document.body.textContent).toContain(t("security.removeOnlyUnlockPasskey"));
+  expect(queryByRole(document.body, "alertdialog")).toBeNull();
+  expect(api.delete).not.toHaveBeenCalled();
+});
+
 it("offers retry for a persisted native key removal before allowing re-enrollment", async () => {
   vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("touchid");
+  vi.stubGlobal("navigator", { userAgent: "Macintosh", locks: { request: vi.fn() } });
   vi.mocked(hasPendingNativeUnlockRemoval).mockResolvedValueOnce(true);
   await show("security");
   const toggle = getByRole<HTMLInputElement>(document.body, "switch", { name: "Touch ID" });
   expect(toggle.checked).toBe(false);
   expect(toggle.disabled).toBe(true);
   await click(getByRole(document.body, "button", { name: "Retry" }));
-  expect(removeLocalUnlockMethod).toHaveBeenCalledExactlyOnceWith("native");
+  expect(retryNativeKeyCleanup).toHaveBeenCalledExactlyOnceWith({ background: false });
+  expect(removeLocalUnlockMethod).not.toHaveBeenCalled();
   expect(toggle.disabled).toBe(false);
 });
+
+it("keeps a native slot enabled when enrollment finishes before the cleanup retry", async () => {
+  vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("touchid");
+  vi.stubGlobal("navigator", { userAgent: "Macintosh", locks: { request: vi.fn() } });
+  vi.mocked(hasPendingNativeUnlockRemoval).mockResolvedValueOnce(true);
+  await show("security");
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["password", "native"]);
+  await click(getByRole(document.body, "button", { name: "Retry" }));
+  expect(retryNativeKeyCleanup).toHaveBeenCalledExactlyOnceWith({ background: false });
+  expect(removeLocalUnlockMethod).not.toHaveBeenCalled();
+  expect(getByRole<HTMLInputElement>(document.body, "switch", { name: "Touch ID" }).checked).toBe(true);
+  expect(queryByRole(document.body, "button", { name: "Retry" })).toBeNull();
+});
+
+it.each([
+  ["Macintosh", "Touch ID", { biometricUnlockCleanup: true }],
+  ["iPhone", "Biometrics", { biometricUnlockRemove: true }],
+  ["iPhone", "Face ID", { biometricUnlockRemove: true, biometricUnlockKind: "faceid" }],
+  ["Windows", "Windows Hello", { biometricUnlockRemove: true }],
+  ["Android", "Fingerprint", { androidBiometricProbe: true, androidBiometricKind: "fingerprint" }],
+] as const)("removes an enrolled slot and retries cleanup in the %s shell", async (userAgent, name, flags) => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", flags);
+  vi.spyOn(navigator, "userAgent", "get").mockReturnValue(userAgent);
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["password", "native"]);
+  await show("security");
+  const toggle = getByRole<HTMLInputElement>(document.body, "switch", { name });
+  expect(toggle.checked).toBe(true);
+  expect(toggle.disabled).toBe(false);
+  vi.mocked(hasPendingNativeUnlockRemoval).mockResolvedValueOnce(true);
+  await click(toggle);
+  expect(toggle.checked).toBe(false);
+  expect(toggle.disabled).toBe(true);
+  await click(getByRole(document.body, "button", { name: "Retry" }));
+  expect(removeLocalUnlockMethod).toHaveBeenCalledExactlyOnceWith("native", expect.any(Function));
+  expect(retryNativeKeyCleanup).toHaveBeenCalledExactlyOnceWith({ background: false });
+  expect(queryByRole(document.body, "switch", { name })).toBeNull();
+  if (userAgent === "Windows") expect(document.body.textContent).not.toContain("Biometrics");
+});
+
+it("can turn Touch ID off without Web Locks and suppresses the new enrollment offer", async () => {
+  vi.spyOn(capabilities, "biometricUnlock", "get").mockReturnValue("touchid");
+  vi.stubGlobal("navigator", { userAgent: "Macintosh" });
+  vi.mocked(listLocalUnlockMethods).mockResolvedValueOnce(["password", "native"]);
+  sessionStorage.setItem("unlock-offer:this-device", "new");
+  try {
+    await show("security");
+    expect(queryByRole(document.body, "button", { name: "Turn on Touch ID" })).toBeNull();
+    await click(getByRole(document.body, "switch", { name: "Touch ID" }));
+    expect(removeLocalUnlockMethod).toHaveBeenCalledExactlyOnceWith("native", expect.any(Function));
+    expect(queryByRole(document.body, "switch", { name: "Touch ID" })).toBeNull();
+  } finally { sessionStorage.removeItem("unlock-offer:this-device"); }
+});
+
+it.each(["Security switch", "unlock offer"] as const)("explains unsupported Windows Hello enrollment from the %s", async entry => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlock: "windows-hello" });
+  vi.stubGlobal("navigator", { userAgent: "Windows", locks: { request: vi.fn() } });
+  const enroll = vi.fn(() => biometricUnlock.enroll("new-slot", new Uint8Array(32)));
+  vi.mocked(invoke).mockRejectedValueOnce("unsupported");
+  vi.mocked(bindLocalUnlockEnrollment).mockReturnValue(enroll);
+  sessionStorage.setItem("unlock-offer:this-device", "new");
+  try {
+    await show("security");
+    const toggle = getByRole<HTMLInputElement>(document.body, "switch", { name: "Windows Hello" });
+    const offer = getByRole(document.body, "button", { name: "Turn on Windows Hello" });
+    await click(entry === "Security switch" ? toggle : offer);
+    expect(enroll).toHaveBeenCalledExactlyOnceWith({ method: "native" });
+    expect(toggle.checked).toBe(false);
+    expect(toggle.disabled).toBe(true);
+    expect(document.body.textContent).toContain("This device doesn't support setting up Windows Hello for Private Base.");
+    expect(queryByRole(document.body, "button", { name: "Turn on Windows Hello" })).toBeNull();
+    expect(document.body.textContent).not.toContain("Biometrics");
+  } finally { sessionStorage.removeItem("unlock-offer:this-device"); }
+});
+
+it("offers a visible Settings retry after a transient probe failure", async () => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { androidBiometricProbe: true });
+  vi.mocked(invoke).mockRejectedValueOnce("failed");
+  await refreshNativeUnlockCapability();
+  await show("security");
+  expect(document.body.textContent).toContain("is unavailable. Check your device’s unlock settings and try again.");
+  expect(getByRole<HTMLInputElement>(document.body, "switch", { name: "Biometrics" }).disabled).toBe(true);
+  vi.mocked(invoke).mockResolvedValueOnce("fingerprint");
+  await click(getByRole(document.body, "button", { name: "Try again" }));
+  expect(getByRole<HTMLInputElement>(document.body, "switch", { name: "Fingerprint" }).disabled).toBe(false);
+});
+
 it("hides Notifications and its toggle without the Android background capability", async () => {
   await show("notifications");
   expect(document.body.textContent).not.toContain("Stay connected in background");

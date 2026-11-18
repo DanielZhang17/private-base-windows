@@ -27,20 +27,21 @@ import {
   type PasskeyProvisionBundle,
   type DeviceLinkPublicBundle,
 } from "@e2ee-chat/shared";
-import { saveKey, saveKeys, getKey, clearAll, clearCryptoState, migrateLocalEditKeys, pendingResetNativeKeyIds, clearResetNativeKeyId,
-  recordNativeKeyCleanup, hasNativeKeyCleanup,
+import { saveKey, saveKeys, sameLocalKey, getKey, clearAll, clearCryptoState, migrateLocalEditKeys, pendingResetNativeKeyIds, clearResetNativeKeyId,
+  recordNativeEnrollment, abandonNativeEnrollment, pendingNativeEnrollmentIds, claimNativeCleanup, releaseNativeCleanup,
   type LocalKey, type PendingSetupRecord } from "../db/index.js";
 import { api } from "../services/api.js";
 import { clearRegisteredLocalCallState } from "../platform/session-cleanup.js";
 
 import {
   deriveEncryptionKey, generateVault, readVault, vaultRecord,
-  enrollNativeUnlockSlot, wrapUnlockSlot, unwrapUnlockSlot, unlockMethodAvailable,
-  type DeviceVault, type UnlockSlot, type UnlockSetup, type UnlockMethod,
+  wrapUnlockSlot, unwrapUnlockSlot, unlockMethodAvailable, type DeviceVault, type UnlockSetup, type UnlockMethod, type UnlockSlot,
 } from "./device-key-vault.js";
 import { decryptData, encryptData, localEncryptionKey as _encryptionKey, openAttachmentBytes, sealAttachmentBytes,
   setLocalEncryptionKey, type SealedAttachment } from "./local-key-encryption.js";
-import { biometricUnlock } from "../platform/biometric-unlock.js";
+import { biometricUnlock, hasExclusiveNativeDocument, hasNativeWebLocks, NativeBiometricError,
+  refreshNativeUnlockCapability } from "../platform/biometric-unlock.js";
+import { assertNotAborted, withNativeDeadline } from "../platform/native-wait.js";
 import { notifyUnlockMethodsChanged } from "./unlock-method-changes.js";
 
 const IDENTITY_KEY_ID = "identity";
@@ -125,7 +126,6 @@ let _bundleUpload: Promise<void> | null = null;
 let _bundlePublished = false;
 /** Counts unlocks (key generation or loading) of this tab; never shared with other tabs. */
 let _unlockGeneration = 0;
-const activeNativeEnrollments = new Set<string>();
 
 const IDLE_LOCK_MS = 15 * 60 * 1_000; // 15 minutes
 // The window overload returns a DOM handle even when dependency types add Node timer overloads.
@@ -211,41 +211,94 @@ async function generateDeviceKeys() {
 
 type PreparedDeviceKeys = Awaited<ReturnType<typeof generateDeviceKeys>>;
 
-const nativeKeyLock = (keyId: string) => `native-unlock:${keyId}`;
+const nativeKeyLock = "privatebase-native-unlock";
+let nativeOperations = Promise.resolve();
+let nativeOperationsPending = 0;
 
-async function removePendingNativeKey(keyId: string): Promise<void> {
-  if (!await hasNativeKeyCleanup(keyId)) return;
-  await biometricUnlock.remove(keyId);
-  await clearResetNativeKeyId(keyId);
+async function withNativeKeyLock(
+  operation: (canRecoverEnrollment: boolean) => Promise<void>, background = false, signal?: AbortSignal,
+): Promise<void> {
+  // A background run can retry later if a prompt or removal already owns the claim.
+  if (background && nativeOperationsPending) return;
+  nativeOperationsPending++;
+  try {
+    let result!: Promise<void>;
+    await withNativeDeadline(60_000, async waiting => {
+      let enter!: () => void;
+      const admitted = new Promise<void>(resolve => { enter = resolve; });
+      const run = (canRecoverEnrollment: boolean) => {
+        assertNotAborted(waiting);
+        enter();
+        return operation(canRecoverEnrollment);
+      };
+      result = nativeOperations.then(async () => {
+        assertNotAborted(waiting);
+        if (hasNativeWebLocks()) {
+          const options = background ? { ifAvailable: true } : { signal: waiting };
+          await navigator.locks.request(nativeKeyLock, options, lock => lock ? run(true) : undefined);
+        } else await run(hasExclusiveNativeDocument());
+      });
+      nativeOperations = result.catch(() => undefined);
+      await Promise.race([admitted, result]);
+    }, signal);
+    // Once admitted, keep the lock until the operation settles. Each IPC has its own deadline.
+    await result;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError") throw new NativeBiometricError("failed");
+    throw error;
+  }
+  finally { nativeOperationsPending--; }
 }
+
+type PreparedUnlockSlot = { key: CryptoKey; save: (slot: UnlockSlot) => Promise<void> };
 
 async function commitUnlockSlot(
-  key: CryptoKey, setup: UnlockSetup, assertCurrent: () => void,
-  commit: (slot: UnlockSlot, nativeEnrollmentId?: string) => Promise<void>,
+  setup: UnlockSetup, assertCurrent: () => void, prepare: () => PreparedUnlockSlot | Promise<PreparedUnlockSlot>, signal?: AbortSignal,
 ): Promise<void> {
-  if (setup.method !== "native") return commit(await wrapUnlockSlot(key, setup));
-  const keyId = crypto.randomUUID();
-  const enroll = async () => {
-    activeNativeEnrollments.add(keyId);
-    try {
-      // Startup and resets can remove this key even if the webview closes
-      // between the native write and the IndexedDB slot commit.
-      await recordNativeKeyCleanup(keyId);
+  if (setup.method !== "native") {
+    const { key, save } = await prepare();
+    return save(await wrapUnlockSlot(key, setup));
+  }
+  let retryCleanup = false;
+  try {
+    await withNativeKeyLock(async canRecoverEnrollment => {
+      if (!canRecoverEnrollment) throw new NativeBiometricError("unsupported");
+      if (await hasPendingNativeUnlockRemoval()) {
+        await drainNativeKeyJournal(canRecoverEnrollment, signal);
+        assertNotAborted(signal);
+        if (await hasPendingNativeUnlockRemoval()) throw new Error("Finish removing the previous native unlock key");
+      }
+      assertCurrent();
+      const { key, save } = await prepare();
+      const keyId = crypto.randomUUID();
+      assertNotAborted(signal);
+      await recordNativeEnrollment(keyId);
       try {
         assertCurrent();
-        await commit(await enrollNativeUnlockSlot(key, keyId), keyId);
+        const slot = await wrapUnlockSlot(key, { method: "native", keyId }, signal);
+        assertNotAborted(signal);
+        await save(slot);
       } catch (error) {
-        await removePendingNativeKey(keyId).catch(() => undefined);
+        // Only the shell's bundled web version uses the native IndexedDB origin.
+        // Browser tabs use a separate origin and cannot share this journal.
+        // If commit succeeded before a session lock, the journal entry is already gone.
+        await abandonNativeEnrollment(keyId).catch(() => undefined);
+        if (signal) retryCleanup = true;
+        else await drainNativeKeyJournal(false).catch(() => undefined);
+        notifyUnlockMethodsChanged();
         throw error;
       }
-    } finally {
-      activeNativeEnrollments.delete(keyId);
-    }
-  };
-  await (navigator.locks ? navigator.locks.request(nativeKeyLock(keyId), enroll) : enroll());
+      void refreshNativeUnlockCapability({ afterPending: true });
+    }, false, signal);
+  } finally {
+    if (retryCleanup) void retryNativeKeyCleanup().catch(() => undefined);
+  }
 }
 
-async function commitDeviceKeys(prepared: PreparedDeviceKeys, setup: UnlockSetup, epoch: number, fresh = false, checkpoint?: { record: PendingSetupRecord; owner: LocalKeyOwner }) {
+async function commitDeviceKeys(
+  prepared: PreparedDeviceKeys, setup: UnlockSetup, epoch: number, fresh = false,
+  checkpoint?: { record: PendingSetupRecord; owner: LocalKeyOwner }, signal?: AbortSignal,
+) {
   const { vault, encKey, identityKeyPair, signedPreKey, oneTimePreKeys } = prepared;
   // Encrypt every private record before opening the write transaction.
   const serialized = serializeIdentityKeyPair(identityKeyPair);
@@ -272,7 +325,7 @@ async function commitDeviceKeys(prepared: PreparedDeviceKeys, setup: UnlockSetup
   const otpEnc = await encryptData(encKey, new TextEncoder().encode(JSON.stringify(otpData)));
   const nextId = OTP_KEY_POOL_SIZE + 1;
   const assertCurrent = () => { if (_lockEpoch !== epoch) throw new KeysLockedError(); };
-  await commitUnlockSlot(encKey, setup, assertCurrent, async (slot, nativeEnrollmentId) => {
+  const save = async (slot: UnlockSlot) => {
     vault.slots = [slot];
     await withOneTimePreKeyLock(async () => {
       assertCurrent();
@@ -284,14 +337,19 @@ async function commitDeviceKeys(prepared: PreparedDeviceKeys, setup: UnlockSetup
         { id: OTP_NEXT_ID, type: OTP_NEXT_ID, data: String(nextId) },
         { id: OTP_PENDING_IDS, type: OTP_PENDING_IDS, data: "[]" },
         ...(checkpoint ? [{ id: "owner", type: "owner", data: JSON.stringify(checkpoint.owner) }] : []),
-      ], fresh ? [{ id: DB_ENCRYPTION_KEY_ID }, { id: IDENTITY_KEY_ID }] : [], checkpoint?.record, undefined, nativeEnrollmentId);
+      ], fresh ? [{ id: DB_ENCRYPTION_KEY_ID }, { id: IDENTITY_KEY_ID }] : [], checkpoint?.record, () => {
+        assertCurrent();
+        assertNotAborted(signal);
+      },
+      slot.method === "native" ? { enrolled: slot.keyId } : undefined);
       notifyUnlockMethodsChanged();
       assertCurrent();
       publishUnlockedKeys(encKey, vault.id, identityKeyPair, signedPreKey, {
         keys: oneTimePreKeys, nextId, pendingIds: new Set(),
       });
     });
-  });
+  };
+  await commitUnlockSlot(setup, assertCurrent, () => ({ key: encKey, save }), signal);
 }
 
 /** Generate fresh keys in memory. Persist them under an unlock method before publishing the bundle. */
@@ -308,9 +366,9 @@ export async function prepareDeviceKeySetup(deviceName: string, platform: Device
   const bundle: PasskeyProvisionBundle = { ...unsigned, bundleSignature: toBase64Url(signature) };
   return {
     bundle,
-    commit: async (setup: UnlockSetup, checkpoint?: { record: PendingSetupRecord; owner: LocalKeyOwner }) => {
+    commit: async (setup: UnlockSetup, checkpoint?: { record: PendingSetupRecord; owner: LocalKeyOwner }, signal?: AbortSignal) => {
       if (!prepared) throw new Error("Device setup has ended");
-      await commitDeviceKeys(prepared, setup, epoch, true, checkpoint);
+      await commitDeviceKeys(prepared, setup, epoch, true, checkpoint, signal);
       prepared = undefined;
     },
     discard: () => { prepared = undefined; },
@@ -372,15 +430,21 @@ export function loadKeys(password: string): Promise<void> {
   return unlockLocalKeys("password", password);
 }
 
-export async function unlockLocalKeys(method: UnlockMethod, password?: string, onUnwrap?: () => void): Promise<void> {
+export async function unlockLocalKeys(method: UnlockMethod, password?: string, onUnwrap?: () => void, signal?: AbortSignal): Promise<void> {
+  assertNotAborted(signal);
   lockLocalCryptoState();
   const epoch = _lockEpoch;
-  const assertCurrent = () => { if (_lockEpoch !== epoch) throw new KeysLockedError(); };
+  const assertCurrent = () => {
+    assertNotAborted(signal);
+    if (_lockEpoch !== epoch) throw new KeysLockedError();
+  };
   // Keep biometric prompts outside the cross-tab lock so a prompt cannot block pre-key operations.
   const initialRecord = await getKey(DB_ENCRYPTION_KEY_ID);
   const initialVault = readVault(initialRecord);
   const slot = initialVault?.slots.find((entry) => entry.method === method);
-  const unlockedKey = slot && await unwrapUnlockSlot(slot, password);
+  assertCurrent();
+  const unlockedKey = slot && await unwrapUnlockSlot(slot, password, signal);
+  assertCurrent();
   onUnwrap?.();
   await withOneTimePreKeyLock(async () => {
     assertCurrent();
@@ -491,7 +555,8 @@ export async function localPasskeyUnlockId(): Promise<string | undefined> {
 }
 
 export async function hasPendingNativeUnlockRemoval(): Promise<boolean> {
-  return !!readVault(await getKey(DB_ENCRYPTION_KEY_ID))?.pendingNativeRemoval;
+  return !!readVault(await getKey(DB_ENCRYPTION_KEY_ID))?.pendingNativeRemoval ||
+    !!(await pendingNativeEnrollmentIds()).length || !!(await pendingResetNativeKeyIds()).length;
 }
 
 export async function isOnlyLocalPasskeyUnlock(credentialId: string): Promise<boolean> {
@@ -509,19 +574,21 @@ export function bindLocalUnlockEnrollment(isCurrent: () => boolean = () => true)
     }
   };
   assertCurrent();
-  return async (setup: UnlockSetup): Promise<void> => {
+  return async (setup: UnlockSetup, { retireNative = false } = {}): Promise<void> => {
     assertCurrent();
-    const { vault, record, key } = await unlockedVault();
-    assertCurrent();
-    if (setup.method === "native" && vault.slots.some(slot => slot.method === "native")) {
-      throw new Error("Native unlock is already enrolled");
-    }
-    if (setup.method === "native" && vault.pendingNativeRemoval) {
-      throw new Error("Finish removing the previous native unlock key");
-    }
-    await commitUnlockSlot(key, setup, assertCurrent, async (slot, nativeEnrollmentId) => {
-      vault.slots = [...vault.slots.filter(entry => entry.method !== setup.method), slot];
-      await saveKeys([vaultRecord(vault)], [record], undefined, assertCurrent, nativeEnrollmentId);
+    await commitUnlockSlot(setup, assertCurrent, async () => {
+      const { vault, record, key } = await unlockedVault();
+      assertCurrent();
+      if (setup.method === "native" && vault.slots.some(slot => slot.method === "native")) {
+        throw new Error("Native unlock is already enrolled");
+      }
+      return { key, save: async slot => {
+        const retired = retireNative && slot.method === "password" ? vault.slots.find(entry => entry.method === "native") : undefined;
+        vault.slots = [...vault.slots.filter(entry => entry.method !== setup.method && entry !== retired), slot];
+        await saveKeys([vaultRecord(vault)], [record], undefined, assertCurrent,
+          slot.method === "native" ? { enrolled: slot.keyId } : retired ? { remove: retired.keyId } : undefined);
+        if (retired) void retryNativeKeyCleanup().catch(() => undefined);
+      } };
     });
     notifyUnlockMethodsChanged();
   };
@@ -531,13 +598,29 @@ export async function enrollLocalUnlockMethod(setup: UnlockSetup): Promise<void>
   await bindLocalUnlockEnrollment()(setup);
 }
 
-export async function removeLocalUnlockMethod(method: UnlockMethod): Promise<void> {
-  const { vault, record, key } = await unlockedVault();
+export async function removeLocalUnlockMethod(method: UnlockMethod, isCurrent: () => boolean = () => true): Promise<void> {
+  const snapshot = await unlockedVault();
+  const assertCurrent = () => {
+    if (_encryptionKey !== snapshot.key || _vaultId !== snapshot.vault.id || !isCurrent()) throw new KeysLockedError();
+  };
+  assertCurrent();
+  if (method !== "native") return removeUnlockSlot(method, snapshot, assertCurrent);
+  await withNativeKeyLock(async canRecoverEnrollment => {
+    const record = await getKey(DB_ENCRYPTION_KEY_ID);
+    assertCurrent();
+    if (!sameLocalKey(record, snapshot.record)) throw new Error("Local keys changed in another session");
+    await removeUnlockSlot(method, snapshot, assertCurrent);
+    const failures = await drainNativeKeyJournal(canRecoverEnrollment);
+    if (failures.length) throw failures[0];
+    if (await hasPendingNativeUnlockRemoval()) throw new Error("Native unlock cleanup is still pending");
+  });
+}
+
+async function removeUnlockSlot(
+  method: UnlockMethod, { vault, record, key }: Awaited<ReturnType<typeof unlockedVault>>, assertCurrent: () => void,
+): Promise<void> {
   const slot = vault.slots.find(entry => entry.method === method);
-  if (!slot) {
-    if (method === "native" && vault.pendingNativeRemoval) await finishNativeUnlockRemoval(vault.pendingNativeRemoval);
-    return;
-  }
+  if (!slot) return;
   const remaining = vault.slots.filter(slot => slot.method !== method);
   if (!remaining.some(slot => slot.method === "password")) {
     const alternate = remaining.find(slot => unlockMethodAvailable(slot.method));
@@ -548,23 +631,7 @@ export async function removeLocalUnlockMethod(method: UnlockMethod): Promise<voi
     await decryptData(candidate, proof.iv, proof.ciphertext);
   }
   vault.slots = remaining;
-  // Persist the identifier with the slot removal so an interrupted native command is retryable.
-  if (slot.method === "native") vault.pendingNativeRemoval = slot.keyId;
-  await saveKeys([vaultRecord(vault)], [record], undefined, () => {
-    if (_encryptionKey !== key) throw new KeysLockedError();
-  });
-  notifyUnlockMethodsChanged();
-  if (slot.method === "native") await finishNativeUnlockRemoval(slot.keyId);
-}
-
-async function finishNativeUnlockRemoval(keyId: string) {
-  await biometricUnlock.remove(keyId);
-  const { vault, record, key } = await unlockedVault();
-  if (vault.pendingNativeRemoval !== keyId) return;
-  delete vault.pendingNativeRemoval;
-  await saveKeys([vaultRecord(vault)], [record], undefined, () => {
-    if (_encryptionKey !== key) throw new KeysLockedError();
-  });
+  await saveKeys([vaultRecord(vault)], [record], undefined, assertCurrent, slot.method === "native" ? { remove: slot.keyId } : undefined);
   notifyUnlockMethodsChanged();
 }
 
@@ -892,16 +959,47 @@ function nativeKeyForCleanup(record: LocalKey | undefined): string | undefined {
   return vault?.slots.find(slot => slot.method === "native")?.keyId ?? vault?.pendingNativeRemoval;
 }
 
-export async function retryNativeKeyCleanup(): Promise<void> {
-  const keyIds = await pendingResetNativeKeyIds();
-  await Promise.allSettled(keyIds.map(async keyId => {
-    if (activeNativeEnrollments.has(keyId)) return;
-    if (navigator.locks) {
-      await navigator.locks.request(nativeKeyLock(keyId), { ifAvailable: true }, async lock => {
-        if (lock) await removePendingNativeKey(keyId);
-      });
-    } else await removePendingNativeKey(keyId);
-  }));
+export async function retryNativeKeyCleanup({ background = true } = {}): Promise<void> {
+  await withNativeKeyLock(async canRecoverEnrollment => {
+    const failures = await drainNativeKeyJournal(canRecoverEnrollment);
+    if (!background && failures.length) throw failures[0];
+  }, background);
+}
+
+async function drainNativeKeyJournal(canRecoverEnrollment: boolean, signal?: AbortSignal): Promise<unknown[]> {
+  // The lease also coordinates removal-only documents that lack Web Locks.
+  // Expiry can repeat an idempotent removal and never authorizes recovery of an enrollment.
+  const owner = crypto.randomUUID();
+  if (!await claimNativeCleanup(owner)) return [];
+  try { return await drainClaimedNativeJournal(owner, canRecoverEnrollment, signal); }
+  finally { await releaseNativeCleanup(owner); }
+}
+
+async function drainClaimedNativeJournal(owner: string, canRecoverEnrollment: boolean, signal?: AbortSignal): Promise<unknown[]> {
+  // Older clients stored interrupted removals on the vault itself.
+  const record = await getKey(DB_ENCRYPTION_KEY_ID);
+  const vault = readVault(record);
+  const legacyRemoval = vault?.pendingNativeRemoval;
+  if (record && vault && legacyRemoval) {
+    delete vault.pendingNativeRemoval;
+    await saveKeys([vaultRecord(vault)], [record], undefined, undefined, { remove: legacyRemoval });
+  }
+  if (canRecoverEnrollment) {
+    for (const keyId of await pendingNativeEnrollmentIds()) await abandonNativeEnrollment(keyId);
+  }
+  const failures: unknown[] = [];
+  for (const keyId of await pendingResetNativeKeyIds()) {
+    assertNotAborted(signal);
+    if (!await claimNativeCleanup(owner, true)) break;
+    try {
+      if (signal) await biometricUnlock.remove(keyId, signal);
+      else await biometricUnlock.remove(keyId);
+      await clearResetNativeKeyId(keyId);
+      notifyUnlockMethodsChanged();
+    }
+    catch (error) { failures.push(error); }
+  }
+  return failures;
 }
 
 /** Clears local crypto state, including orphaned key material after a failed registration. */
@@ -909,23 +1007,21 @@ export async function resetLocalCryptoState(expectedSetupId?: string, expectedVa
   const recoveryKey = _encryptionKey;
   const recoveryVaultId = _vaultId;
   lockLocalCryptoState();
-  return withOneTimePreKeyLock(async () => {
+  const cleared = await withOneTimePreKeyLock(async () => {
     await _otpWrites;
     const record = await getKey(DB_ENCRYPTION_KEY_ID);
     const vault = readVault(record);
     if (expectedVaultId && vault?.id !== expectedVaultId) return false;
     const recovery = recoveryKey && record && vault?.id === recoveryVaultId ? { key: recoveryKey, vault: record } : undefined;
-    if (!await clearCryptoState(expectedSetupId, expectedVaultId ? record : undefined, nativeKeyForCleanup, recovery)) return false;
-    await retryNativeKeyCleanup().catch(() => undefined);
-    return true;
+    return clearCryptoState(expectedSetupId, expectedVaultId ? record : undefined, nativeKeyForCleanup, recovery);
   });
+  if (cleared) void retryNativeKeyCleanup().catch(() => undefined);
+  return cleared;
 }
 
 /** Use after the user confirms that local history and keys should be erased. */
 export async function resetLocalDevice(expectedKey?: LocalKey): Promise<boolean> {
-  return withOneTimePreKeyLock(async () => {
-    if (!await clearAll(expectedKey, lockLocalCryptoState, nativeKeyForCleanup)) return false;
-    await retryNativeKeyCleanup().catch(() => undefined);
-    return true;
-  });
+  const cleared = await withOneTimePreKeyLock(() => clearAll(expectedKey, lockLocalCryptoState, nativeKeyForCleanup));
+  if (cleared) void retryNativeKeyCleanup().catch(() => undefined);
+  return cleared;
 }

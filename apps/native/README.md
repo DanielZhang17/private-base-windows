@@ -410,18 +410,24 @@ this branch's validation.
 
 ### Windows Hello device unlock
 
-The local Windows main window exposes the three biometric IPC commands. Startup
-only queries `KeyCredentialManager.IsSupportedAsync()` on an MTA worker and
-waits at most 250 ms. The shell adds `biometricUnlock: "windows-hello"` before
-frontend JS starts when Windows reports readiness. It also offers Hello if the
-probe times out, is otherwise inconclusive, or an existing slot needs unlock or
-cleanup. The startup probe is noninteractive. Enrollment goes directly to
-credential creation, which reports current availability.
+The local Windows main window exposes the enroll, unlock, remove, and probe
+commands. With a local data path, the shell merges `biometricUnlockProbe: true`,
+`biometricUnlockRemove: true`, and `biometricUnlockKind: "windows-hello"` into
+the capabilities before frontend JS starts. It adds
+`biometricUnlock: "windows-hello"` only if the silent startup query confirms
+readiness within 250 ms. The live probe checks
+`KeyCredentialManager.IsSupportedAsync()` on an MTA worker and waits at most one
+second. It returns `"windows-hello"` when available, `null` when unavailable,
+and retryable `failed` on a transient error or timeout. The probe concerns
+current availability. Unlock checks the requested slot even if the probe is
+pending. Windows uses Web Locks for web enrollment coordination. Windows
+accepts an optional `locale` on enroll and unlock and uses the system Hello UI.
 
 Enroll and unlock request Windows Hello verification for a fixed per-vault
 challenge bound to the installation. Hello can verify a face, fingerprint, or
 TPM-backed Windows Hello PIN. Explicit enrollment creates the vault credential,
-requires TPM attestation, and signs the same challenge twice. Both signatures
+requires TPM attestation, and signs the same challenge twice. Enrollment goes
+directly to credential creation to check current availability. Both signatures
 must be identical and verify as RSA PKCS#1 v1.5 with SHA-256. Enrollment returns
 `unsupported` if either check fails. The signing code wipes the original WinRT
 buffer after copying the signature into zeroizing storage.
@@ -432,8 +438,14 @@ could not confirm. The web client also records the UUID in the IndexedDB cleanup
 queue before invoking enrollment. The transaction that saves the usable slot
 removes that queue entry. If the webview closes before the transaction commits,
 startup or reset can retry deletion of the orphaned credential and wrapped key.
-Settings and the unlock offer share the unsupported result. Transient service
-and public-key export failures remain retryable.
+The native handler acquires an exclusive file lock for the store before
+scheduling enrollment. The worker keeps the lock until enrollment finishes,
+including rollback. Removal is noninteractive and returns retryable `failed`
+if the store is busy, including when a reload or another process attempts
+cleanup while an earlier enrollment can still write. Windows releases the lock
+when its owning process exits. Transient service and public-key export
+failures remain retryable. Settings and the unlock offer stop offering
+enrollment when native returns `unsupported` for a definitive limitation.
 
 The backend derives an AES-256-GCM wrapping key from the Hello signature with
 HKDF-SHA-256 and protects the wrapped record with user-scoped DPAPI in the app's
@@ -447,7 +459,8 @@ or fingerprint set does not by itself invalidate the slot.
 The removal path derives the new credential name from the vault ID, so it can
 delete the credential even if the installation ID is unreadable or missing, or
 the wrapped file no longer exists.
-It removes the record after Windows confirms the credential is gone. Legacy
+It removes the record after Windows confirms the credential is gone. An
+already-absent credential and record count as success. Legacy
 records remain readable with their original installation ID. Removal verifies
 the legacy record against that ID. If the ID is missing or has been replaced,
 removal preserves the record and reports a retryable failure because it cannot

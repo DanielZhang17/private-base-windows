@@ -8,6 +8,7 @@
   "permissions": [
     "allow-biometric-unlock-enroll",
     "allow-biometric-unlock",
-    "allow-biometric-unlock-remove"
+    "allow-biometric-unlock-remove",
+    "allow-biometric-unlock-probe"
   ]
 }

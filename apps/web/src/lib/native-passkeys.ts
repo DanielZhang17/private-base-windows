@@ -4,6 +4,7 @@ import { signWithIdentityKey } from "./key-manager.js";
 import type { AuthResponse, PasskeyProvisionBundle, PendingPasskeySetup } from "@e2ee-chat/shared";
 import { api } from "../services/api.js";
 import { createPasskeyHandoff, PASSKEY_HANDOFF_ORIGIN, startPasskeyHandoff } from "../platform/passkeyHandoff.js";
+import { abortReason, assertNotAborted } from "../platform/native-wait.js";
 
 async function getNativePasskeyCode(bundleHash?: string, signal?: AbortSignal) {
   const { state, codeVerifier, codeChallenge } = await createPasskeyHandoff();
@@ -13,8 +14,8 @@ async function getNativePasskeyCode(bundleHash?: string, signal?: AbortSignal) {
     ...(bundleHash ? { mode: "provision", bundleHash } : {}),
   }).toString();
   const controller = new AbortController();
-  signal?.throwIfAborted();
-  const cancel = () => controller.abort(signal?.reason);
+  assertNotAborted(signal);
+  const cancel = () => { if (signal) controller.abort(abortReason(signal)); };
   const timer = setTimeout(() => controller.abort(new LocalizedError("passkeySetup.browserTimeout")), 180_000);
   signal?.addEventListener("abort", cancel, { once: true });
   try {
@@ -24,9 +25,9 @@ async function getNativePasskeyCode(bundleHash?: string, signal?: AbortSignal) {
 }
 
 async function redeemNativePasskey<T>(body: object, caller?: AbortSignal) {
-  caller?.throwIfAborted();
+  assertNotAborted(caller);
   const controller = new AbortController();
-  const cancel = () => controller.abort(caller?.reason);
+  const cancel = () => { if (caller) controller.abort(abortReason(caller)); };
   const timer = setTimeout(() => controller.abort(), 30_000);
   caller?.addEventListener("abort", cancel, { once: true });
   try { return await api.post<T>("/auth/passkey/handoff/redeem", body, { signal: controller.signal }); }
