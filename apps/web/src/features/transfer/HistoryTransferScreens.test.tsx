@@ -1,5 +1,5 @@
 import { fireEvent, getByRole, getByText, queryByRole, waitFor } from "@testing-library/dom";
-import { act, useState } from "react";
+import { act, useState, useSyncExternalStore } from "react";
 import { HISTORY_TRANSFER_VERSION } from "@e2ee-chat/shared";
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
@@ -140,12 +140,44 @@ it("offers both roles from Linked devices", async () => {
     <Route path="/devices" element={<LinkedDevicesTransfer devices={[]} />} />
     <Route path={TRANSFER_PATH} element={<HistoryTransferScreen />} />
   </Routes></ToastProvider></MemoryRouter>);
-  await click(getByRole(container(), "button", { name: /transfer history/i }));
   expect(getByRole(container(), "heading", { name: "Transfer history" })).toBeTruthy();
   expect(getByRole(container(), "button", { name: /get history on this device/i })).toBeTruthy();
   expect(getByRole(container(), "button", { name: /send history from this device/i })).toBeTruthy();
   await click(getByRole(container(), "button", { name: /send history from this device/i }));
   expect(queryByRole(container(), "heading", { name: "Transfer history" })).toBeNull();
+});
+
+it("starts a fresh code after Back then Forward from a waiting receive link", async () => {
+  type State = { phase: ReturnType<typeof useHistoryTransfer>["phase"]; role?: "receiver" };
+  let state: State = { phase: "idle" };
+  const listeners = new Set<() => void>();
+  const set = (next: State) => { state = next; listeners.forEach((listener) => listener()); };
+  const startAsReceiver = vi.fn(async () => set({ phase: "waiting", role: "receiver" }));
+  const stop = vi.fn(() => { if (state.phase !== "idle") set({ ...state, phase: "cancelled" }); });
+  const dismiss = vi.fn(() => set({ phase: "idle" }));
+  const actions = { startAsReceiver, stop, dismiss, showTransfer: vi.fn(), continueInBackground: vi.fn(() => false),
+    listInterrupted: async () => [], progress: { records: 0, totalRecords: 0, bytes: 0, totalBytes: 0 }, requiresPairing: false };
+  vi.spyOn(transfer, "useHistoryTransfer").mockImplementation(() => {
+    const current = useSyncExternalStore((listener) => { listeners.add(listener); return () => listeners.delete(listener); }, () => state);
+    return { ...actions, ...current } as unknown as ReturnType<typeof useHistoryTransfer>;
+  });
+  let go: ReturnType<typeof useNavigate> = () => undefined;
+  function History() { go = useNavigate(); return null; }
+  await render(<MemoryRouter initialEntries={["/devices"]}><ToastProvider><HistoryTransferOwner /><History /><Routes>
+    <Route path="/devices" element={<LinkedDevicesTransfer devices={[]} />} />
+    <Route path={TRANSFER_PATH} element={<HistoryTransferScreen />} />
+  </Routes></ToastProvider></MemoryRouter>);
+  await click(getByRole(container(), "button", { name: /get history on this device/i }));
+  await waitFor(() => expect(state.phase).toBe("waiting"));
+  expect(startAsReceiver).toHaveBeenCalledOnce();
+  await act(async () => { await go(-1); });
+  expect(getByRole(container(), "button", { name: /get history on this device/i })).toBeTruthy();
+  expect(stop).toHaveBeenCalledOnce();
+  expect(state.phase).toBe("idle");
+  await act(async () => { await go(1); });
+  await waitFor(() => expect(startAsReceiver).toHaveBeenCalledTimes(2));
+  expect(queryByRole(container(), "heading", { name: "Transfer stopped" })).toBeNull();
+  expect(state.phase).toBe("waiting");
 });
 
 it("preselects only unfinished chats, applies search bulk actions to non-hidden matches, and keeps attachment copying explicit", async () => {

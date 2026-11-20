@@ -9,6 +9,7 @@ dist/
 .env.*
 !.env.example
 apps/web/dist-native/
+apps/web/dist-native-ota-no-ready/
 apps/native/src-tauri/target/
 apps/native/src-tauri/gen/
 /backups/

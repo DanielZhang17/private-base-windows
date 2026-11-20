@@ -75,7 +75,7 @@ export function SettingsFrame({ section, detail, detailActive = true, title, onS
           </div>
 
           <ul role="list" className="space-y-1">
-            {SETTINGS_SECTIONS.filter(([key]) => (key !== "notifications" || capabilities.backgroundConnection || showWebPushSettings()) && (key !== "about" || !!capabilities.autoUpdate)).map(([key, label, icon]) => <li key={key}>
+            {SETTINGS_SECTIONS.filter(([key]) => (key !== "notifications" || capabilities.backgroundConnection || showWebPushSettings()) && (key !== "about" || capabilities.autoUpdate || capabilities.otaUiAvailable)).map(([key, label, icon]) => <li key={key}>
               <ListItem
                 leading={<Icon name={icon} size={22} />}
                 title={t(label)}

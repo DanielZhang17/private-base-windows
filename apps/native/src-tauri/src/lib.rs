@@ -4,8 +4,16 @@ mod biometric_unlock;
 mod capture_protection;
 #[cfg(any(windows, test))]
 mod files;
+#[path = "ui_bundle.rs"]
+pub mod ota;
 #[cfg(any(windows, test))]
 mod passkey_handoff;
+mod ui_bundle_archive;
+mod ui_bundle_http;
+mod ui_bundle_state;
+#[cfg(all(debug_assertions, any(desktop, target_os = "android")))]
+mod ui_bundle_test_feed;
+mod update_transport;
 #[cfg(desktop)]
 mod updater;
 #[cfg(desktop)]
@@ -34,9 +42,15 @@ fn native_capabilities_script(passkey_handoff: bool, hello_readiness: Option<boo
     )
 }
 
-#[cfg(any(desktop, test))]
 fn native_invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
     let other_commands: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+        ota::ui_bundle_ready,
+        ota::ui_bundle_set_channel,
+        ota::ui_bundle_initialize_channel,
+        ota::ui_bundle_get_pending,
+        ota::ui_bundle_restart,
+        ota::ui_bundle_get_channel,
+        ota::ui_bundle_is_unmetered,
         #[cfg(any(windows, test))]
         passkey_handoff::windows::passkey_handoff_start,
         #[cfg(any(windows, test))]
@@ -65,6 +79,13 @@ fn native_invoke_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync 
     }
 }
 
+fn native_builder() -> tauri::Builder<tauri::Wry> {
+    // On mobile Tauri builds the dev proxy's Reqwest client while creating the
+    // webview, even for an HTTP dev URL. Install Rustls before Tauri starts.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    tauri::Builder::default()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(windows)]
@@ -72,10 +93,19 @@ pub fn run() {
         return;
     }
 
-    let builder = tauri::Builder::default();
+    let builder = native_builder();
+    let mut context = tauri::generate_context!();
+    let launch = ota::prepare(&mut context);
 
     #[cfg(windows)]
-    let builder = passkey_handoff::windows::configure(builder);
+    let builder = passkey_handoff::windows::configure(builder, launch);
+    #[cfg(not(windows))]
+    let builder = builder.setup(move |app| {
+        if let Some(launch) = launch.filter(ota::Launch::creates_main_on_setup) {
+            launch.open_main(app.handle())?;
+        }
+        Ok(())
+    });
 
     let builder = builder
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -93,11 +123,11 @@ pub fn run() {
                 .js_init_script(include_str!("update-capability.js"))
                 .build(),
         )
-        .manage(updater::UpdateState::default())
-        .invoke_handler(native_invoke_handler());
+        .manage(updater::UpdateState::default());
 
     builder
-        .run(tauri::generate_context!())
+        .invoke_handler(native_invoke_handler())
+        .run(context)
         .expect("error while running Private Base");
 }
 
@@ -146,5 +176,12 @@ mod tests {
     #[test]
     fn native_invoke_handler_type_checks_on_host() {
         let _handler = super::native_invoke_handler();
+    }
+
+    #[test]
+    fn native_builder_installs_the_provider_before_reqwest_builds_a_client() {
+        let _ = super::native_builder();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        reqwest::Client::builder().build().unwrap();
     }
 }

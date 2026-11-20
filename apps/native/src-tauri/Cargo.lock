@@ -974,10 +974,15 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2ee-chat-native"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
+ "chrono",
+ "flate2",
  "getrandom 0.4.3",
+ "jni 0.21.1",
+ "minisign-verify",
+ "ndk-context",
  "reqwest",
  "ring",
  "rustls",
@@ -985,8 +990,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tauri",
  "tauri-build",
+ "tauri-codegen",
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-deep-link",
  "tauri-plugin-dialog",
@@ -996,6 +1003,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tauri-utils",
  "tempfile",
  "tokio",
  "windows",

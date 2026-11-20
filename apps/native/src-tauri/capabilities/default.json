@@ -5,6 +5,13 @@
   "windows": ["main"],
   "permissions": [
     "core:app:allow-version",
+    "allow-ui-bundle-ready",
+    "allow-ui-bundle-set-channel",
+    "allow-ui-bundle-initialize-channel",
+    "allow-ui-bundle-get-channel",
+    "allow-ui-bundle-get-pending",
+    "allow-ui-bundle-restart",
+    "allow-ui-bundle-is-unmetered",
     "notification:allow-is-permission-granted",
     "notification:allow-request-permission",
     "notification:allow-notify",

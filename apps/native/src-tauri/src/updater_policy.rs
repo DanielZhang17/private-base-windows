@@ -1,10 +1,8 @@
 use std::cmp::Ordering;
 
+use crate::update_transport::{rollout_bucket, RELEASE_BASE};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
-pub const RELEASE_BASE: &str = "https://dist.718788.xyz/private-base/releases/";
 
 pub fn endpoint(channel: &str) -> Result<String, &'static str> {
     match channel {
@@ -36,14 +34,6 @@ pub struct CheckResult {
     notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mandatory: Option<bool>,
-}
-
-// A fixed SHA-256 bucket is stable across runs, versions, channels and platforms.
-// Use 10,000 buckets so an integer percent always selects exactly that share.
-fn rollout_bucket(install_id: &[u8; 32]) -> u16 {
-    let hash = Sha256::digest(install_id);
-    let prefix = u64::from_be_bytes(hash[..8].try_into().expect("SHA-256 has eight bytes"));
-    (prefix % 10_000) as u16
 }
 
 pub fn evaluate_manifest(

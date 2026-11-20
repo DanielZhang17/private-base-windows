@@ -16,7 +16,7 @@ export function UpdateBanner() {
   const title = t(u.state.error ? "updates.bannerError" : u.ready ? "updates.bannerReady" : "updates.bannerAvailable", { version: u.state.update?.version ?? "" });
   const bytes = u.state.update?.sizeBytes;
   const size = bytes !== undefined && Number.isFinite(bytes) && bytes > 0 ? formatMegabytes(bytes) : undefined;
-  const metered = u.kind === "android" && !isKnownUnmeteredConnection();
+  const metered = u.kind === "android" && (u.state.androidMetered || !isKnownUnmeteredConnection());
   const availableSummary = metered
     ? size ? t("updates.bannerSizeMetered", { size }) : t("updates.bannerMetered")
     : size;

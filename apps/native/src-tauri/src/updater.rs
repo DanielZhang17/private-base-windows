@@ -1,30 +1,13 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::{self, Write},
-    path::Path,
-    time::Duration,
-};
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{async_runtime::Mutex, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::update_transport::{configure_update_client, install_id};
 use crate::updater_policy::{endpoint, evaluate_manifest, valid_artifact_url, CheckResult};
 
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
-
-fn configure_update_client(
-    client: reqwest::ClientBuilder,
-    read_timeout: Duration,
-) -> reqwest::ClientBuilder {
-    client
-        .https_only(true)
-        .connect_timeout(Duration::from_secs(15))
-        // The plugin's builder timeout only covers checks. This callback also
-        // configures artifact reads, resetting the deadline as data arrives.
-        .read_timeout(read_timeout)
-        .redirect(reqwest::redirect::Policy::none())
-}
 
 #[derive(Default)]
 pub struct UpdateState(Mutex<Session>);
@@ -55,31 +38,6 @@ fn supported_target() -> Result<(), &'static str> {
         Ok(())
     } else {
         Err("unsupported")
-    }
-}
-
-fn install_id(directory: &Path) -> io::Result<[u8; 32]> {
-    fs::create_dir_all(directory)?;
-    let path = directory.join("updater-install-id");
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(&path) {
-        Ok(mut file) => {
-            let mut id = [0; 32];
-            getrandom::fill(&mut id).map_err(io::Error::other)?;
-            file.write_all(&id)?;
-            file.sync_all()?;
-            Ok(id)
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => fs::read(path)?
-            .try_into()
-            .map_err(|_| io::Error::other("invalid updater install id")),
-        Err(error) => Err(error),
     }
 }
 
@@ -225,38 +183,6 @@ pub async fn update_install(
     // (the process plugin exposes no public Rust restart function).
     app.request_restart();
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn random_install_id_persists_and_corruption_is_not_silently_replaced() {
-        let mut suffix = [0; 8];
-        getrandom::fill(&mut suffix).unwrap();
-        let directory = std::env::temp_dir().join(format!(
-            "privatebase-updater-test-{}",
-            u64::from_be_bytes(suffix)
-        ));
-        let first = install_id(&directory).unwrap();
-        assert_eq!(first, install_id(&directory).unwrap());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(directory.join("updater-install-id"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-        fs::write(directory.join("updater-install-id"), [0; 4]).unwrap();
-        assert!(install_id(&directory).is_err());
-        fs::remove_dir_all(directory).unwrap();
-    }
 }
 
 #[cfg(all(

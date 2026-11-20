@@ -1,6 +1,6 @@
 import { createJSONStorage } from "zustand/middleware";
 import { beforeEach, describe, expect, it } from "vitest";
-import { getContrastRatio, getDefaultUiPreferences, getReadableTextColor, migrateDefaultPreferences, type UiPreferences } from "../../lib/ui-preferences.js";
+import { getContrastRatio, getDefaultUiPreferences, getIncomingLinkColor, getReadableTextColor, migrateDefaultPreferences, type UiPreferences } from "../../lib/ui-preferences.js";
 import { useUiPreferencesStore } from "../../stores/uiPreferencesStore.js";
 const oldLight: UiPreferences = { themeMode: "light", outgoingMessageColor: "#2563eb", incomingMessageColor: "#e5e7eb", sendButtonColor: "#2563eb" };
 const oldDark: UiPreferences = { themeMode: "dark", outgoingMessageColor: "#3b82f6", incomingMessageColor: "#1f2937", sendButtonColor: "#3b82f6" };
@@ -52,5 +52,32 @@ describe("readable text", () => {
   });
   it.each(["#000000", "#ffffff", "#14586e", "#1c6b84", "#808080", "#f6c667", "#6b3fa0"])("chooses the higher contrast foreground for %s", (background) => {
     expect(getContrastRatio(background, getReadableTextColor(background))).toBe(Math.max(getContrastRatio(background, "#111827"), getContrastRatio(background, "#f9fafb")));
+  });
+});
+
+describe("incoming link colour", () => {
+  it.each([["light", "#14586e"], ["dark", "#6cc3db"]] as const)("keeps the %s primary colour on the default incoming bubble", (theme, primary) => {
+    const incoming = getDefaultUiPreferences(theme).incomingMessageColor;
+    expect(getContrastRatio(primary, incoming)).toBeGreaterThanOrEqual(4.5);
+    expect(getIncomingLinkColor(incoming, ` ${primary}`)).toBe("var(--primary)");
+  });
+  it.each(["#14586e", "#0f4759", "#222222"])("falls back to readable text on a low-contrast custom bubble %s", (incoming) => {
+    expect(getIncomingLinkColor(incoming, "#14586e")).toBe(getReadableTextColor(incoming));
+  });
+  it.each([["#7a7a7a", "#000000"], ["#767676", "#000000"]])("uses pure black/white when the palette text colour misses 4.5:1 on %s", (incoming, expected) => {
+    expect(getContrastRatio(getReadableTextColor(incoming), incoming)).toBeLessThan(4.5);
+    const color = getIncomingLinkColor(incoming, "#14586e");
+    expect(color).toBe(expected);
+    expect(getContrastRatio(color, incoming)).toBeGreaterThanOrEqual(4.5);
+  });
+  it("meets 4.5:1 for every grey bubble", () => {
+    for (let value = 0; value < 256; value += 1) {
+      const incoming = `#${value.toString(16).padStart(2, "0").repeat(3)}`;
+      const color = getIncomingLinkColor(incoming, "#6cc3db");
+      expect(getContrastRatio(color === "var(--primary)" ? "#6cc3db" : color, incoming)).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+  it("falls back when the primary colour cannot be read", () => {
+    expect(getIncomingLinkColor("#e3e9eb", "")).toBe(getReadableTextColor("#e3e9eb"));
   });
 });

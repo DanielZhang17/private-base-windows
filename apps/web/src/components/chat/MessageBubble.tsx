@@ -1,13 +1,14 @@
 import { localized } from "../../i18n/messages.js";
 import { formatTime } from "../../i18n/format.js";
 import { t, useLocale } from "../../i18n/index.js";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type SyntheticEvent } from "react";
 import { attachmentName, copyableMessageText, fileTypeLabel, isSticker, parseFilePayload, parseStickerToken, type DecryptedMessage } from "../../features/chat/presentation.js";
 import { canOpenFile, copyMessageText } from "../../features/chat/message-actions.js";
 import { formatBytes } from "../../features/chat/useFilePreview.js";
 import { captureMessageActionSession, isMessageActionSessionCurrent, trackMessageUndoToast } from "../../features/chat/message-action-session.js";
 import { useMessageActions } from "../../features/chat/useMessageActions.js";
 import { messageSelectionText } from "../../features/chat/message-selection.js";
+import { messageLinks, openMessageLink } from "../../features/chat/message-links.js";
 import { ActionMenu, ConfirmDialog, Icon, IconButton, useToast, type ActionMenuItem } from "../../ui/index.js";
 import FilePreview, { type FilePreviewActions } from "./FilePreview.js";
 import InlineEmojiText from "./InlineEmojiText.js";
@@ -83,6 +84,13 @@ export default function MessageBubble({ message, isOwn, isGroup, senderName, fai
     if (actions.error && !actions.confirmDelete && !actions.confirmLocalDelete) { toast.show({ tone: "danger", message: actions.error }); actions.clearError(); }
   }, [actions.error, actions.confirmDelete, actions.confirmLocalDelete]);
   const copy = (text: string) => void copyMessageText(text).then(() => toast.show({ tone: "success", message: localized("messageCopied") })).catch(() => toast.show({ tone: "danger", message: localized("couldNotCopyMessage") }));
+  const copyLink = (text: string) => void copyMessageText(text).then(() => toast.show({ tone: "success", message: localized("linkCopied") })).catch(() => toast.show({ tone: "danger", message: localized("couldNotCopyLink") }));
+  const openLink = (href: string) => void openMessageLink(href).catch(() => toast.show({ tone: "danger", message: localized("couldNotOpenLink") }));
+  // The link under a long-press, right-click or menu key, so Copy link can copy that one.
+  const pressedLink = useRef<string | null>(null);
+  const notePressedLink = (event: SyntheticEvent) => {
+    pressedLink.current = event.target instanceof Element ? event.target.closest("[data-message-link]")?.textContent ?? null : null;
+  };
   const deleteForMe = () => {
     const session = captureMessageActionSession();
     const current = () => isMessageActionSessionCurrent(session);
@@ -100,7 +108,13 @@ export default function MessageBubble({ message, isOwn, isGroup, senderName, fai
   const displayText = message.pendingEdit?.content ?? message.content;
   const pendingEditStatus = !deleted && !stickerId && message.pendingEdit ? t("messageEditPending") : null;
   const editStatus = pendingEditStatus ?? (!deleted && message.editedAt ? t("messageEdited") : null);
-  if (!stickerId && !deleted && message.type === "text" && displayText) items.push({ id: "copy", icon: "copy", label: t("copyText"), onSelect: () => copy(copyableMessageText(message)) });
+  const textMessage = !stickerId && !deleted && message.type === "text" && !!displayText;
+  if (textMessage) items.push({ id: "copy", icon: "copy", label: t("copyText"), onSelect: () => copy(copyableMessageText(message)) });
+  const links = textMessage && message.status !== "failed" && actions.position ? messageLinks(displayText) : [];
+  // Opened on a link: copy that link, or offer nothing if an edit removed it.
+  // Opened elsewhere: copy the first link.
+  const link = pressedLink.current === null ? links[0]?.value : links.find(({ value }) => value === pressedLink.current)?.value;
+  if (link) items.push({ id: "copy-link", icon: "link", label: t("copyLink"), onSelect: () => copyLink(link) });
   if (onEdit && !isSticker(message)) items.push({ id: "edit", icon: "edit", label: t("editMessageAction"), onSelect: onEdit });
   if (file && !queued) {
     if (!fileBlocked && canOpenFile(file.fileName, file.mimeType)) items.push({ id: "open", icon: "file", label: t("fileOpen"), onSelect: () => fileActions.current?.open() });
@@ -115,7 +129,7 @@ export default function MessageBubble({ message, isOwn, isGroup, senderName, fai
   const content = deleted ? <span>{deletedText}</span>
     : message.type === "file" ? file ? <FilePreview actionsRef={fileActions} onBlocked={markBlocked} onSaveUnsupportedChange={setFileSaveUnsupported} messageId={message.id} fileId={file.fileId} fileName={file.fileName} mimeType={file.mimeType} fileKey={file.fileKey} fileIv={file.iv ?? file.fileIv!} sizeBytes={file.size ?? file.sizeBytes} />
     : <span>{message.status === "sending" ? t("encryptingFile") : failed ? t("fileNotSent") : t("invalidFilePayload")}</span>
-    : !isOwn && message.status === "failed" ? <span>{t("aMessageCouldNotBeDecrypted")}</span> : <InlineEmojiText content={displayText} />;
+    : !isOwn && message.status === "failed" ? <span>{t("aMessageCouldNotBeDecrypted")}</span> : <InlineEmojiText content={displayText} links={{ onOpen: selecting ? undefined : openLink }} />;
   const preview = <div className="min-w-0"><p className="text-[13px] font-semibold leading-[18px]">{isOwn ? t("selfDisplayName") : senderName ?? t("contactDisplayNameFallback")}</p>
     {file ? <div className="mt-2 flex items-center gap-3"><span className="flex size-10 shrink-0 items-center justify-center rounded-control bg-sunken"><Icon name="file" /></span><div className="min-w-0"><p className="break-words text-sm">{file.fileName}</p><p className="text-xs text-ink-subtle">{t("fileDescription", { size: formatBytes(file.size ?? file.sizeBytes ?? 0), format: fileTypeLabel(file.fileName) })}</p></div></div>
       : <p className="mt-1 line-clamp-2 break-words text-sm font-normal text-ink-muted">{deleted ? deletedText : message.type === "file" ? attachmentName(message.content) : !stickerId ? displayText
@@ -148,8 +162,8 @@ export default function MessageBubble({ message, isOwn, isGroup, senderName, fai
         aria-label={t("retryMessage", { content: message.type === "file" ? attachmentName(message.content) : message.content })}
         className={`message-action-surface bubble bubble-own bubble-failed text-start ${actions.position ? "message-menu-target" : ""}`}>
         {message.type === "file" ? attachmentName(message.content) : <InlineEmojiText content={message.content} />}
-      </button> : <div {...actions.triggers} inert={selecting} className={`message-action-surface bubble ${isOwn ? "bubble-own" : "bubble-incoming"} ${deleted ? "bubble-deleted" : ""} ${actions.position ? "message-menu-target" : ""}`}>{content}</div>}
-      {!selection && <IconButton ref={more} icon="more" label={t(failed ? "failedMessageActions" : "messageActions")} size="sm" aria-haspopup="menu" aria-expanded={!!actions.position} onClick={actions.openFromButton} className="message-more text-ink-subtle focus-visible:outline-2 focus-visible:outline-brand" />}
+      </button> : <div {...actions.triggers} onPointerDownCapture={notePressedLink} onContextMenuCapture={notePressedLink} onKeyDownCapture={notePressedLink} inert={selecting} className={`message-action-surface bubble ${isOwn ? "bubble-own" : "bubble-incoming"} ${deleted ? "bubble-deleted" : ""} ${actions.position ? "message-menu-target" : ""}`}>{content}</div>}
+      {!selection && <IconButton ref={more} icon="more" label={t(failed ? "failedMessageActions" : "messageActions")} size="sm" aria-haspopup="menu" aria-expanded={!!actions.position} onClickCapture={() => { pressedLink.current = null; }} onClick={actions.openFromButton} className="message-more text-ink-subtle focus-visible:outline-2 focus-visible:outline-brand" />}
     </div>
     {!stickerId && (showMeta || editStatus || (message.expiryKind === "timed" && message.expiresAt != null)) && <div className={`flex min-h-7 flex-wrap items-center gap-1.5 px-1 pt-1 text-xs tabular-nums ${failed ? "font-semibold text-danger" : "text-ink-subtle"}`}>
       {showMeta && <span data-message-meta="" className="inline-flex items-center gap-1.5">{failed ? <><Icon name="alert-circle" size={14} /><span>{t("notSent")}</span></>

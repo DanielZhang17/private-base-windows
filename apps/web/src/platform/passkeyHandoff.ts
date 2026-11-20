@@ -40,12 +40,15 @@ declare global {
       biometricUnlockSingleDocument?: boolean;
       androidBiometricProbe?: true;
       autoUpdate?: "desktop" | "android";
+      otaUi?: boolean | "read-only";
+      otaUiRestart?: boolean;
       fileOpen?: boolean;
       fileSave?: "dialog" | "downloads" | "share";
       backgroundConnection?: boolean;
       nativeCallNotifications?: boolean;
       captureProtection?: "full" | "recording" | "best-effort";
     };
+    __PRIVATEBASE_UI_BUNDLE__?: import("./updates.js").UiBundleInfo;
   }
 }
 export function supportsPasskeyHandoff(): boolean {

@@ -76,6 +76,19 @@ export function getReadableTextColor(backgroundHex: string): string {
   return getContrastRatio(backgroundHex, dark) >= getContrastRatio(backgroundHex, light) ? dark : light;
 }
 
+/**
+ * Link colour inside incoming bubbles: the theme's primary colour when it stays
+ * readable (WCAG AA, 4.5:1) on the user's incoming bubble colour, otherwise the
+ * bubble's readable text colour, or pure black/white when even that falls
+ * short on a mid-tone bubble (links stay underlined either way).
+ */
+export function getIncomingLinkColor(incomingBackgroundHex: string, primaryHex: string): string {
+  if (isHexColor(primaryHex) && getContrastRatio(primaryHex, incomingBackgroundHex) >= 4.5) return "var(--primary)";
+  const readable = getReadableTextColor(incomingBackgroundHex);
+  if (getContrastRatio(readable, incomingBackgroundHex) >= 4.5) return readable;
+  return getContrastRatio("#000000", incomingBackgroundHex) >= getContrastRatio("#ffffff", incomingBackgroundHex) ? "#000000" : "#ffffff";
+}
+
 /** Only an entire old default palette is uncustomised; preserve every custom palette. */
 export function migrateDefaultPreferences(preferences: UiPreferences, prefersDark = false): UiPreferences {
   const palette = [preferences.outgoingMessageColor, preferences.incomingMessageColor, preferences.sendButtonColor]

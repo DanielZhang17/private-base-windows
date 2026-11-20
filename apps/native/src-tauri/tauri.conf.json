@@ -1,13 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Private Base",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "identifier": "xyz.chat718788.e2eechat",
   "build": {
     "frontendDist": "../../web/dist-native",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "node scripts/dev-web.mjs",
-    "beforeBuildCommand": "node scripts/build-web.mjs"
+    "beforeBuildCommand": "node scripts/build-web.mjs --embedded"
   },
   "app": {
     "windows": [

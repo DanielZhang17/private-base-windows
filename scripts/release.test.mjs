@@ -127,12 +127,18 @@ test('collects actual hashes/sizes and .sig files, refusing incomplete groups', 
     await assert.rejects(collectArtifacts({ version: '0.1.1', windows: exe }), /Provide all/);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
-test('CLI dry run writes manifests locally without invoking Wrangler', async () => {
+test('full-app CLI uses the app version and preserves the embedded UI declaration', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'release-test-'));
   try {
+    const declaration = new URL('../apps/native/ui-bundle.json', import.meta.url);
+    const uiMetadata = await readFile(declaration, 'utf8');
     const apk = join(dir, 'PrivateBase.apk'); await writeFile(apk, 'built signed APK fixture');
-    await main(['--version', '0.1.0', '--channel', 'beta', '--rollout', '5', '--android', apk, '--out', dir]);
+    await main(['--version', '0.1.0', '--channel', 'beta', '--rollout', '5', '--android', apk, '--out', dir],
+      () => assert.fail('dry run contacted distribution'));
     const manifest = JSON.parse(await readFile(join(dir, 'beta/android.json'), 'utf8'));
+    assert.equal(manifest.versionName, '0.1.0');
+    assert.notEqual(manifest.versionName, JSON.parse(uiMetadata).embeddedUiVersion);
+    assert.equal(await readFile(declaration, 'utf8'), uiMetadata);
     assert.equal(manifest.versionCode, 1000); assert.equal(manifest.rolloutPercent, 5);
     await assert.rejects(readFile(join(dir, 'latest.json')));
     await assert.rejects(readFile(join(dir, 'notes.json')));

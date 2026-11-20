@@ -52,6 +52,17 @@ async function show(section: string) {
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
 }
 const button = (text: string, scope: ParentNode = document) => Array.from(scope.querySelectorAll<HTMLButtonElement>("button")).find((node) => node.textContent === text)!;
+it.each([true, "read-only", false] as const)("exposes About in the list and at its direct URL when OTA is available (%s)", async otaUi => {
+  vi.stubGlobal("__TAURI_INTERNALS__", {});
+  vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { otaUi });
+  vi.stubGlobal("__PRIVATEBASE_UI_BUNDLE__", { appVersion: "0.1.3", uiVersion: "1.0.1", uiSource: "ota" });
+  expect(capabilities.autoUpdate).toBeUndefined();
+  await show("about");
+  expect(!!queryByRole(document.body, "button", { name: "About" })).toBe(otaUi !== false);
+  expect(document.body.textContent?.includes("App version0.1.3")).toBe(otaUi !== false);
+  expect(document.body.textContent?.includes("UI bundle version1.0.1Updated")).toBe(otaUi !== false);
+});
+
 it("hides passkey management on unsupported platforms", async () => {
   await show("security"); expect(document.body.textContent).not.toContain("Passkeys");
   expect(api.get).not.toHaveBeenCalledWith("/api/passkeys");

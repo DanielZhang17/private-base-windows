@@ -64,7 +64,7 @@ export function useSettings() {
   const privacy = usePrivacySettings(sectionParam === "privacy");
   const selectedSection = SETTINGS_SECTIONS.some(([key]) => key === sectionParam) &&
     (sectionParam !== "notifications" || background.supported || webPush.visible) &&
-    (sectionParam !== "about" || !!capabilities.autoUpdate) ? sectionParam as SettingsSection : null;
+    (sectionParam !== "about" || capabilities.autoUpdate || capabilities.otaUiAvailable) ? sectionParam as SettingsSection : null;
   const [confirmation, setConfirmation] = useState<{ kind: "passkey" | "emoji"; id: string; name: string } | null>(null);
   const [showDeleteAccount, setShowDeleteAccount] = useState(false);
   const [showForgetKeys, setShowForgetKeys] = useState(false);

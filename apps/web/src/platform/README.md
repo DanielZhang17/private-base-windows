@@ -122,6 +122,71 @@ auth-independent lifecycle beneath CallProvider, including call-aware install
 deferral. Native integration, manifest layout and acceptance are in
 [releasing.md](../../../../docs/releasing.md).
 
+## Native OTA web bundles
+
+Bundled native shells advertise `capabilities.otaUi` independently of
+`capabilities.autoUpdate`. The OTA adapter is exported as `uiBundles` from
+`platform/index.ts`.
+
+- `uiBundles.getActive()` returns `{ appVersion, uiVersion, uiSource: "embedded" | "ota" }`
+  for the active bundle, including after rollback and on read-only launches.
+  `appVersion` comes from the native package. The UI has its own version
+  sequence starting at `1.0.0`. Embedded builds read the version from
+  `apps/native/ui-bundle.json`, and OTA launches read it from the signed bundle.
+  Use `capabilities.otaUiAvailable` for version displays and About, and
+  `capabilities.otaUi` for writable OTA actions.
+- `invoke("ui_bundle_get_pending")` is a read-only query. It returns the UI
+  version staged and verified for the next launch as a string, or `null` if
+  there is no pending bundle or the OTA state is unavailable. The web adapter's
+  `uiBundles.getPending()` can expose `undefined` for those cases. It only
+  queries when `capabilities.otaUi === true`, and any rejection counts as
+  nothing pending. About re-reads it on each visit, after every saved channel
+  change (changing the channel withdraws the staged bundle), and on writable
+  OTA shells every 30 s and on window focus while About is visible. Polling
+  stops while the document is hidden and when About closes.
+- Show **Restart now** only when a pending version exists and the shell
+  advertises `window.__PRIVATEBASE_NATIVE_CAPABILITIES__.otaUiRestart === true`.
+  The flag is available on writable desktop OTA launches. Calling
+  `invoke("ui_bundle_restart")` requests a graceful app restart after verifying
+  the pending bundle. The command rejects with `"not_ready"` if there is no
+  usable pending bundle or if the active trial has yet to acknowledge readiness.
+  Mobile returns `"unsupported"` and applies the pending bundle on a later launch.
+  About disables Restart now (with a hint) while a history transfer runs, so a
+  `"not_ready"` can never cost the transfer, and asks first during a call.
+- `UiBundleReady` acknowledges a trial once per document. It is mounted inside
+  each destination screen (login/register, unlock, the protected chat/settings/
+  call layouts, session-ended, clients), never beside a redirect or the startup
+  loader. It waits for a rendered frame (`afterPaint`: an animation frame, then
+  the task after it) and for the local DB to open. Signed-out and locked screens qualify. The
+  shell allows 20 seconds from boot. `uiBundles.ready()` retries a failed
+  `ui_bundle_ready` twice (after 1 s and 4 s, about 5 s in total); a
+  `"unsupported"` or `"no_trial"` rejection stops retrying.
+- Each document reads the current native channel before checking for full-app
+  updates. On mount, `uiBundles.initializeChannel()` imports the localStorage
+  choice independently of database or trial readiness. It invokes
+  `ui_bundle_initialize_channel` with `{ channel }`, which fills
+  only an unset native preference. On first launch, native waits for this
+  import or an explicit selection before checking for OTA bundles. Changes wait for
+  `uiBundles.setChannel(channel)` before updating the selector. Read-only
+  launches keep the selector locked. `UiBundleChannelImport`, mounted once at the
+  app root, runs the import (startup screens included).
+- A native load or reload of `/clients` or `/clients/releases` enters through
+  `ClientsApp`, not `App`. It lazily loads `platform/ui-bundle-public.ts`, which
+  imports the channel and acknowledges readiness after paint. That entry never
+  opens IndexedDB (the public page imports no DB code), so it skips the DB
+  check: the painted page is the proof. Browsers load nothing extra.
+- Builds with `VITE_OTA_TEST_NO_READY=1` still import the channel but never
+  acknowledge readiness, so native rollback of an unacknowledged trial can be
+  tested; native web builds then mark the emitted `schema-version.json` with
+  `otaTestNoReady: true`.
+- `src/db/schema-version.json` supplies the IndexedDB version and the bundle's
+  declared schema. The shell requires an exact match with its embedded UI.
+- Bundle discovery, verification and selection run in Rust. The next process
+  launch chooses the assets for the same Tauri origin. The selected source
+  serves every request for that launch, including nested route reloads.
+  Keep native HTML scripts and styles in external assets so the shell CSP
+  can serve the same `dist-native` on every platform.
+
 
 ## Native file command contract v2 (binary IPC)
 

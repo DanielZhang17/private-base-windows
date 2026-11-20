@@ -11,6 +11,16 @@ const temporaryDirectory = mkdtempSync(join(tmpdir(), "e2ee-native-build-"));
 const fakePnpm = join(temporaryDirectory, "pnpm.cjs");
 writeFileSync(fakePnpm, `
   console.log(JSON.stringify({ args: process.argv.slice(2), api: process.env.VITE_API_BASE_URL }));
+  if (process.env.TEST_WEB_DIR && process.argv.includes("vite")) {
+    const { mkdirSync, writeFileSync } = require("node:fs");
+    const { join } = require("node:path");
+    const out = join(process.env.TEST_WEB_DIR, process.argv[process.argv.indexOf("--outDir") + 1]);
+    mkdirSync(out, { recursive: true });
+    writeFileSync(join(out, "schema-version.json"), JSON.stringify({
+      version: Number(process.env.TEST_SCHEMA_VERSION),
+      ...(process.env.VITE_OTA_TEST_NO_READY === "1" ? { otaTestNoReady: true } : {}),
+    }));
+  }
   const failing = process.env.TEST_FAIL_ON;
   const fails = failing === undefined || process.argv.slice(2).join(" ").includes(failing);
   process.exit(fails ? Number(process.env.TEST_BUILD_STATUS || 0) : 0);
@@ -39,6 +49,62 @@ function build(api, status = "0", failOn) {
 }
 
 describe("native frontend build hook", () => {
+  it("validates the embedded UI contract against the actual built schema receipt", () => {
+    const config = JSON.parse(read("../src-tauri/tauri.conf.json"));
+    expect(config.build.beforeBuildCommand).toBe("node scripts/build-web.mjs --embedded");
+    const apps = join(temporaryDirectory, "schema-fixture");
+    const scripts = join(apps, "native", "scripts");
+    const schema = join(apps, "web", "src", "db");
+    const output = join(apps, "web", "dist-native");
+    mkdirSync(scripts, { recursive: true });
+    mkdirSync(schema, { recursive: true });
+    mkdirSync(output, { recursive: true });
+    for (const name of ["build-web.mjs", "pnpm.mjs", "ui-version.mjs"]) writeFileSync(join(scripts, name), read(`./${name}`));
+    const metadata = join(apps, "native", "ui-bundle.json");
+    const valid = { embeddedUiVersion: "1.0.0", nativeContract: 3, embeddedDbSchemaVersion: 9 };
+    writeFileSync(join(schema, "schema-version.json"), '{"version":9}');
+    const receipt = join(output, "schema-version.json");
+    const run = (version, ...args) => {
+      const env = {
+        ...process.env, npm_execpath: fakePnpm, TEST_WEB_DIR: join(apps, "web"), TEST_SCHEMA_VERSION: version,
+      };
+      delete env.VITE_OTA_TEST_NO_READY;
+      return spawnSync(process.execPath, [join(scripts, "build-web.mjs"), ...args], { env, encoding: "utf8" });
+    };
+    for (const [field, value] of [["embeddedUiVersion", "1.0.1-01"], ["nativeContract", 0xffffffff + 1], ["embeddedDbSchemaVersion", 0]]) {
+      writeFileSync(metadata, JSON.stringify({ ...valid, [field]: value }));
+      const invalid = run("9", "--embedded");
+      expect(invalid.status).toBe(1);
+      expect(invalid.stderr).toContain(field);
+      expect(invalid.stdout).toBe("");
+    }
+    writeFileSync(metadata, JSON.stringify(valid));
+    const embedded = run("10", "--embedded");
+    expect(embedded.status).toBe(1);
+    expect(embedded.stderr).toContain("embeddedDbSchemaVersion must match");
+    expect(calls(embedded)).toHaveLength(3);
+    expect(run("10").status).toBe(0);
+    expect(run("9", "--embedded").status).toBe(0);
+    expect(JSON.parse(readFileSync(receipt))).toEqual({ version: 9 });
+    const before = readFileSync(receipt);
+    expect(run("9", "--ota-test-no-ready").status).toBe(0);
+    expect(readFileSync(receipt)).toEqual(before);
+    const fixture = join(apps, "web", "dist-native-ota-no-ready", "schema-version.json");
+    expect(JSON.parse(readFileSync(fixture))).toEqual({ version: 9, otaTestNoReady: true });
+  });
+
+  it.each(["--embedded", "--release"])("rejects the OTA fixture flag in %s builds before invoking pnpm", (kind) => {
+    const script = fileURLToPath(new URL("./build-web.mjs", import.meta.url));
+    for (const noReady of ["cli", "env"]) {
+      const env = { ...process.env, npm_execpath: fakePnpm, VITE_OTA_TEST_NO_READY: noReady === "env" ? "1" : "0" };
+      const args = noReady === "cli" ? [kind, "--ota-test-no-ready"] : [kind];
+      const result = spawnSync(process.execPath, [script, ...args], { env, encoding: "utf8" });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("The OTA no-ready flag cannot be set");
+      expect(result.stdout).toBe("");
+    }
+  });
+
   it.each([undefined, "", "  "])("uses the production API default for %j", (api) => {
     const result = build(api);
     expect(result.status).toBe(0);
@@ -162,6 +228,13 @@ describe("native workspace wiring", () => {
     expect(capability.platforms).toBeUndefined();
     expect(capability.permissions).toEqual([
       "core:app:allow-version",
+      "allow-ui-bundle-ready",
+      "allow-ui-bundle-set-channel",
+      "allow-ui-bundle-initialize-channel",
+      "allow-ui-bundle-get-channel",
+      "allow-ui-bundle-get-pending",
+      "allow-ui-bundle-restart",
+      "allow-ui-bundle-is-unmetered",
       "notification:allow-is-permission-granted",
       "notification:allow-request-permission",
       "notification:allow-notify",
@@ -275,6 +348,7 @@ describe("native workspace wiring", () => {
     expect(config.build.frontendDist).toBe("../../web/dist-native");
     expect(read("./build-web.mjs")).toContain('NATIVE_OUT_DIR = "dist-native"');
     expect(read("../../../.gitignore").split("\n")).toContain("apps/web/dist-native/");
+    expect(read("../../../.gitignore").split("\n")).toContain("apps/web/dist-native-ota-no-ready/");
   });
 
   it("keeps native dev out of the generic turbo dev task", () => {

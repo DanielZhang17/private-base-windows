@@ -93,6 +93,8 @@ function DevicesView({ d }: { d: ReturnType<typeof useDevices> }) {
           </article>)}
         </section>}
 
+        {capabilities.historyTransfer && <LinkedDevicesTransfer devices={d.devices} />}
+
         <section className="space-y-3">
           <h2 className="text-sm font-semibold text-ink-muted">{t("yourDevices")}</h2>
 
@@ -119,7 +121,6 @@ function DevicesView({ d }: { d: ReturnType<typeof useDevices> }) {
         <Notice title={t("devices.historyNoticeTitle")} icon="info">
           {t(capabilities.historyTransfer ? "devices.historyNoticeBody" : "earlierHistoryStaysOnTheDevicesThatAlready")}
         </Notice>
-        {capabilities.historyTransfer && <LinkedDevicesTransfer devices={d.devices} />}
 
         <ListItem
           leading={<Icon name="key" />}

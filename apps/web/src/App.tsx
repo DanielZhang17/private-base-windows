@@ -28,6 +28,7 @@ import SessionRepairEffects from "./components/app/SessionRepairEffects.js";
 import { UpdateProvider } from "./features/updates/UpdateProvider.js";
 import WebPushEffects from "./components/app/WebPushEffects.js";
 import SaveFeedbackToastProvider from "./components/app/SaveFeedbackToastProvider.js";
+import { UiBundleChannelImport, UiBundleReady } from "./platform/UiBundleReady.js";
 
 function FullScreenLoader({ phase }: { phase: AuthPhase }) {
   return (
@@ -54,8 +55,9 @@ function ProtectedRoute({ phase, children }: { phase: AuthPhase; children: React
   if (phase === "locked") {
     return <Navigate to="/unlock" replace state={{ from: location }} />;
   }
-  // Android: no chat is shown until screenshot protection is confirmed on.
-  return <CaptureProtectionGate>{children}</CaptureProtectionGate>;
+  // Android: no chat is shown until screenshot protection is confirmed on. The gate is
+  // itself a rendered screen, so a slow native capture check cannot roll back a healthy UI.
+  return <><UiBundleReady /><CaptureProtectionGate>{children}</CaptureProtectionGate></>;
 }
 
 function PublicOnlyRoute({ phase, children, preserveAfterAuth = false }: {
@@ -67,7 +69,7 @@ function PublicOnlyRoute({ phase, children, preserveAfterAuth = false }: {
   const enteredAnonymously = useRef(false);
   const upgradeBlocked = useDatabaseUpgradeBlocked();
   if (phase === "anonymous") enteredAnonymously.current = true;
-  const form = <>{children}{upgradeBlocked && <div className="fixed inset-x-0 top-0 z-40 flex justify-center px-4 pt-safe">
+  const form = <><UiBundleReady />{children}{upgradeBlocked && <div className="fixed inset-x-0 top-0 z-40 flex justify-center px-4 pt-safe">
     <Notice tone="warning" className="mt-2 max-w-sm">{t("databaseUpgradeBlocked")}</Notice>
   </div>}</>;
 
@@ -101,7 +103,7 @@ function UnlockRoute({ phase }: { phase: AuthPhase }) {
   if (hasStartupScreen(phase)) return <FullScreenLoader phase={phase} />;
   if (phase === "anonymous") return <Navigate to="/login" replace />;
   if (phase === "unlocked") return <Navigate to={returnTo} replace />;
-  return <UnlockPage />;
+  return <><UiBundleReady /><UnlockPage /></>;
 }
 
 export default function App() {
@@ -110,6 +112,7 @@ export default function App() {
 
   return (
     <SaveFeedbackToastProvider>
+      <UiBundleChannelImport />
       <SessionRepairEffects />
       <WebPushEffects unlocked={phase === "unlocked"} />
       <UiPreferencesEffects />
@@ -118,8 +121,8 @@ export default function App() {
       <CallProvider enabled={phase === "unlocked"}>
       <Routes>
         {/* The public download route never mounts the updater, including after in-app navigation. */}
-        <Route path={CLIENTS_PATH} element={<ClientsPage />} />
-        <Route path={CLIENTS_RELEASES_PATH} element={<ClientsPage />} />
+        <Route path={CLIENTS_PATH} element={<><UiBundleReady /><ClientsPage /></>} />
+        <Route path={CLIENTS_RELEASES_PATH} element={<><UiBundleReady /><ClientsPage /></>} />
         <Route element={<UpdateProvider><Outlet /></UpdateProvider>}>
         <Route
           path="/login"
@@ -138,7 +141,7 @@ export default function App() {
           )}
         />
         <Route path="/unlock" element={<UnlockRoute phase={phase} />} />
-        <Route path="/session-ended" element={<SessionEndedPage />} />
+        <Route path="/session-ended" element={<><UiBundleReady /><SessionEndedPage /></>} />
         <Route
           path="/call/:callId"
           element={(

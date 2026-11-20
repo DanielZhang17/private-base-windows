@@ -3,7 +3,7 @@ import { getByRole } from "@testing-library/dom";
 import { beforeEach, afterEach, expect, it, vi } from "vitest";
 import { click, setupDom } from "../../ui/test-utils.js";
 import { capabilities } from "../../platform/capabilities.js";
-import { updates, UpdateError, type UpdateProgress } from "../../platform/updates.js";
+import { uiBundles, updates, UpdateError, type UpdateProgress } from "../../platform/updates.js";
 import { useCallStore } from "../../stores/callStore.js";
 import { canDownloadAutomatically, UPDATE_CHANNEL_KEY, UPDATE_INTERVAL, useUpdates } from "./useUpdates.js";
 import { UpdateActions } from "./UpdateStatus.js";
@@ -145,6 +145,31 @@ it("persists the per-device channel and checks the selected channel", async () =
   await render(<Probe />); await act(async () => value.setChannel("beta"));
   expect(localStorage.getItem(UPDATE_CHANNEL_KEY)).toBe("beta"); expect(updates.check).toHaveBeenLastCalledWith("beta");
   await render(null); await render(<Probe />); expect(value.channel).toBe("beta");
+});
+it("keeps the selected channel during a native save and allows a failed switch to be retried", async () => {
+  let reject!: (error: Error) => void;
+  const persist = vi.spyOn(uiBundles, "setChannel")
+    .mockReturnValueOnce(new Promise((_, fail) => { reject = fail; }))
+    .mockResolvedValueOnce(undefined);
+  localStorage.setItem(UPDATE_CHANNEL_KEY, "beta");
+  await render(<Probe />);
+  await act(async () => { void value.setChannel("stable"); });
+  expect(persist).toHaveBeenCalledExactlyOnceWith("stable");
+  expect(value.channelLocked).toBe(true);
+  expect(value.channel).toBe("beta");
+  expect(localStorage.getItem(UPDATE_CHANNEL_KEY)).toBe("beta");
+  expect(updates.check).toHaveBeenCalledExactlyOnceWith("beta");
+
+  await act(async () => { reject(new Error("native persistence failed")); });
+  expect(value.channelLocked).toBe(false);
+  expect(value.state.error).toBe("failed");
+  expect(value.channel).toBe("beta");
+  expect(localStorage.getItem(UPDATE_CHANNEL_KEY)).toBe("beta");
+
+  await act(async () => value.setChannel("stable"));
+  expect(value.channel).toBe("stable");
+  expect(localStorage.getItem(UPDATE_CHANNEL_KEY)).toBe("stable");
+  expect(updates.check).toHaveBeenLastCalledWith("stable");
 });
 it("ignores stale work after unmount and removes an in-flight download listener", async () => {
   let finish!: (value: typeof available) => void;

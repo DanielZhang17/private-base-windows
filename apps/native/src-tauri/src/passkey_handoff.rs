@@ -264,7 +264,10 @@ pub(super) mod windows {
             .map_err(str::to_owned)
     }
 
-    pub(crate) fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    pub(crate) fn configure(
+        builder: tauri::Builder<tauri::Wry>,
+        launch: Option<crate::ota::Launch>,
+    ) -> tauri::Builder<tauri::Wry> {
         builder
             // First plugin: the browser's second process forwards to this instance.
             // Filter before calling deep-link, whose debug diagnostics can log
@@ -290,7 +293,7 @@ pub(super) mod windows {
             }))
             .plugin(tauri_plugin_deep_link::init())
             .manage(Handoffs::default())
-            .setup(|app| {
+            .setup(move |app| {
                 // Writes only HKCU\Software\Classes\privatebase; no elevation.
                 let available = app.deep_link().register("privatebase").is_ok();
                 app.manage(Available { enabled: available });
@@ -326,17 +329,27 @@ pub(super) mod windows {
                     .ok_or(UNSUPPORTED)?;
                 // Tao applies display affinity before creating the webview. Keep
                 // the window hidden until our checked Win32 call also succeeds.
-                let window = WebviewWindowBuilder::from_config(app, config)?
+                let selected = launch
+                    .map(|launch| launch.select(app.handle()))
+                    .transpose()?;
+                let builder = WebviewWindowBuilder::from_config(app, config)?
                     .content_protected(capture_protection_enabled)
                     .visible(false)
                     .initialization_script(crate::native_capabilities_script(
                         available,
                         hello_readiness,
-                    ))
-                    .build()?;
+                    ));
+                let builder = match &selected {
+                    Some(selected) => selected.configure_window(builder),
+                    None => builder,
+                };
+                let window = builder.build()?;
                 #[cfg(windows)]
                 crate::capture_protection::apply(&window, capture_protection_enabled)?;
                 window.show()?;
+                if let Some(selected) = selected {
+                    selected.start_checks();
+                }
                 Ok(())
             })
     }
@@ -702,7 +715,9 @@ mod tests {
 
     #[test]
     fn windows_builder_wiring_type_checks_on_host() {
-        let _configure: fn(tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> =
-            windows::configure;
+        let _configure: fn(
+            tauri::Builder<tauri::Wry>,
+            Option<crate::ota::Launch>,
+        ) -> tauri::Builder<tauri::Wry> = windows::configure;
     }
 }

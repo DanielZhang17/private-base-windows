@@ -9,3 +9,4 @@ export { copyText } from "./clipboard.js";
 export { openExternal } from "./external.js";
 export { openFile, saveFile, SaveUnsupportedError } from "./files.js";
 export { E2EECallUnsupportedError } from "./calls.js";
+export { uiBundles, type UiBundleInfo } from "./updates.js";

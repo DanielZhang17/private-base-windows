@@ -36,7 +36,8 @@ export function useMessageActions(message: DecryptedMessage, isOwn: boolean, sel
       if (!event.currentTarget.contains(event.target as Node)) return;
       const target = event.target instanceof Element ? event.target : null;
       const selection = window.getSelection();
-      if (target?.closest("a") || (selection && !selection.isCollapsed && selection.rangeCount && selection.getRangeAt(0).intersectsNode(event.currentTarget))) { press.cancel(); return; }
+      // Message-text links belong to the message menu; other links keep the native menu.
+      if (target?.closest("a:not([data-message-link])") || (selection && !selection.isCollapsed && selection.rangeCount && selection.getRangeAt(0).intersectsNode(event.currentTarget))) { press.cancel(); return; }
       event.preventDefault(); event.stopPropagation();
       const native = event.nativeEvent as PointerEvent & { sourceCapabilities?: { firesTouchEvents?: boolean } };
       if (press.contextMenu(native.pointerType === "touch" || native.sourceCapabilities?.firesTouchEvents)) openAtPointer(event.clientX, event.clientY);

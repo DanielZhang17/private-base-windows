@@ -62,12 +62,17 @@ function importGraph(entry: string): { files: string[]; packages: string[] } {
   return { files: [...seen], packages: [...packages] };
 }
 
+const PLATFORM_FILES = ["platform/after-paint.ts", "platform/calls.ts", "platform/capabilities.ts", "platform/clipboard.ts",
+  "platform/environment.ts", "platform/external.ts", "platform/native-wait.ts", "platform/passkeyHandoff.ts",
+  "platform/ui-bundle-public.ts", "platform/updates.ts"];
 it("ClientsApp loads no session, store, API or crypto modules", () => {
   const { files, packages } = importGraph("ClientsApp.tsx");
   expect(files).toContain("pages/ClientsPage.tsx");
   expect(files).toContain("features/clients/useClientsPage.ts");
   expect(files).toContain("features/clients/ClientsReleaseNotes.tsx");
   expect(files.filter((file) => forbidden.test(file))).toEqual([]);
-  expect(files.filter((file) => file.startsWith("platform/")).sort()).toEqual(["platform/clipboard.ts", "platform/environment.ts", "platform/external.ts"]);
+  // Native direct entry also loads the OTA platform adapter (channel import + readiness), never the DB.
+  expect(files.filter((file) => file.startsWith("platform/")).sort()).toEqual(PLATFORM_FILES);
+  expect(files).not.toContain("platform/UiBundleReady.tsx");
   expect(packages.filter((name) => name.startsWith("@e2ee-chat/") || /sodium|idb|zustand|@tanstack/.test(name))).toEqual([]);
 });

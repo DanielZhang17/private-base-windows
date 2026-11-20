@@ -3,6 +3,7 @@ import { useAuthStore } from "../../stores/authStore.js";
 import { useUiPreferencesStore } from "../../stores/uiPreferencesStore.js";
 import {
   getDefaultUiPreferences,
+  getIncomingLinkColor,
   getReadableTextColor,
   resolveTheme,
 } from "../../lib/ui-preferences.js";
@@ -52,6 +53,7 @@ export default function UiPreferencesEffects() {
     root.style.setProperty("--message-own-fg", getReadableTextColor(outgoing));
     root.style.setProperty("--message-incoming-bg", incoming);
     root.style.setProperty("--message-incoming-fg", getReadableTextColor(incoming));
+    root.style.setProperty("--message-incoming-link", getIncomingLinkColor(incoming, getComputedStyle(root).getPropertyValue("--primary")));
     root.style.setProperty("--send-button-bg", send);
     root.style.setProperty("--send-button-fg", getReadableTextColor(send));
   }, [preferences, prefersDark]);

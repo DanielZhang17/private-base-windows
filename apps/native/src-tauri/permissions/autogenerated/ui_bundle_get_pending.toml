@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-bundle-get-pending"
+description = "Enables the ui_bundle_get_pending command without any pre-configured scope."
+commands.allow = ["ui_bundle_get_pending"]
+
+[[permission]]
+identifier = "deny-ui-bundle-get-pending"
+description = "Denies the ui_bundle_get_pending command without any pre-configured scope."
+commands.deny = ["ui_bundle_get_pending"]

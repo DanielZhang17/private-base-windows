@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-bundle-restart"
+description = "Enables the ui_bundle_restart command without any pre-configured scope."
+commands.allow = ["ui_bundle_restart"]
+
+[[permission]]
+identifier = "deny-ui-bundle-restart"
+description = "Denies the ui_bundle_restart command without any pre-configured scope."
+commands.deny = ["ui_bundle_restart"]

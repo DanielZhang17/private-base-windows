@@ -10,7 +10,7 @@ import { promisify, stripVTControlCharacters } from 'node:util';
 import ts from 'typescript';
 
 export const RELEASE_BASE = 'https://dist.718788.xyz/private-base/releases/';
-const PREFIX = 'private-base/releases/';
+export const PREFIX = 'private-base/releases/';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const exec = promisify(execFile);
 const DESKTOP_TARGETS = ['darwin-aarch64', 'darwin-x86_64', 'windows-x86_64'];
@@ -227,7 +227,7 @@ export function parseArgs(argv) {
   return result;
 }
 
-async function wrangler(args) {
+export async function wrangler(args) {
   try {
     return await exec('npx', ['--no-install', 'wrangler', 'r2', 'object', ...args, '--remote'], {
       cwd: join(ROOT, 'apps/api'), timeout: 300_000, maxBuffer: 2_000_000,
@@ -241,7 +241,7 @@ async function wrangler(args) {
   }
 }
 
-async function readRemoteJson(name, temp, remote) {
+export async function readRemoteJson(name, temp, remote) {
   const path = join(temp, name.replaceAll('/', '-'));
   const result = await remote(['get', `dist/${PREFIX}${name}`, '--file', path]);
   if (result.missing !== true) return JSON.parse(await readFile(path, 'utf8'));
@@ -265,7 +265,7 @@ async function writeMergedNotes(path, previous, { product, entries: [candidate] 
   await writeFile(path, JSON.stringify(merged, null, 2) + '\n');
 }
 
-async function uploadDiscovery(name, path, remote) {
+export async function uploadDiscovery(name, path, remote) {
   await remote(['put', `dist/${PREFIX}${name}`, '--file', path, '--content-type', 'application/json', '--cache-control', 'no-cache, max-age=0, must-revalidate']);
 }
 
@@ -363,6 +363,7 @@ export async function main(argv, remote = wrangler) {
   if (args.help) {
     console.log(`Usage: node scripts/release.mjs --version X.Y.Z --channel stable|beta --rollout 0..100 [artifacts] [--publish]
        node scripts/release.mjs --publish-notes-only --version X.Y.Z
+--version is the native app version. The build embeds the UI version from apps/native/ui-bundle.json.
 Artifacts (all files in each supplied group are required):
   --macos-aarch64-dmg FILE --macos-aarch64-update FILE.app.tar.gz --macos-aarch64-sig FILE.sig
   --macos-x86_64-dmg FILE --macos-x86_64-update FILE.app.tar.gz --macos-x86_64-sig FILE.sig

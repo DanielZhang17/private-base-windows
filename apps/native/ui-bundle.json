@@ -1,0 +1,13 @@
+{
+  "nativeContract": 3,
+  "embeddedUiVersion": "1.0.0",
+  "embeddedDbSchemaVersion": 9,
+  "shellDbSchemas": [
+    {
+      "nativeContract": 3,
+      "minShellVersion": "0.1.4",
+      "maxShellVersion": "0.1.4",
+      "dbSchemaVersion": 9
+    }
+  ]
+}

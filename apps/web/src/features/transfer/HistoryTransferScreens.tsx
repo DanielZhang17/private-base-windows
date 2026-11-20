@@ -18,6 +18,7 @@ import "./TransferScreens.css";
 export const TRANSFER_PATH = "/devices/transfer";
 export const TRANSFER_SETUP_PATH = "/setup/history-transfer";
 export const TRANSFER_RECEIVE_PATH = transferLink("receive");
+export const TRANSFER_SEND_PATH = transferLink("send");
 
 type Flow = ReturnType<typeof useHistoryTransfer>;
 type Mode = "send" | "receive";
@@ -27,6 +28,10 @@ function transferLink(mode: Mode, peer?: string) {
   if (peer) params.set("peer", peer);
   return `${TRANSFER_PATH}?${params}`;
 }
+const TRANSFER_OPTIONS = [
+  ["receive", "transfer.getHere", "transfer.getHereHelp", "download"],
+  ["send", "transfer.sendFromHere", "transfer.sendFromHereHelp", "transfer"],
+] as const;
 function isTransferScreen(pathname: string) {
   return pathname === TRANSFER_PATH || pathname === TRANSFER_SETUP_PATH;
 }
@@ -45,11 +50,15 @@ export function HistoryTransferOwner() {
   useEffect(() => {
     if (wasVisible.current && !visible) {
       if (progressPhase(flow.phase)) flow.continueInBackground();
-      else if (["starting", "waiting", "pairing", "ready"].includes(flow.phase)) flow.stop();
+      else if (["starting", "waiting", "pairing", "ready"].includes(flow.phase)) {
+        // Leaving an unfinished pairing abandons it: clear it so returning (e.g. Forward) starts fresh, not on "Transfer stopped".
+        flow.stop();
+        flow.dismiss();
+      }
     }
     if (visible) flow.showTransfer();
     wasVisible.current = visible;
-  }, [visible, flow.phase, flow.continueInBackground, flow.stop, flow.showTransfer]);
+  }, [visible, flow.phase, flow.continueInBackground, flow.stop, flow.dismiss, flow.showTransfer]);
   useEffect(() => {
     if (flow.phase !== "complete") completed.current = false;
     else if (!visible && !completed.current && flow.peerDeviceName) {
@@ -102,7 +111,20 @@ export function LinkedDevicesTransfer({ devices }: { devices: { id: string; devi
     }).catch(() => undefined);
     return () => { active = false; };
   }, [flow.phase, flow.requiresPairing, flow.listInterrupted, accountId, deviceId]);
-  return <section className="space-y-3" aria-label={t("transfer.title")}>
+  // A running transfer owns the flow: show one row that reopens it instead of offering a new one.
+  const running = progressPhase(flow.phase);
+  const sending = flow.role === "sender";
+  const peer = flow.peerDeviceName ?? t("transfer.otherDevice");
+  // The percentage sits in its own span so a long device name truncates before it does.
+  const runningStatus = !running ? undefined : flow.phase === "reconnecting" ? t("transfer.reconnecting")
+    : flow.phase === "paused" ? t(sending ? "transfer.viewPausedSending" : "transfer.viewPausedReceiving", { deviceName: peer })
+    : <span className="flex min-w-0 gap-1">
+      <span className="truncate">{t(sending ? "transfer.viewSending" : "transfer.viewReceiving", { deviceName: peer })}</span>
+      <span className="shrink-0 tabular-nums">{t("transfer.viewPercent", { percent: transferPercent(flow.progress.bytes, flow.progress.totalBytes) })}</span>
+    </span>;
+  return <section className="space-y-3" aria-labelledby="linked-devices-transfer">
+    <h2 id="linked-devices-transfer" className="text-sm font-semibold text-ink-muted">{t("transfer.title")}</h2>
+    <p className="text-sm text-ink-muted">{t("transfer.settingsHelp")}</p>
     {interrupted.map((item) => {
       const name = devices.find(({ id }) => id === item.peerDeviceId)?.deviceName ?? t("transfer.otherDevice");
       const stats = { deviceName: name, done: item.completedChatIds.length, total: item.chats.length };
@@ -111,11 +133,15 @@ export function LinkedDevicesTransfer({ devices }: { devices: { id: string; devi
         <Button variant="secondary" className="mt-2" onClick={() => { flow.dismiss(); navigate(transferLink(item.mode, item.peerDeviceId)); }}>{t("transfer.resume")}</Button>
       </Notice>;
     })}
-    <ListItem leading={<Icon name="transfer" />} title={t("transfer.title")} subtitle={t("transfer.entryHelp")}
-      trailing={<Icon name="chevron-right" size={18} />} onClick={() => {
-        if (progressPhase(flow.phase)) navigate(transferLink(flow.role === "sender" ? "send" : "receive"));
-        else { flow.dismiss(); navigate(TRANSFER_PATH); }
-      }} />
+    <ul role="list" className="divide-y divide-line rounded-card border border-line">
+      {running ? <li>
+        <ListItem leading={<Icon name="transfer" />} title={t("transfer.viewTransfer")} subtitle={runningStatus}
+          trailing={<Icon name="chevron-right" size={18} />} onClick={() => navigate(transferLink(sending ? "send" : "receive"))} />
+      </li> : TRANSFER_OPTIONS.map(([mode, label, help, icon]) => <li key={mode}>
+        <ListItem leading={<Icon name={icon} />} title={t(label)} subtitle={t(help)}
+          trailing={<Icon name="chevron-right" size={18} />} onClick={() => { flow.dismiss(); navigate(transferLink(mode)); }} />
+      </li>)}
+    </ul>
   </section>;
 }
 
@@ -255,13 +281,9 @@ export function HistoryTransferScreen({ setup = false }: { setup?: boolean }) {
     </div> : entry === "words" ? <EnterTransferWords connect={connect} connecting={false} />
       : <ScanTransferCode connect={connect} enter={() => setEntry("words")} onViewfinder={setViewfinder} />;
   } else {
-    const options = [
-      ["receive", "transfer.getHere", "transfer.getHereHelp", "download"],
-      ["send", "transfer.sendFromHere", "transfer.sendFromHereHelp", "transfer"],
-    ] as const;
     content = <div className="transfer-column space-y-4">
       <TransferHeading>{t("transfer.title")}</TransferHeading>
-      <div className="transfer-list">{options.map(([role, label, help, icon]) => <ListItem key={role}
+      <div className="transfer-list">{TRANSFER_OPTIONS.map(([role, label, help, icon]) => <ListItem key={role}
         leading={<Icon name={icon} />} title={t(label)} subtitle={t(help)} trailing={<Icon name="chevron-right" size={18} />}
         onClick={() => navigate(transferLink(role))} />)}</div>
     </div>;

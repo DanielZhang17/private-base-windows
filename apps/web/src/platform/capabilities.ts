@@ -12,6 +12,16 @@ export const capabilities = {
     const value = window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.autoUpdate;
     return value === "desktop" || value === "android" ? value : undefined;
   },
+  get otaUi(): boolean {
+    return isNative() && window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.otaUi === true;
+  },
+  get otaUiAvailable(): boolean {
+    return this.otaUi || (isNative() && window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.otaUi === "read-only");
+  },
+  /** Writable desktop OTA launches can restart into a staged UI bundle. */
+  get otaUiRestart(): boolean {
+    return this.otaUi && window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.otaUiRestart === true;
+  },
   get captureProtection(): "full" | "recording" | "best-effort" | undefined {
     if (!isNative()) return undefined;
     const value = window.__PRIVATEBASE_NATIVE_CAPABILITIES__?.captureProtection;

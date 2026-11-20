@@ -211,6 +211,9 @@
     --message-own-fg: #f9fafb;
     --message-incoming-bg: #e3e9eb;
     --message-incoming-fg: #111827;
+    /* Link colour in incoming bubbles; UiPreferencesEffects falls back to the
+       readable text colour when the primary colour lacks contrast. */
+    --message-incoming-link: var(--primary);
     --send-button-bg: #14586e;
     --send-button-fg: #f9fafb;
 
@@ -497,6 +500,23 @@
   .message-action-surface { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
 }
 .message-menu-target { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+/* Links in message text. Own bubbles keep their readable text colour. */
+.message-link {
+  cursor: pointer;
+  color: var(--message-incoming-link);
+  text-decoration-line: underline;
+  text-decoration-thickness: from-font;
+  text-underline-offset: 0.15em;
+  overflow-wrap: anywhere;
+  border-radius: 0.125rem;
+  -webkit-touch-callout: none;
+  /* Dragging inside a URL selects text instead of dragging the link. */
+  -webkit-user-drag: none;
+  /* With dir="ltr": bidi controls around the link cannot reorder its label. */
+  unicode-bidi: isolate;
+}
+.bubble-own .message-link { color: inherit; }
+.message-link:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; }
 .bubble.bubble-deleted { background: transparent; border: 1px solid var(--line); color: var(--text-muted); font-style: italic; }
 .message-action-popover, .message-action-sheet { animation: ui-fade var(--duration-fast) var(--ease-enter) both; }
 .file-text-dialog { min-width: min(36rem, 100%); }

@@ -11,9 +11,10 @@ import { messageVisibleToAccount } from "../lib/message-account.js";
 import type { ReceiveGap } from "../lib/receive.js";
 
 import { getConversationHideGeneration, publishLocalMessageChange } from "../lib/local-message-changes.js";
+import dbSchema from "./schema-version.json";
 
 const DB_NAME = "e2ee-chat";
-const DB_VERSION = 9;
+const DB_VERSION = dbSchema.version;
 const OUTGOING_REVISION_INDEX = "byOutgoingRevision";
 const PENDING_RECEIVE_ORDER_INDEX = "byPendingReceiveOrder";
 const RENAMED_STORES = {
