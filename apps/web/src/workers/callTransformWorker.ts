@@ -1,5 +1,7 @@
 /// <reference lib="webworker" />
 
+import { groupFrameTransform, type GroupFrameKey } from "../services/group-frame-transform.js";
+
 type EncodedFrame = RTCEncodedVideoFrame | RTCEncodedAudioFrame;
 
 interface TransformOptions {
@@ -76,6 +78,15 @@ function startTransform(
 
 self.addEventListener("rtctransform", (event) => {
   const transformer = (event as RTCTransformEvent).transformer;
-  const options = transformer.options as TransformOptions;
-  startTransform(transformer, options);
+  const options = transformer.options as TransformOptions | { kind: "group"; mode: "sender" | "receiver"; port: MessagePort };
+  if (options.kind !== "group") {
+    startTransform(transformer, options);
+    return;
+  }
+  let key: GroupFrameKey | null = null;
+  const { port } = options;
+  port.onmessage = (message: MessageEvent<GroupFrameKey | null>) => { key = message.data; };
+  void transformer.readable
+    .pipeThrough(groupFrameTransform(options.mode, () => key, (epoch) => port.postMessage(epoch)))
+    .pipeTo(transformer.writable).catch(() => undefined).finally(() => port.close());
 });

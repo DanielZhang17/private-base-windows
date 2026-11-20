@@ -11,22 +11,24 @@ self.addEventListener("push", (event) => {
     if (event.data) {
       try { payload = event.data.json(); } catch { return; }
     }
-    if (payload.v !== 1 || !["message", "call", "device_added", "approval_disabled"].includes(payload.type)) return;
+    if (payload.v !== 1 || !["message", "call", "device_added", "approval_disabled", "group_ring", "group_quiet"].includes(payload.type)) return;
     const call = payload.type === "call";
+    const group = payload.type === "group_ring" || payload.type === "group_quiet";
     const deviceAdded = payload.type === "device_added";
     const approvalDisabled = payload.type === "approval_disabled";
     const securityAlert = deviceAdded || approvalDisabled;
     if (call && (typeof payload.callId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(payload.callId))) return;
     const stored = await cache.match("/__push_locale");
     const locale = stored ? await stored.json() : {};
-    const title = call ? locale.call || "Incoming call" : securityAlert ? "Private Base" : locale.message || "New message";
+    const title = call || payload.type === "group_ring" ? locale.call || "Incoming call" : securityAlert || group ? "Private Base" : locale.message || "New message";
     await self.registration.showNotification(title, {
+      ...(payload.type === "group_quiet" ? { silent: true } : {}),
       ...(securityAlert ? { body: approvalDisabled
         ? locale.approvalDisabled || "A security setting changed on your account. Open Private Base to review."
         : locale.deviceAdded || "A new device signed in to your account. Open Private Base to review." } : {}),
       lang: locale.locale || "en", icon: "/apple-touch-icon.png",
-      tag: call ? `call-${payload.callId}` : securityAlert ? payload.type.replace("_", "-") : "new-message",
-      data: { url: call ? `/call/${payload.callId}?push=call` : deviceAdded ? "/devices" : approvalDisabled ? "/settings?section=privacy" : "/?push=message" },
+      tag: call ? `call-${payload.callId}` : payload.type === "group_quiet" ? "group-call-notice" : group ? "group-call" : securityAlert ? payload.type.replace("_", "-") : "new-message",
+      data: { url: payload.type === "group_ring" ? "/?push=group-call" : group ? "/" : call ? `/call/${payload.callId}?push=call` : deviceAdded ? "/devices" : approvalDisabled ? "/settings?section=privacy" : "/?push=message" },
     });
   })());
 });
@@ -34,7 +36,7 @@ self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   event.waitUntil((async () => {
     const path = event.notification.data?.url;
-    const safe = path === "/?push=message" || path === "/devices" || path === "/settings?section=privacy" || /^\/call\/[A-Za-z0-9_-]{1,128}\?push=call$/.test(path);
+    const safe = path === "/?push=message" || path === "/?push=group-call" || path === "/devices" || path === "/settings?section=privacy" || /^\/call\/[A-Za-z0-9_-]{1,128}\?push=call$/.test(path);
     const destination = safe ? path : "/";
     const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     // Passkey handoff and download pages mount without the app router, so they cannot take push-open.
@@ -50,7 +52,7 @@ self.addEventListener("notificationclick", (event) => {
     if (existing) {
       await existing.focus();
       existing.postMessage({ type: "push-open", destination });
-    } else await self.clients.openWindow((destination === "/devices" || destination === "/settings?section=privacy") ? destination : "/");
+    } else await self.clients.openWindow((destination === "/devices" || destination === "/settings?section=privacy" || destination === "/?push=group-call") ? destination : "/");
   })());
 });
 

@@ -285,7 +285,8 @@ it("preserves the enrollment offer when password unlock completes before the pro
     expect(unlockOfferFor("device")).toBe("new");
     expect(button("Turn on Fingerprint")).toBeUndefined();
     await act(async () => { finish("fingerprint"); await probe; });
-    expect(button("Turn on Fingerprint")).toBeDefined();
+    // The offer opens once the user has rested on the chat list for a moment.
+    await vi.waitFor(() => expect(button("Turn on Fingerprint")).toBeDefined(), { timeout: 4000 });
   } finally {
     finish?.("fingerprint");
     sessionStorage.removeItem("unlock-offer:device");

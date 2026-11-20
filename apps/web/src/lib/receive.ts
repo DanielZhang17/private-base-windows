@@ -8,12 +8,21 @@ export interface ReceiveState {
   oneTimePreKeyId?: number;
 }
 
+export interface ReceiveGap {
+  chain: string | number;
+  from: number;
+  until: number;
+}
+
 export interface ReceiveContext {
   messageId: string;
   ownerId?: string;
   deviceId?: string;
   /** Ingestion owns this peer lock through classification and commit. */
   lockedSession?: string;
+  waitForEarlier?: boolean;
+  beforeSkip?: (gaps: ReceiveGap[]) => Promise<void>;
+  advanceOnly?: () => ReceiveEffects;
   stage?: (state: ReceiveState) => void;
   beforeGroupDecrypt?: (header: SenderKeyHeader) => Promise<void>;
   editKey?: EditKeyToOpen;
@@ -27,6 +36,15 @@ export class ReceiveDecryptionError extends Error {
 
 export class MissingSenderKeyError extends Error {
   constructor(readonly keyId: string) { super("Sender key distribution has not arrived"); }
+}
+
+export class ReceivePredecessorError extends Error {
+  constructor() { super("Could not decrypt message before earlier envelopes arrive"); }
+}
+
+export async function checkReceiveGap(receive: ReceiveContext, ...gaps: ReceiveGap[]): Promise<void> {
+  if (receive.waitForEarlier) throw new ReceivePredecessorError();
+  await receive.beforeSkip?.(gaps);
 }
 
 export class InvalidSenderKeyDistributionError extends Error {}
@@ -61,12 +79,15 @@ export async function decryptPayload<T>(decrypt: () => Promise<T>): Promise<T> {
 
 export async function finishReceive(
   receive: ReceiveContext,
-  plaintext: Uint8Array,
+  plaintext: Uint8Array | undefined,
   state: ReceiveState,
-): Promise<Uint8Array | null> {
+): Promise<boolean> {
+  if (receive.advanceOnly ? plaintext !== undefined : plaintext === undefined) {
+    throw new Error("Receive result does not match the envelope mode");
+  }
   receive.stage?.(state);
-  const effects = await receive.prepare(plaintext);
-  return await commitReceivedMessage(receive.messageId, { ...effects, ownerId: effects.ownerId ?? receive.ownerId, deviceId: receive.deviceId }, state) ? plaintext : null;
+  const effects = receive.advanceOnly ? receive.advanceOnly() : await receive.prepare(plaintext!);
+  return commitReceivedMessage(receive.messageId, { ...effects, ownerId: effects.ownerId ?? receive.ownerId, deviceId: receive.deviceId }, state);
 }
 
 const sessionLocks = new Map<string, Promise<unknown>>();

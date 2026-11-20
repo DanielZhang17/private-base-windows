@@ -1,3 +1,4 @@
+import { hasLocalGroupCall } from "../features/calls/group-call-ownership.js";
 import { create } from "zustand";
 import { registerLocalCallCleanup } from "../platform/session-cleanup.js";
 import { stopAllCapturedTracks } from "../platform/media.js";
@@ -121,7 +122,7 @@ export const useCallStore = create<CallState>()((set) => ({
   isVideoOff: false,
   isMinimized: false,
   setIncomingCall: (meta) =>
-    set(() => ({
+    set(() => hasLocalGroupCall() ? {} : ({
       localCallOwnership: null,
       isMinimized: false,
       activeCallId: meta.callId,
@@ -140,7 +141,7 @@ export const useCallStore = create<CallState>()((set) => ({
   beginCallStart: () => {
     let token: symbol | null = null;
     set((state) => {
-      if (state.pendingCallStart || state.callStatus === "active" || state.callStatus === "ringing") return state;
+      if (hasLocalGroupCall() || state.pendingCallStart || state.callStatus === "active" || state.callStatus === "ringing") return state;
       token = Symbol("call-start");
       return { ...resetState(state), pendingCallStart: { token, callId: null } };
     });

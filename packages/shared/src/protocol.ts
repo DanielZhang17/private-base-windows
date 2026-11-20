@@ -1,3 +1,4 @@
+import type { GroupCallNotice } from "./group-calls.js";
 import type { DeviceAlert } from "./types/users.js";
 import type { CallEventPayload } from "./types/calls.js";
 
@@ -23,6 +24,10 @@ export interface WSMessageFrame {
   editKeyAccepted?: boolean;
   deletedAt?: number | null;
   deletedByUserId?: string | null;
+  /** Opt-in sync only. Advance the chain with this envelope and discard its plaintext. */
+  advanceOnly?: true;
+  /** Acknowledge the delivery after the receive commit. */
+  deliveryAck?: true;
   /** Mutation cursor; timestamp/serverTimestamp remain the original send time. */
   syncTimestamp?: number;
   type: WSFrameType.Message;
@@ -42,6 +47,17 @@ export interface WSMessageFrame {
   recipientDeviceId?: string;
 }
 
+/** Current server state for an envelope the recipient already holds. */
+export interface PendingDeliveryStatus {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  senderDeviceId: string;
+  expiresAt: number;
+  deletedAt: number | null;
+  deletedByUserId: string | null;
+}
+
 export interface WSTypingFrame {
   type: WSFrameType.Typing;
   userId: string;
@@ -55,6 +71,12 @@ export interface WSPresenceFrame {
 }
 
 export interface MessageDeletionEvent { ids: string[]; deletedAt: number; deletedByUserId: string }
+
+export interface ClearHistoryPage {
+  nextCursor: string | null;
+  deletions: { senderId: string; event: MessageDeletionEvent }[];
+  cleanupPending?: true;
+}
 
 export interface MessageEventPayload {
   deletion?: MessageDeletionEvent;
@@ -93,14 +115,25 @@ export interface WSDeliveryReceiptFrame {
 
 export interface WSSignalFrame {
   type: WSFrameType.Signal;
+  /** Assigned by the signaling server for replay-aware sockets. */
+  sequence?: number;
+  replayId?: string;
   payload: {
     kind: "offer" | "answer" | "ice-candidate";
     sdp?: string;
     candidate?: string;
     sdpMid?: string | null;
     sdpMLineIndex?: number | null;
+    usernameFragment?: string | null;
+    /** Correlates an answer with its offer when both clients support it. */
+    offerId?: string;
     fromUserId: string;
   };
+}
+
+export interface WSCallResumeAck {
+  type: "call-resume-ack";
+  version: 1;
 }
 
 export interface WSCallFrame {
@@ -110,6 +143,7 @@ export interface WSCallFrame {
 
 export interface ConversationEventPayload {
   conversationId: string;
+  joinRequest?: "created" | "resolved";
 }
 
 export interface WSConversationFrame {
@@ -164,6 +198,7 @@ export type WSFrame =
   | WSPresenceFrame
   | WSDeliveryReceiptFrame
   | WSSignalFrame
+  | { type: "group-call"; payload: GroupCallNotice }
   | WSCallFrame
   | WSConversationFrame
   | WSProfileFrame

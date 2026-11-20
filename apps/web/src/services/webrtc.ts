@@ -1,3 +1,4 @@
+import { groupFrameTransform, type GroupFrameKey } from "./group-frame-transform.js";
 /**
  * WebRTC service with E2EE via encoded transforms.
  * Supports legacy createEncodedStreams() and RTCRtpScriptTransform for Safari/iOS.
@@ -54,6 +55,33 @@ let callTransformWorker: Worker | null = null;
 const senderTransforms = new WeakSet<RTCRtpSender>();
 const receiverTransforms = new WeakSet<RTCRtpReceiver>();
 const encryptedConnections = new WeakSet<RTCPeerConnection>();
+
+function preferCallVideoCodecs(pc: RTCPeerConnection): void {
+  if (typeof pc.getTransceivers !== "function") return;
+  let codecs: RTCRtpCodec[];
+  try {
+    codecs = RTCRtpSender.getCapabilities?.("video")?.codecs ?? [];
+  } catch {
+    return;
+  }
+  // These packetizers can carry opaque frame payloads. Keep VP8 first for
+  // older peers and avoid preferring codecs whose packetizers parse the payload.
+  const matching = (mimeType: string) => codecs.filter((codec) => codec.mimeType.toLowerCase() === mimeType);
+  const preferred = [...matching("video/vp8"), ...matching("video/vp9")];
+  if (!preferred.length) return;
+  // The browser associates these RTP repair capabilities with the kept codecs.
+  preferred.push(...codecs.filter(({ mimeType }) => /^video\/(?:rtx|red|ulpfec|flexfec(?:-03)?)$/i.test(mimeType)));
+
+  for (const transceiver of pc.getTransceivers()) {
+    if (transceiver.receiver.track.kind !== "video") continue;
+    try {
+      transceiver.setCodecPreferences?.(preferred);
+    } catch {
+      // Capability reporting and preference support vary. Leave the browser's
+      // negotiation in place. The encoded transforms remain mandatory.
+    }
+  }
+}
 
 function asArrayBufferView(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   if (bytes.buffer instanceof ArrayBuffer) {
@@ -120,6 +148,46 @@ function attachScriptTransform(
   return true;
 }
 
+export function createGroupFrameConnection(config: RTCConfiguration): RTCPeerConnection {
+  requireE2EECalling();
+  const pc = supportsLegacyEncodedTransforms()
+    ? new RTCPeerConnection({ ...config, encodedInsertableStreams: true } as RTCConfiguration)
+    : new RTCPeerConnection(config);
+  return pc;
+}
+
+export function attachGroupFrameTransform(
+  target: RTCRtpSender | RTCRtpReceiver,
+  mode: "sender" | "receiver",
+  authenticated: (epoch: number) => void,
+) {
+  let key: GroupFrameKey | null = null;
+  const streams = getEncodedStreams(target);
+  if (streams) {
+    const lifetime = new AbortController();
+    void streams.readable.pipeThrough(groupFrameTransform(mode, () => key, authenticated))
+      .pipeTo(streams.writable, { signal: lifetime.signal }).catch(() => undefined);
+    return { set: (next: GroupFrameKey | null) => { key = next; }, close: () => { key = null; lifetime.abort(); } };
+  }
+  if (!supportsScriptEncodedTransforms() || !("transform" in target)) throw new E2EECallUnsupportedError();
+  const channel = new MessageChannel();
+  try {
+    const transform = new RTCRtpScriptTransform(ensureCallTransformWorker(),
+      { kind: "group", mode, port: channel.port2 }, [channel.port2]);
+    target.transform = transform;
+    if (target.transform !== transform) throw new E2EECallUnsupportedError();
+  } catch (error) {
+    channel.port1.close();
+    channel.port2.close();
+    throw error;
+  }
+  channel.port1.onmessage = (message: MessageEvent<number>) => authenticated(message.data);
+  return { set: (next: GroupFrameKey | null) => channel.port1.postMessage(next), close: () => {
+    channel.port1.postMessage(null);
+    channel.port1.close();
+  } };
+}
+
 function requireEncryptedConnection(pc: RTCPeerConnection): void {
   if (!encryptedConnections.has(pc)) {
     pc.close();
@@ -129,8 +197,8 @@ function requireEncryptedConnection(pc: RTCPeerConnection): void {
 }
 
 /** Fetch short-lived TURN credentials from the server. */
-export async function fetchTurnCredentials(): Promise<TurnCredentialsResponse> {
-  return api.get<TurnCredentialsResponse>("/api/calls/turn-credentials");
+export async function fetchTurnCredentials(signal?: AbortSignal): Promise<TurnCredentialsResponse> {
+  return api.get<TurnCredentialsResponse>("/api/calls/turn-credentials", signal);
 }
 
 /**
@@ -290,31 +358,13 @@ export async function createPeerConnection(
     }
   };
 
-  // Prefer HEVC > VP9 > H.264 for video (better compression at same quality)
-  try {
-    for (const transceiver of pc.getTransceivers()) {
-      if (transceiver.receiver.track.kind === "video" && typeof transceiver.setCodecPreferences === "function") {
-        const codecs = RTCRtpReceiver.getCapabilities("video")?.codecs ?? [];
-        const hevc = codecs.filter((c) => c.mimeType === "video/H265");
-        const vp9 = codecs.filter((c) => c.mimeType === "video/VP9");
-        const h264 = codecs.filter((c) => c.mimeType === "video/H264");
-        const rest = codecs.filter((c) =>
-          c.mimeType !== "video/H265" && c.mimeType !== "video/VP9" && c.mimeType !== "video/H264",
-        );
-        transceiver.setCodecPreferences([...hevc, ...vp9, ...h264, ...rest]);
-      }
-    }
-  } catch {
-    // Codec preference is best-effort; not all browsers support it
-  }
-
   return pc;
 }
 
 /**
  * Attach local media tracks to a peer connection with E2EE sender transforms.
  */
-export function attachLocalTracks(pc: RTCPeerConnection, stream: MediaStream, callKey: CallFrameKey): LocalTrackSenders {
+export function attachLocalTracks(pc: RTCPeerConnection, stream: MediaStream, callKey: CallFrameKey, reserveVideo = false): LocalTrackSenders {
   requireEncryptedConnection(pc);
   // This helper is for initial setup, before SDP enables transmission. Later track
   // replacements must use an existing sender whose transform is already installed.
@@ -339,12 +389,17 @@ export function attachLocalTracks(pc: RTCPeerConnection, stream: MediaStream, ca
         videoSender = sender;
       }
     }
+    if (reserveVideo && !videoSender) {
+      videoSender = pc.addTransceiver("video", { direction: "sendrecv" }).sender;
+      addSenderTransform(videoSender, callKey);
+    }
   } catch {
     pc.close();
     stream.getTracks().forEach((track) => track.stop());
     throw new E2EECallUnsupportedError();
   }
 
+  if (videoSender) preferCallVideoCodecs(pc);
   return { audioSender, videoSender };
 }
 
@@ -414,6 +469,7 @@ export async function acceptCallOffer(
   callWs: WebSocket,
   offerSdp: string,
   isCurrent: () => boolean = () => true,
+  sendAnswer?: (sdp: string) => void,
 ): Promise<void> {
   if (!isCurrent()) return;
   requireEncryptedConnection(pc);
@@ -424,9 +480,12 @@ export async function acceptCallOffer(
   const { user } = useAuthStore.getState();
   await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: offerSdp }));
   if (!isCurrent()) return;
+  // An incoming offer can introduce a receive-only video transceiver.
+  preferCallVideoCodecs(pc);
   const answer = await pc.createAnswer();
   if (!isCurrent()) return;
   await pc.setLocalDescription(answer);
   if (!isCurrent()) return;
-  sendSignal(callWs, { kind: "answer", sdp: answer.sdp, fromUserId: user?.id ?? "" });
+  if (sendAnswer) sendAnswer(answer.sdp!);
+  else sendSignal(callWs, { kind: "answer", sdp: answer.sdp, fromUserId: user?.id ?? "" });
 }

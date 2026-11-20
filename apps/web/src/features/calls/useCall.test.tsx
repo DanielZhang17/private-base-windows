@@ -13,7 +13,7 @@ import CallPage from "../../pages/CallPage.js";
 import { useCallStore } from "../../stores/callStore.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { api } from "../../services/api.js";
-import { acceptCallOffer, attachLocalTracks, createPeerConnection, supportsE2EECalling, disposeCallTransforms, sendSignal, deriveCallKey } from "../../services/webrtc.js";
+import { acceptCallOffer, addSenderTransform, attachLocalTracks, createPeerConnection, supportsE2EECalling, disposeCallTransforms, sendSignal, deriveCallKey, fetchTurnCredentials } from "../../services/webrtc.js";
 import { WSFrameType } from "@e2ee-chat/shared";
 import { E2EECallUnsupportedError } from "../../platform/calls.js";
 import { clearAccountScopedState } from "../../platform/session.js";
@@ -34,7 +34,7 @@ vi.mock("../../lib/message-sync.js", () => ({ syncMessages: vi.fn() }));
 vi.mock("@e2ee-chat/crypto", () => ({ fromBase64Url: () => new Uint8Array([1]) }));
 vi.mock("../../services/webrtc.js", () => ({
   disposeCallTransforms: vi.fn(), deriveCallKey: vi.fn(async () => ({})), supportsE2EECalling: vi.fn(() => true), createPeerConnection: vi.fn(),
-  attachLocalTracks: vi.fn(() => ({ audioSender: null, videoSender: null })), addSenderTransform: vi.fn(), acceptCallOffer: vi.fn(), sendSignal: vi.fn(),
+  attachLocalTracks: vi.fn(() => ({ audioSender: null, videoSender: null })), addSenderTransform: vi.fn(), acceptCallOffer: vi.fn(), sendSignal: vi.fn(), fetchTurnCredentials: vi.fn(async () => ({ iceServers: [] })),
 }));
 let root: Root;
 let container: HTMLDivElement;
@@ -42,9 +42,14 @@ let state: ReturnType<typeof useCall>;
 let stream: MediaStream;
 let stop: ReturnType<typeof vi.fn>;
 let close: ReturnType<typeof vi.fn>;
-const sockets: Array<{ close: ReturnType<typeof vi.fn>; onmessage?: (event: { data: string }) => Promise<void>; onopen?: () => Promise<void>; onclose?: (event: { code: number }) => void }> = [];
+const sockets: Array<{ url?: string; protocols?: string[]; close: ReturnType<typeof vi.fn>; onmessage?: (event: { data: string }) => Promise<void>; onopen?: () => Promise<void>; onclose?: (event: { code: number; reason?: string }) => void }> = [];
 let mediaPlay: ReturnType<typeof vi.spyOn>;
 let onRemote: (stream: MediaStream) => void;
+let reportConnected: () => void;
+function connectRemote(stream: MediaStream) {
+  onRemote(stream);
+  reportConnected();
+}
 function Harness({ children }: { children: ReactNode }) {
   return <MemoryRouter><ToastProvider><CallProvider enabled>{children}</CallProvider></ToastProvider></MemoryRouter>;
 }
@@ -63,9 +68,14 @@ beforeEach(() => {
   vi.stubGlobal("WebSocket", class { close = vi.fn(); constructor() { sockets.push(this); } });
   vi.mocked(createPeerConnection).mockImplementation(async (_id, _key, remote) => {
     onRemote = remote;
-    return { close, connectionState: "new" } as unknown as RTCPeerConnection;
+    const pc = { close, connectionState: "new", onconnectionstatechange: null as (() => void) | null };
+    reportConnected = () => {
+      pc.connectionState = "connected";
+      pc.onconnectionstatechange?.();
+    };
+    return pc as unknown as RTCPeerConnection;
   });
-  useAuthStore.setState({ user: { id: "alice" }, device: { id: "device" }, sessionId: "session", authEpoch: 0 } as never);
+  useAuthStore.setState({ user: { id: "alice" }, device: { id: "device" }, sessionId: "session", authEpoch: 0, accessToken: "token" } as never);
   useCallStore.getState().clearAllCalls();
   useCallStore.getState().setOutgoingCall({ callId: "call", conversationId: "chat", callType: "audio", initiatorId: "alice" });
   vi.mocked(api.get).mockImplementation(async (path) => (path.startsWith("/api/calls/")
@@ -110,7 +120,7 @@ it("closes signaling, peer connections and captured audio on unmount", async () 
 });
 
 function mediaTrack(kind: "audio" | "video") {
-  const track = { kind, enabled: true, readyState: "live", stop: vi.fn() };
+  const track = { kind, enabled: true, readyState: "live", stop: vi.fn(), onended: null as (() => void) | null };
   track.stop.mockImplementation(() => { track.readyState = "ended"; });
   return track;
 }
@@ -127,6 +137,36 @@ function configureVideoCall() {
   vi.mocked(api.get).mockImplementation(async (path) => (path.startsWith("/api/calls/")
     ? { id: "call", conversationId: "chat", type: "video", status: "active", initiatorId: "alice" }
     : { id: "chat", members: [] }) as never);
+}
+
+function mockTransport() {
+  vi.useFakeTimers();
+  vi.stubGlobal("WebSocket", class {
+    static OPEN = 1;
+    readyState = 1;
+    close = vi.fn();
+    constructor(public url: string, public protocols: string[]) { sockets.push(this); }
+  });
+  const pc = {
+    close, connectionState: "new", signalingState: "stable", iceConnectionState: "new",
+    onconnectionstatechange: null as (() => void) | null,
+    oniceconnectionstatechange: null as (() => void) | null,
+    onicecandidate: null as ((event: { candidate: RTCIceCandidateInit | null }) => void) | null,
+    getConfiguration: vi.fn(() => ({})), setConfiguration: vi.fn(),
+    createOffer: vi.fn(async (options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> => ({
+      type: "offer", sdp: options?.iceRestart ? "restart" : "initial",
+    })),
+    setLocalDescription: vi.fn(async (description: RTCSessionDescriptionInit) => {
+      pc.signalingState = description.type === "offer" ? "have-local-offer" : "stable";
+    }),
+    setRemoteDescription: vi.fn(async () => { pc.signalingState = "stable"; }),
+    addIceCandidate: vi.fn(async () => {}),
+  };
+  vi.mocked(createPeerConnection).mockImplementationOnce(async (_id, _key, remote) => {
+    onRemote = remote;
+    return pc as unknown as RTCPeerConnection;
+  });
+  return pc;
 }
 
 it("starts signaling when immediate acceptance precedes completion of a ringing call snapshot", async () => {
@@ -150,7 +190,7 @@ it("starts signaling when immediate acceptance precedes completion of a ringing 
   expect(createPeerConnection).toHaveBeenCalledOnce();
   expect(sockets).toHaveLength(1);
   await act(async () => { await sockets[0].onopen?.(); });
-  expect(sendSignal).toHaveBeenCalledWith(sockets[0], { kind: "offer", sdp: "caller-offer", fromUserId: "alice" });
+  expect(sendSignal).toHaveBeenCalledWith(sockets[0], expect.objectContaining({ kind: "offer", sdp: "caller-offer", fromUserId: "alice" }));
 });
 
 it.each(["audio", "video"] as const)("P1: applies ringing mute intent to every audio track before attaching %s media", async (callType) => {
@@ -318,7 +358,7 @@ it("does not restart capture when the user's profile changes", async () => {
 it("retains the elapsed duration when the call ends", async () => {
   await act(async () => root.render(<Harness><Probe /></Harness>));
   vi.useFakeTimers();
-  await act(async () => onRemote(stream));
+  await act(async () => connectRemote(stream));
   await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
   expect(state.callDuration).toBe(2);
   await act(async () => useCallStore.getState().updateCallStatus("call", "ended"));
@@ -356,6 +396,7 @@ it.each(["unmount", "session expiry", "camera restart"])("stops all acquired tra
   vi.mocked(api.get).mockImplementation(async (path) => (path.startsWith("/api/calls/")
     ? { id: "call", conversationId: "chat", type: "video", status: "active", initiatorId: "alice" }
     : { id: "chat", members: [] }) as never);
+  vi.mocked(attachLocalTracks).mockReturnValue({ audioSender: null, videoSender: { replaceTrack: vi.fn(async () => {}) } as unknown as RTCRtpSender });
   await act(async () => root.render(<Harness><Probe /></Harness>));
   await act(async () => { await state.toggleScreenShare(); });
   expect(state.isSharingScreen).toBe(true);
@@ -405,7 +446,7 @@ function RoutingHarness({ enabled = true }: { enabled?: boolean }) {
 }
 async function connectAndMinimize() {
   await act(async () => root.render(<RoutingHarness />));
-  await act(async () => onRemote(stream));
+  await act(async () => connectRemote(stream));
   await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Minimise call"]')!.click());
 }
 
@@ -419,7 +460,7 @@ it.each(["audio", "video"])("keeps %s media, signaling, transforms and audio mou
   vi.mocked(attachLocalTracks).mockReturnValue({ audioSender: sender as unknown as RTCRtpSender, videoSender: null });
   await act(async () => root.render(<RoutingHarness />));
   vi.useFakeTimers();
-  await act(async () => onRemote(stream));
+  await act(async () => connectRemote(stream));
   const audio = container.querySelector("audio")!;
   expect(audio.srcObject).toBe(stream);
   expect(container.querySelectorAll("audio")).toHaveLength(1);
@@ -461,7 +502,7 @@ it.each(["audio", "video"])("keeps %s media, signaling, transforms and audio mou
 it("keeps accessible audio recovery and its single owner through full view and bubble switches", async () => {
   mediaPlay.mockRejectedValueOnce(new DOMException("Gesture required", "NotAllowedError"));
   await act(async () => root.render(<RoutingHarness />));
-  await act(async () => onRemote(stream));
+  await act(async () => connectRemote(stream));
   const audio = container.querySelector("audio")!;
   const recovery = getByRole(container, "button", { name: "Tap to turn on sound" });
   expect(recovery.tabIndex).toBe(0);
@@ -491,7 +532,7 @@ it.each(["full", "bubble"])("recovers blocked video and persistent audio synchro
   let gesture = false;
   mediaPlay.mockImplementation(() => gesture ? Promise.resolve() : Promise.reject(new DOMException("Gesture required", "NotAllowedError")));
   await act(async () => root.render(<RoutingHarness />));
-  await act(async () => onRemote(stream));
+  await act(async () => connectRemote(stream));
   if (surface === "bubble") {
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Minimise call"]')!.click());
   }
@@ -533,7 +574,7 @@ it("keeps status and recovery in one scroll region above the wrapping call contr
   vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(max-width: 639px) and (pointer: coarse)" }));
   mediaPlay.mockRejectedValue(new DOMException("Gesture required", "NotAllowedError"));
   await act(async () => root.render(<RoutingHarness />));
-  await act(async () => onRemote(stream));
+  await act(async () => connectRemote(stream));
   await act(async () => vi.advanceTimersByTime(4000));
 
   const controls = container.querySelector<HTMLElement>("[data-call-controls]")!;
@@ -571,7 +612,7 @@ it("keeps status and recovery in one scroll region above the wrapping call contr
 it("clears audio recovery on playing without requiring another recovery click", async () => {
   mediaPlay.mockRejectedValueOnce(new DOMException("Gesture required", "NotAllowedError"));
   await act(async () => root.render(<RoutingHarness />));
-  await act(async () => onRemote(stream));
+  await act(async () => connectRemote(stream));
   const audio = container.querySelector("audio")!;
   expect(getByRole(container, "button", { name: "Tap to turn on sound" })).toBeDefined();
   await act(async () => audio.dispatchEvent(new Event("playing")));
@@ -623,7 +664,7 @@ it.each(["lock", "sign-out"])("stops microphone, parked camera, screen and remot
   configureVideoCall();
   vi.mocked(attachLocalTracks).mockReturnValue({ audioSender: null, videoSender: { replaceTrack: vi.fn(async () => {}) } as unknown as RTCRtpSender });
   await act(async () => root.render(<RoutingHarness />));
-  await act(async () => onRemote(new TestMediaStream([remote]) as unknown as MediaStream));
+  await act(async () => connectRemote(new TestMediaStream([remote]) as unknown as MediaStream));
   await act(async () => state.toggleScreenShare());
   await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Minimise call"]')!.click());
   await act(async () => root.render(<RoutingHarness enabled={false} />));
@@ -652,7 +693,7 @@ it("starts a fresh call after hangup without inheriting terminal state or the pr
   expect(useCallStore.getState().localStream).toBe(nextStream);
   expect(nextMicrophone.stop).not.toHaveBeenCalled();
   vi.useFakeTimers();
-  await act(async () => onRemote(nextStream));
+  await act(async () => connectRemote(nextStream));
   await act(async () => vi.advanceTimersByTime(3500));
   expect(state.stage).toBe("connected");
   expect(useCallStore.getState().activeCallId).toBe("next");
@@ -691,7 +732,7 @@ it.each(["screen", "camera"])("stops late %s capture after lock while the root p
 
 it("keeps the full call's ended state and lets Back to chat leave immediately", async () => {
   await act(async () => root.render(<RoutingHarness />));
-  await act(async () => onRemote(stream));
+  await act(async () => connectRemote(stream));
   await act(async () => useCallStore.getState().updateCallStatus("call", "ended"));
   expect(state.stage).toBe("ended");
   expect(container.querySelector("output")!.textContent).toBe("/call/call");
@@ -745,7 +786,7 @@ it("keeps an accepted incoming call alive when minimised and removes it on remot
 it("retains the full call's elapsed end state and return timer when notification cleanup clears the store", async () => {
   await act(async () => root.render(<RoutingHarness />));
   vi.useFakeTimers();
-  await act(async () => onRemote(stream));
+  await act(async () => connectRemote(stream));
   await act(async () => vi.advanceTimersByTime(2000));
   await act(async () => useCallStore.getState().updateCallStatus("call", "ended"));
   await act(async () => vi.advanceTimersByTime(1500));
@@ -858,18 +899,18 @@ it.each(["resolve", "reject"])("P2 epoch: a stale ICE-restart %s from call A can
   let resolve!: (offer: RTCSessionDescriptionInit) => void;
   let reject!: (error: Error) => void;
   const restart = new Promise<RTCSessionDescriptionInit>((yes, no) => { resolve = yes; reject = no; });
-  const pcA = { close: vi.fn(), connectionState: "failed", createOffer: vi.fn(() => restart), setLocalDescription: vi.fn(async () => {}), onconnectionstatechange: null as (() => void) | null };
+  const pcA = mockTransport();
+  pcA.createOffer.mockImplementation((options) => options?.iceRestart ? restart : Promise.resolve({ type: "offer", sdp: "initial" }));
   const pcB = { close: vi.fn(), connectionState: "new" };
   vi.mocked(api.post).mockResolvedValue({} as never);
-  vi.mocked(createPeerConnection).mockReset().mockResolvedValueOnce(pcA as unknown as RTCPeerConnection).mockResolvedValueOnce(pcB as unknown as RTCPeerConnection);
-  vi.stubGlobal("WebSocket", class {
-    static OPEN = 1;
-    readyState = 1;
-    close = vi.fn();
-    constructor() { sockets.push(this); }
-  });
+  vi.mocked(createPeerConnection).mockResolvedValueOnce(pcB as unknown as RTCPeerConnection);
   await act(async () => root.render(<Harness><Probe /></Harness>));
-  await act(async () => pcA.onconnectionstatechange!());
+  await act(async () => sockets[0].onopen?.());
+  pcA.setLocalDescription.mockClear();
+  vi.mocked(sendSignal).mockClear();
+  pcA.signalingState = "stable";
+  pcA.connectionState = "failed";
+  await act(async () => { pcA.onconnectionstatechange!(); await vi.advanceTimersByTimeAsync(0); });
   expect(pcA.createOffer).toHaveBeenCalledWith({ iceRestart: true });
   await act(async () => state.handleEnd());
   vi.mocked(api.get).mockImplementation(async (path) => (path.startsWith("/api/calls/")
@@ -1000,12 +1041,12 @@ it("round 3: a cross-tab authEpoch change keeps this tab's duration and signalin
   const microphone = mediaTrack("audio");
   stream = new TestMediaStream([microphone]) as unknown as MediaStream;
   vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValue(stream);
-  const pc = { close, connectionState: "connected", createOffer: vi.fn(async () => ({ type: "offer", sdp: "restart" })), setLocalDescription: vi.fn(async () => {}), onconnectionstatechange: null as (() => void) | null };
-  vi.mocked(createPeerConnection).mockImplementationOnce(async (_id, _key, remote) => { onRemote = remote; return pc as unknown as RTCPeerConnection; });
-  vi.stubGlobal("WebSocket", class { static OPEN = 1; readyState = 1; close = vi.fn(); constructor() { sockets.push(this); } });
+  const pc = mockTransport();
   await act(async () => root.render(<Harness><Probe /></Harness>));
-  vi.useFakeTimers();
-  await act(async () => onRemote(stream));
+  await act(async () => sockets[0].onopen?.());
+  pc.signalingState = "stable";
+  pc.connectionState = "connected";
+  await act(async () => pc.onconnectionstatechange!());
   await act(async () => useAuthStore.setState({ authEpoch: 2 } as never));
   await act(async () => vi.advanceTimersByTime(2000));
   expect(state.callDuration).toBe(2);
@@ -1013,9 +1054,9 @@ it("round 3: a cross-tab authEpoch change keeps this tab's duration and signalin
   expect(close).not.toHaveBeenCalled();
   expect(microphone.stop).not.toHaveBeenCalled();
   pc.connectionState = "failed";
-  await act(async () => pc.onconnectionstatechange!());
+  await act(async () => { pc.onconnectionstatechange!(); await vi.advanceTimersByTimeAsync(0); });
   expect(pc.createOffer).toHaveBeenCalledWith({ iceRestart: true });
-  expect(sendSignal).toHaveBeenCalledWith(sockets[0], { kind: "offer", sdp: "restart", fromUserId: "alice" });
+  expect(sendSignal).toHaveBeenCalledWith(sockets[0], expect.objectContaining({ kind: "offer", sdp: "restart", fromUserId: "alice" }));
 });
 
 function InvitationNavigation() {
@@ -1212,4 +1253,721 @@ it("ends a call on 4403 without reopening signaling", async () => {
   expect(state.error).toBeTruthy();
   await act(async () => vi.advanceTimersByTimeAsync(120_000));
   expect(sockets).toHaveLength(1);
+});
+
+const resumeAck = { data: JSON.stringify({ type: "call-resume-ack", version: 1 }) };
+function remoteSignal(kind: "offer" | "answer" | "ice-candidate", value: string, sequence?: number, replayId?: string) {
+  return { data: JSON.stringify({
+    type: WSFrameType.Signal, sequence, replayId, payload: {
+      kind, fromUserId: "bob", ...(kind === "ice-candidate" ? { candidate: value } : { sdp: value }),
+    },
+  }) };
+}
+
+it("resumes on the same encrypted peer, refreshing socket auth and applying only missed signaling", async () => {
+  const pc = mockTransport();
+  const getStats = vi.fn(async () => new Map([["pair", {
+    id: "pair", type: "candidate-pair", state: "succeeded", selected: true, currentRoundTripTime: 0.045,
+  }]]));
+  Object.assign(pc, { getStats });
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => sockets[0].onmessage?.(resumeAck));
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "answer", 5)));
+  pc.connectionState = "connected";
+  await act(async () => { pc.onconnectionstatechange!(); await vi.advanceTimersByTimeAsync(2000); });
+  const local = state.localStream;
+  expect(state.diagnostics?.roundTripTimeMs).toBe(45);
+  vi.mocked(api.get).mockImplementationOnce(async () => {
+    useAuthStore.setState({ accessToken: "rotated" } as never);
+    return { status: "active" } as never;
+  });
+  await act(async () => sockets[0].onclose?.({ code: 1006 }));
+  expect(state.stage).toBe("reconnecting");
+  expect(container.textContent).toContain("Reconnecting…");
+  await act(async () => vi.advanceTimersByTimeAsync(999));
+  expect(sockets).toHaveLength(1);
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  expect(sockets[1].url).toContain("?resume=1&after=5");
+  expect(sockets[1].protocols).toEqual(["token.rotated"]);
+  await act(async () => sockets[1].onopen?.());
+  await act(async () => vi.advanceTimersByTimeAsync(1000));
+  expect(state.stage).toBe("reconnecting");
+  expect(getStats).toHaveBeenCalledTimes(2);
+  expect(state.diagnostics?.roundTripTimeMs).toBe(45);
+  await act(async () => {
+    await sockets[1].onmessage?.(remoteSignal("answer", "answer", 5));
+    await sockets[1].onmessage?.(remoteSignal("ice-candidate", "late", 6));
+    await sockets[1].onmessage?.(resumeAck);
+  });
+  expect(state.stage).toBe("connected");
+  expect(pc.setRemoteDescription).toHaveBeenCalledOnce();
+  expect(pc.addIceCandidate).toHaveBeenCalledOnce();
+  expect(pc.createOffer).toHaveBeenCalledOnce();
+  expect(state.localStream).toBe(local);
+  expect(state.callDuration).toBeGreaterThanOrEqual(2);
+  expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledOnce();
+  expect(deriveCallKey).toHaveBeenCalledOnce();
+  expect(attachLocalTracks).toHaveBeenCalledOnce();
+  expect(disposeCallTransforms).not.toHaveBeenCalled();
+  await act(async () => { state.handleEnd(); await vi.advanceTimersByTimeAsync(6000); });
+  expect(getStats).toHaveBeenCalledTimes(2);
+});
+
+it("falls back to legacy replay after an unacknowledged resume and skips already-applied SDP", async () => {
+  const pc = mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "legacy")));
+  pc.connectionState = "connected";
+  await act(async () => pc.onconnectionstatechange!());
+  vi.mocked(sendSignal).mockClear();
+  await act(async () => { sockets[0].onclose?.({ code: 1006 }); await vi.advanceTimersByTimeAsync(1000); });
+  await act(async () => {
+    await sockets[1].onopen?.();
+    await sockets[1].onmessage?.(remoteSignal("answer", "legacy"));
+    await vi.advanceTimersByTimeAsync(2000);
+  });
+  expect(state.stage).toBe("connected");
+  expect(pc.setRemoteDescription).toHaveBeenCalledOnce();
+  expect(sendSignal).not.toHaveBeenCalled();
+});
+
+it("uses ICE grace, coalesces duplicate ICE events and refreshes TURN only for a sustained outage", async () => {
+  const pc = mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "answer")));
+  pc.connectionState = "connected";
+  await act(async () => pc.onconnectionstatechange!());
+  pc.connectionState = "disconnected";
+  await act(async () => { pc.onconnectionstatechange!(); await vi.advanceTimersByTimeAsync(2500); });
+  expect(state.stage).toBe("reconnecting");
+  expect(fetchTurnCredentials).not.toHaveBeenCalled();
+  pc.connectionState = "connected";
+  await act(async () => { pc.onconnectionstatechange!(); await vi.advanceTimersByTimeAsync(500); });
+  expect(state.stage).toBe("connected");
+  expect(fetchTurnCredentials).not.toHaveBeenCalled();
+  pc.connectionState = "disconnected";
+  pc.iceConnectionState = "disconnected";
+  await act(async () => {
+    pc.onconnectionstatechange!();
+    pc.oniceconnectionstatechange!();
+    await vi.advanceTimersByTimeAsync(3000);
+  });
+  expect(fetchTurnCredentials).toHaveBeenCalledOnce();
+  expect(pc.createOffer.mock.calls).toEqual([[undefined], [{ iceRestart: true }]]);
+  expect(pc.setConfiguration).toHaveBeenCalledWith({ iceServers: [] });
+  pc.connectionState = "connected";
+  pc.iceConnectionState = "connected";
+  await act(async () => { pc.onconnectionstatechange!(); await vi.advanceTimersByTimeAsync(60_000); });
+  expect(state.stage).toBe("connected");
+  expect(sockets).toHaveLength(1);
+  expect(fetchTurnCredentials).toHaveBeenCalledOnce();
+  expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledOnce();
+});
+
+it.each(["hang up", "remote end", "lock"])("invalidates a socket reauthorization in flight on %s", async (reason) => {
+  mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  let finish!: (value: never) => void;
+  vi.mocked(api.get).mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+  vi.mocked(api.post).mockResolvedValue({});
+  await act(async () => { sockets[0].onclose?.({ code: 1006 }); await vi.advanceTimersByTimeAsync(1000); });
+  expect(finish).toBeDefined();
+  await act(async () => {
+    if (reason === "hang up") state.handleEnd();
+    else if (reason === "remote end") useCallStore.getState().updateCallStatus("call", "ended");
+    else clearAccountScopedState();
+  });
+  await act(async () => { finish({ status: "active" } as never); await vi.advanceTimersByTimeAsync(60_000); });
+  expect(sockets).toHaveLength(1);
+  expect(state.stage).toBe("ended");
+  expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledOnce();
+});
+
+it("backs off after failed socket reauthorization and stops when the server reports a terminal call", async () => {
+  mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  vi.mocked(api.get).mockClear();
+  vi.mocked(api.get).mockRejectedValueOnce({ status: 0 }).mockResolvedValueOnce({ status: "ended" } as never);
+  await act(async () => { sockets[0].onclose?.({ code: 1006 }); await vi.advanceTimersByTimeAsync(2999); });
+  expect(api.get).toHaveBeenCalledOnce();
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  expect(api.get).toHaveBeenCalledTimes(2);
+  expect(state.stage).toBe("ended");
+  expect(state.error).toBeNull();
+  expect(sockets).toHaveLength(1);
+});
+
+function camerasForTest() {
+  vi.stubGlobal("MediaStream", TestMediaStream);
+  const front = Object.assign(mediaTrack("video"), { getSettings: () => ({ deviceId: "front" }) });
+  const rear = Object.assign(mediaTrack("video"), { getSettings: () => ({ deviceId: "rear" }) });
+  const screen = mediaTrack("video");
+  const microphone = mediaTrack("audio");
+  const devices = Object.assign(new EventTarget(), {
+    enumerateDevices: vi.fn(async () => [
+      { deviceId: "front", label: "Front", kind: "videoinput" },
+      { deviceId: "rear", label: "Rear", kind: "videoinput" },
+    ]),
+    getUserMedia: vi.fn(async () => new TestMediaStream([front, microphone])),
+    getDisplayMedia: vi.fn(async () => new TestMediaStream([screen])),
+  });
+  vi.stubGlobal("navigator", { mediaDevices: devices });
+  configureVideoCall();
+  const replaceTrack = vi.fn(async () => {});
+  vi.mocked(attachLocalTracks).mockReturnValue({ audioSender: null, videoSender: { replaceTrack } as unknown as RTCRtpSender });
+  return { front, rear, screen, microphone, devices, replaceTrack };
+}
+
+it("switches an encrypted sender to the selected camera and releases the old camera only after replacement", async () => {
+  const { front, rear, microphone, devices, replaceTrack } = camerasForTest();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  expect(state.cameraId).toBe("front");
+  devices.getUserMedia.mockResolvedValueOnce(new TestMediaStream([rear]));
+  replaceTrack.mockImplementationOnce(async () => { expect(front.stop).not.toHaveBeenCalled(); });
+  await act(async () => state.toggleMute());
+  await act(async () => state.handleSelectCamera("rear"));
+  expect(replaceTrack).toHaveBeenCalledExactlyOnceWith(rear);
+  expect(vi.mocked(addSenderTransform).mock.invocationCallOrder[0]).toBeLessThan(replaceTrack.mock.invocationCallOrder[0]!);
+  expect(front.stop).toHaveBeenCalledOnce();
+  expect(state.cameraId).toBe("rear");
+  expect(state.localStream!.getTracks()).toEqual([microphone, rear]);
+  expect(microphone.enabled).toBe(false);
+});
+
+it("keeps the selected camera on permission denial and handles unplug without recapture", async () => {
+  const { front, devices, replaceTrack } = camerasForTest();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  devices.getUserMedia.mockRejectedValueOnce(new DOMException("Denied", "NotAllowedError"));
+  await act(async () => state.handleSelectCamera("rear"));
+  expect(state.cameraId).toBe("front");
+  expect(front.stop).not.toHaveBeenCalled();
+  expect(replaceTrack).not.toHaveBeenCalled();
+  devices.enumerateDevices.mockResolvedValue([{ deviceId: "rear", label: "Rear", kind: "videoinput" }]);
+  await act(async () => { devices.dispatchEvent(new Event("devicechange")); });
+  expect(state.isVideoOff).toBe(true);
+  expect(state.cameraId).toBe("rear");
+  expect(replaceTrack).toHaveBeenCalledExactlyOnceWith(null);
+  expect(devices.getUserMedia).toHaveBeenCalledTimes(2);
+});
+
+it("parks the new camera during screen share and restores it when screen share ends", async () => {
+  const { front, rear, screen, devices, replaceTrack } = camerasForTest();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => state.toggleScreenShare());
+  devices.getUserMedia.mockResolvedValueOnce(new TestMediaStream([rear]));
+  await act(async () => state.handleSelectCamera("rear"));
+  expect(front.stop).toHaveBeenCalledOnce();
+  expect(state.localStream!.getVideoTracks()).toEqual([screen]);
+  expect(replaceTrack).toHaveBeenCalledExactlyOnceWith(screen);
+  await act(async () => screen.onended?.());
+  expect(state.isSharingScreen).toBe(false);
+  expect(state.localStream!.getVideoTracks()).toEqual([rear]);
+  expect(replaceTrack).toHaveBeenLastCalledWith(rear);
+});
+
+it.each([false, true])("keeps screen sharing active during encoder restoration (first write rejects: %s)", async (rejectRestore) => {
+  const { front, screen } = camerasForTest();
+  const pc = mockTransport();
+  Object.assign(pc, { getStats: vi.fn(async () => new Map([["pair", {
+    id: "pair", type: "candidate-pair", state: "succeeded", selected: true, availableOutgoingBitrate: 300_000,
+  }]])) });
+  const original = { maxFramerate: 30 };
+  let encoding: RTCRtpEncodingParameters = original;
+  const sender = {
+    track: front,
+    getParameters: () => ({ encodings: [{ ...encoding }] }),
+    setParameters: vi.fn(async ({ encodings }: RTCRtpSendParameters) => { encoding = encodings[0]!; }),
+    replaceTrack: vi.fn(async (next: typeof front) => { sender.track = next; }),
+  };
+  vi.mocked(attachLocalTracks).mockReturnValue({ audioSender: null, videoSender: sender as unknown as RTCRtpSender });
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => {
+    await sockets[0].onopen?.();
+    await sockets[0].onmessage?.(remoteSignal("answer", "answer"));
+  });
+  pc.connectionState = "connected";
+  await act(async () => { pc.onconnectionstatechange!(); await vi.advanceTimersByTimeAsync(8000); });
+  expect(encoding).toMatchObject({ maxBitrate: 500_000, maxFramerate: 15, scaleResolutionDownBy: 2 });
+
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  if (rejectRestore) sender.setParameters.mockRejectedValueOnce(new DOMException("Rejected screen reset for private-track-id", "InvalidStateError"));
+  await act(async () => state.toggleScreenShare());
+  expect(sender.replaceTrack).toHaveBeenCalledExactlyOnceWith(screen);
+  expect(state.localStream!.getVideoTracks()).toEqual([screen]);
+  await act(async () => vi.advanceTimersByTimeAsync(2000));
+  if (rejectRestore) {
+    expect(warn.mock.calls).toEqual([["Call encoder settings update failed"]]);
+    expect(encoding).toMatchObject({ maxFramerate: 15, scaleResolutionDownBy: 2 });
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+  }
+  expect(state.stage).toBe("connected");
+  expect(state.isSharingScreen).toBe(true);
+  expect(screen.stop).not.toHaveBeenCalled();
+  expect(sender.replaceTrack).toHaveBeenCalledOnce();
+  expect(encoding).toEqual(original);
+  warn.mockRestore();
+  const writes = sender.setParameters.mock.calls.length;
+  await act(async () => vi.advanceTimersByTimeAsync(8000));
+  expect(sender.setParameters).toHaveBeenCalledTimes(writes);
+  expect(encoding).toEqual(original);
+
+  await act(async () => state.toggleScreenShare());
+  expect(sender.replaceTrack).toHaveBeenLastCalledWith(front);
+  await act(async () => vi.advanceTimersByTimeAsync(4000));
+  expect(encoding).toMatchObject({ maxBitrate: 1_200_000, maxFramerate: 24, scaleResolutionDownBy: 1.5 });
+});
+
+it("renews a half-open signaling socket during ICE recovery and ends at the recovery deadline", async () => {
+  const pc = mockTransport();
+  vi.mocked(api.post).mockResolvedValue({});
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => sockets[0].onmessage?.(resumeAck));
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "answer", 5)));
+  pc.connectionState = "connected";
+  await act(async () => pc.onconnectionstatechange!());
+  pc.connectionState = "failed";
+  await act(async () => { pc.onconnectionstatechange!(); await vi.advanceTimersByTimeAsync(8000); });
+  expect(sockets[0].close).toHaveBeenCalledOnce();
+  expect(state.stage).toBe("reconnecting");
+  await act(async () => vi.advanceTimersByTimeAsync(1000));
+  expect(sockets[1].url).toContain("after=5");
+  await act(async () => {
+    await sockets[1].onopen?.();
+    await sockets[1].onmessage?.(resumeAck);
+    await vi.advanceTimersByTimeAsync(36_000);
+  });
+  expect(state.stage).toBe("ended");
+  expect(api.post).toHaveBeenCalledWith("/api/calls/call/end");
+  expect(close).toHaveBeenCalled();
+  const socketCount = sockets.length;
+  await act(async () => vi.advanceTimersByTimeAsync(45_000));
+  expect(sockets).toHaveLength(socketCount);
+  expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledOnce();
+});
+
+it("keeps healthy media alive through a prolonged signaling outage while backgrounded", async () => {
+  const pc = mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  pc.connectionState = "connected";
+  await act(async () => pc.onconnectionstatechange!());
+  const local = state.localStream;
+  const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+  try {
+    vi.mocked(api.get).mockRejectedValue({ status: 0 });
+    await act(async () => {
+      sockets[0].onclose?.({ code: 1006 });
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(state.stage).toBe("reconnecting");
+    expect(vi.mocked(api.get).mock.calls.filter(([path]) => path === "/api/calls/call").length).toBeGreaterThan(3);
+    expect(state.localStream).toBe(local);
+    expect(close).not.toHaveBeenCalled();
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledOnce();
+  } finally { hidden.mockRestore(); }
+});
+
+it("remembers a selected camera with video off and captures it only when video is turned back on", async () => {
+  const { rear, devices, replaceTrack } = camerasForTest();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => state.handleToggleVideo());
+  await act(async () => state.handleSelectCamera("rear"));
+  expect(state.isVideoOff).toBe(true);
+  expect(state.cameraId).toBe("rear");
+  expect(devices.getUserMedia).toHaveBeenCalledOnce();
+  expect(replaceTrack).toHaveBeenCalledExactlyOnceWith(null);
+  devices.getUserMedia.mockResolvedValueOnce(new TestMediaStream([rear]));
+  await act(async () => state.handleToggleVideo());
+  expect(devices.getUserMedia).toHaveBeenLastCalledWith({
+    audio: false, video: expect.objectContaining({ deviceId: { exact: "rear" } }),
+  });
+  expect(state.isVideoOff).toBe(false);
+  expect(replaceTrack).toHaveBeenLastCalledWith(rear);
+});
+
+it("answers an incoming legacy offer without a resume acknowledgment", async () => {
+  const pc = mockTransport();
+  incomingCall();
+  useCallStore.getState().acceptLocalCall("call");
+  vi.mocked(api.get).mockImplementation(async (path) => (path.startsWith("/api/calls/")
+    ? { id: "call", conversationId: "chat", type: "audio", status: "active", initiatorId: "bob" }
+    : { id: "chat", members: [] }) as never);
+  vi.mocked(acceptCallOffer).mockImplementationOnce(async (_peer, _socket, _sdp, _current, answer) => {
+    answer?.("legacy answer");
+  });
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => sockets[0].onmessage?.(remoteSignal("offer", "legacy offer")));
+  expect(pc.createOffer).not.toHaveBeenCalled();
+  expect(acceptCallOffer).toHaveBeenCalledWith(pc, sockets[0], "legacy offer", expect.any(Function), expect.any(Function));
+  expect(sendSignal).toHaveBeenCalledExactlyOnceWith(sockets[0], { kind: "answer", sdp: "legacy answer", fromUserId: "alice", offerId: undefined });
+});
+
+it.each([false, true])("requires the peer transport to connect before setup expires (connected=%s)", async (connected) => {
+  const pc = mockTransport();
+  vi.mocked(api.post).mockResolvedValue({});
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  pc.connectionState = "connecting";
+  pc.iceConnectionState = "checking";
+  await act(async () => onRemote(stream));
+  expect(state.stage).toBe("connecting");
+  expect(state.callDuration).toBe(0);
+  await act(async () => vi.advanceTimersByTimeAsync(29_999));
+  if (connected) {
+    pc.connectionState = "connected";
+    pc.iceConnectionState = "connected";
+    await act(async () => pc.onconnectionstatechange!());
+  }
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  expect(state.stage).toBe(connected ? "connected" : "ended");
+  if (connected) expect(api.post).not.toHaveBeenCalled();
+  else expect(api.post).toHaveBeenCalledWith("/api/calls/call/end");
+});
+
+it.each(["granted", "denied"] as const)("stops sharing immediately while camera permission is pending and then %s", async (permission) => {
+  const { front, rear, screen, devices, replaceTrack } = camerasForTest();
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => getByRole(container, "button", { name: "Share screen" }).click());
+  let grant!: (stream: TestMediaStream) => void;
+  let deny!: (error: DOMException) => void;
+  devices.getUserMedia.mockReturnValueOnce(new Promise((resolve, reject) => { grant = resolve; deny = reject; }));
+  await act(async () => getByRole(container, "button", { name: "Switch camera" }).click());
+  expect(state.videoBusy).toBe(true);
+  const stopSharing = getByRole<HTMLButtonElement>(container, "button", { name: "Stop sharing screen" });
+  expect(stopSharing.disabled).toBe(false);
+  await act(async () => stopSharing.click());
+  expect(screen.stop).toHaveBeenCalledOnce();
+  expect(state.isSharingScreen).toBe(false);
+  expect(state.localStream!.getVideoTracks()).toEqual([]);
+  expect(replaceTrack).toHaveBeenCalledExactlyOnceWith(screen);
+  await act(async () => {
+    if (permission === "granted") grant(new TestMediaStream([rear]));
+    else deny(new DOMException("Denied", "NotAllowedError"));
+  });
+  const camera = permission === "granted" ? rear : front;
+  expect(replaceTrack).toHaveBeenLastCalledWith(camera);
+  expect(state.localStream!.getVideoTracks()).toEqual([camera]);
+  expect(state.videoBusy).toBe(false);
+});
+
+it.each([false, true])("recovers a queued legacy offer unless the answer was replayed (answer=%s)", async (replayedAnswer) => {
+  const pc = mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  const offer = vi.mocked(sendSignal).mock.calls[0][1];
+  vi.mocked(sendSignal).mockClear();
+  await act(async () => { sockets[0].onclose?.({ code: 1006 }); await vi.advanceTimersByTimeAsync(1000); });
+  await act(async () => sockets[1].onopen?.());
+  if (replayedAnswer) await act(async () => sockets[1].onmessage?.(remoteSignal("answer", "legacy answer")));
+  await act(async () => vi.advanceTimersByTimeAsync(2000));
+  if (replayedAnswer) expect(sendSignal).not.toHaveBeenCalled();
+  else {
+    expect(sendSignal).toHaveBeenCalledExactlyOnceWith(sockets[1], offer);
+    await act(async () => sockets[1].onmessage?.(remoteSignal("answer", "legacy answer")));
+  }
+  expect(pc.signalingState).toBe("stable");
+  expect(pc.createOffer).toHaveBeenCalledOnce();
+  expect(deriveCallKey).toHaveBeenCalledOnce();
+});
+
+it.each(["fails", "stalls"])("restarts ICE with the existing configuration when TURN refresh %s", async (outcome) => {
+  const pc = mockTransport();
+  if (outcome === "fails") vi.mocked(fetchTurnCredentials).mockRejectedValueOnce({ status: 503 });
+  else vi.mocked(fetchTurnCredentials).mockReturnValueOnce(new Promise(() => {}));
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "answer")));
+  pc.connectionState = "connected";
+  await act(async () => pc.onconnectionstatechange!());
+  pc.connectionState = "failed";
+  await act(async () => { pc.onconnectionstatechange!(); await vi.advanceTimersByTimeAsync(0); });
+  const signal = vi.mocked(fetchTurnCredentials).mock.calls[0][0];
+  expect(signal).toBeInstanceOf(AbortSignal);
+  if (outcome === "stalls") {
+    expect(pc.createOffer).toHaveBeenCalledOnce();
+    await act(async () => vi.advanceTimersByTimeAsync(2500));
+    expect(signal?.aborted).toBe(true);
+  }
+  expect(pc.setConfiguration).not.toHaveBeenCalled();
+  expect(pc.createOffer).toHaveBeenLastCalledWith({ iceRestart: true });
+  expect(state.stage).toBe("reconnecting");
+  expect(deriveCallKey).toHaveBeenCalledOnce();
+});
+
+it("aborts a stalled reconnect lookup and ignores its late result after backoff succeeds", async () => {
+  const pc = mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "answer")));
+  pc.connectionState = "connected";
+  await act(async () => pc.onconnectionstatechange!());
+  const lookup = vi.mocked(api.get);
+  lookup.mockClear();
+  let finish!: (value: never) => void;
+  lookup.mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+  await act(async () => { sockets[0].onclose?.({ code: 1006 }); await vi.advanceTimersByTimeAsync(1000); });
+  const signal = lookup.mock.calls[0][1];
+  expect(signal?.aborted).toBe(false);
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(signal?.aborted).toBe(true);
+  expect(lookup).toHaveBeenCalledOnce();
+  await act(async () => vi.advanceTimersByTimeAsync(2000));
+  expect(lookup).toHaveBeenCalledTimes(2);
+  expect(sockets).toHaveLength(2);
+  await act(async () => sockets[1].onopen?.());
+  await act(async () => sockets[1].onmessage?.(resumeAck));
+  await act(async () => finish({ status: "ended" } as never));
+  expect(sockets).toHaveLength(2);
+  expect(state.stage).toBe("connected");
+  expect(close).not.toHaveBeenCalled();
+});
+
+it("delivers live ICE past the replay cap in both directions and keeps a bounded reconnect replay", async () => {
+  const pc = mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "answer")));
+  await act(async () => sockets[0].onmessage?.(resumeAck));
+  const relay = "candidate:relay 1 udp 1 192.0.2.1 9000 typ relay raddr 192.0.2.2 rport 9000";
+  const all = [...Array.from({ length: 60 }, (_, index) => `candidate:host${index} 1 udp 1 192.0.2.2 9000 typ host`), relay];
+  const outgoing = () => vi.mocked(sendSignal).mock.calls.filter(([, signal]) => signal.kind === "ice-candidate");
+  await act(async () => {
+    for (const candidate of all) {
+      pc.onicecandidate!({ candidate: { candidate, sdpMid: "0" } });
+      await sockets[0].onmessage?.(remoteSignal("ice-candidate", candidate));
+    }
+  });
+  expect(outgoing()).toHaveLength(all.length);
+  expect(outgoing().at(-1)?.[1].candidate).toBe(relay);
+  expect(pc.addIceCandidate).toHaveBeenCalledTimes(all.length);
+  expect(pc.addIceCandidate).toHaveBeenLastCalledWith(expect.objectContaining({ candidate: relay }));
+
+  vi.mocked(sendSignal).mockClear();
+  await act(async () => { sockets[0].onclose?.({ code: 1006 }); await vi.advanceTimersByTimeAsync(1000); });
+  await act(async () => sockets[1].onopen?.());
+  await act(async () => sockets[1].onmessage?.(resumeAck));
+  expect(outgoing()).toHaveLength(48);
+  expect(outgoing().some(([, signal]) => signal.candidate === relay)).toBe(true);
+});
+
+it.each(["capture", "replacement"])("turns the camera off immediately during a pending camera switch %s", async (phase) => {
+  const { front, rear, microphone, devices, replaceTrack } = camerasForTest();
+  vi.useFakeTimers();
+  vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(max-width: 639px) and (pointer: coarse)" }));
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => connectRemote(state.localStream!));
+  let release!: () => void;
+  if (phase === "capture") {
+    devices.getUserMedia.mockReturnValueOnce(new Promise((resolve) => {
+      release = () => resolve(new TestMediaStream([rear]));
+    }));
+  } else {
+    devices.getUserMedia.mockResolvedValueOnce(new TestMediaStream([rear]));
+    replaceTrack.mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+  }
+  await act(async () => getByRole(container, "button", { name: "Switch camera" }).click());
+  await act(async () => vi.advanceTimersByTimeAsync(4000));
+  expect(container.querySelector("[data-call-controls]")?.classList).not.toContain("opacity-0");
+  const off = getByRole<HTMLButtonElement>(container, "button", { name: "Turn off camera" });
+  expect(off.disabled).toBe(false);
+  await act(async () => getByRole(container, "button", { name: "Mute microphone" }).click());
+  expect(microphone.enabled).toBe(false);
+  await act(async () => off.click());
+  expect(front.readyState).toBe("ended");
+  if (phase === "replacement") expect(rear.readyState).toBe("ended");
+  expect(state.isVideoOff).toBe(true);
+  expect(state.localStream!.getVideoTracks()).toEqual([]);
+  await act(async () => release());
+  expect(rear.readyState).toBe("ended");
+  expect(state.isVideoOff).toBe(true);
+  expect(state.localStream!.getVideoTracks()).toEqual([]);
+  if (phase === "capture") expect(replaceTrack).toHaveBeenCalledExactlyOnceWith(null);
+  else expect(replaceTrack.mock.calls).toEqual([[rear], [null]]);
+});
+
+it.each(["before permission", "during permission"])("honors camera-off %s on initial capture and still connects with muted audio", async (phase) => {
+  const { front, microphone, devices } = camerasForTest();
+  let release!: () => void;
+  if (phase === "before permission") {
+    vi.mocked(createPeerConnection).mockReturnValueOnce(new Promise((resolve) => {
+      release = () => resolve({ close, connectionState: "new" } as unknown as RTCPeerConnection);
+    }));
+    devices.getUserMedia.mockResolvedValueOnce(new TestMediaStream([microphone]));
+  } else {
+    devices.getUserMedia.mockReturnValueOnce(new Promise((resolve) => {
+      release = () => resolve(new TestMediaStream([front, microphone]));
+    }));
+  }
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => getByRole(container, "button", { name: "Turn off camera" }).click());
+  await act(async () => getByRole(container, "button", { name: "Mute microphone" }).click());
+  expect(state.isVideoOff).toBe(true);
+  await act(async () => release());
+  if (phase === "before permission") expect(devices.getUserMedia).toHaveBeenCalledExactlyOnceWith({ audio: true, video: false });
+  else expect(front.readyState).toBe("ended");
+  const attached = vi.mocked(attachLocalTracks).mock.calls[0];
+  expect(attached[1].getTracks()).toEqual([microphone]);
+  expect(attached[3]).toBe(true); // Reserve the encrypted video sender without a camera.
+  expect(microphone.enabled).toBe(false);
+  expect(state.stage).toBe("connecting");
+});
+
+it("cancels a pending camera enable from the call bubble and keeps hangup immediate", async () => {
+  const { rear, microphone, devices, replaceTrack } = camerasForTest();
+  vi.mocked(api.post).mockReturnValue(new Promise(() => {}));
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => getByRole(container, "button", { name: "Turn off camera" }).click());
+  let finish!: (value: TestMediaStream) => void;
+  devices.getUserMedia.mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+  await act(async () => getByRole(container, "button", { name: "Turn on camera" }).click());
+  await act(async () => getByRole(container, "button", { name: "Minimise call" }).click());
+  const bubble = container.querySelector<HTMLElement>(".call-bubble")!;
+  await act(async () => getByRole(bubble, "button", { name: "Turn off camera" }).click());
+  expect(state.isVideoOff).toBe(true);
+  await act(async () => getByRole(bubble, "button", { name: "End call" }).click());
+  expect(microphone.readyState).toBe("ended");
+  expect(close).toHaveBeenCalled();
+  expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/calls/call/end");
+  await act(async () => finish(new TestMediaStream([rear])));
+  expect(rear.readyState).toBe("ended");
+  expect(replaceTrack).toHaveBeenCalledExactlyOnceWith(null);
+  expect(state.stage).toBe("ended");
+});
+
+it.each(["prompt", "replacement"])("can stop a display share from the call bubble while its %s is pending", async (phase) => {
+  const { front, screen, devices, replaceTrack } = camerasForTest();
+  await act(async () => root.render(<RoutingHarness />));
+  let release!: () => void;
+  if (phase === "prompt") {
+    devices.getDisplayMedia.mockReturnValueOnce(new Promise((resolve) => { release = () => resolve(new TestMediaStream([screen])); }));
+  } else {
+    replaceTrack.mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+  }
+  await act(async () => getByRole(container, "button", { name: "Share screen" }).click());
+  expect(state.videoBusy).toBe(true);
+  await act(async () => getByRole(container, "button", { name: "Minimise call" }).click());
+  const bubble = container.querySelector<HTMLElement>(".call-bubble")!;
+  await act(async () => getByRole(bubble, "button", { name: "Stop sharing screen" }).click());
+  expect(state.isSharingScreen).toBe(false);
+  if (phase === "replacement") expect(screen.readyState).toBe("ended");
+  await act(async () => release());
+  expect(screen.readyState).toBe("ended");
+  expect(state.isSharingScreen).toBe(false);
+  expect(state.localStream!.getVideoTracks()).toEqual([front]);
+  if (phase === "prompt") expect(replaceTrack).not.toHaveBeenCalled();
+  else expect(replaceTrack.mock.calls).toEqual([[screen], [front]]);
+});
+
+it("lets an answered ICE restart finish checking and retries when that check actually fails", async () => {
+  const pc = mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "initial answer")));
+  pc.connectionState = "connected";
+  await act(async () => pc.onconnectionstatechange!());
+  pc.connectionState = "failed";
+  pc.iceConnectionState = "failed";
+  await act(async () => { pc.oniceconnectionstatechange!(); await vi.advanceTimersByTimeAsync(0); });
+  expect(pc.createOffer).toHaveBeenCalledTimes(2);
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "restart answer")));
+  pc.connectionState = "connecting";
+  pc.iceConnectionState = "checking";
+  await act(async () => { pc.oniceconnectionstatechange!(); await vi.advanceTimersByTimeAsync(24_000); });
+  expect(pc.createOffer).toHaveBeenCalledTimes(2);
+  expect(state.stage).toBe("reconnecting");
+  pc.iceConnectionState = "failed";
+  await act(async () => { pc.oniceconnectionstatechange!(); await vi.advanceTimersByTimeAsync(0); });
+  expect(pc.createOffer).toHaveBeenCalledTimes(3);
+  expect(deriveCallKey).toHaveBeenCalledOnce();
+});
+
+it.each([false, true])("resends a queued legacy answer to the replayed offer only before media connects (connected=%s)", async (connected) => {
+  const pc = mockTransport();
+  incomingCall();
+  useCallStore.getState().acceptLocalCall("call");
+  vi.mocked(api.get).mockImplementation(async (path) => (path.startsWith("/api/calls/")
+    ? { id: "call", conversationId: "chat", status: "active", type: "audio", initiatorId: "bob" }
+    : { id: "chat", members: [] }) as never);
+  vi.mocked(acceptCallOffer).mockImplementationOnce(async (_peer, _socket, _sdp, _current, answer) => { answer?.("answer"); });
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  const offer = remoteSignal("offer", "legacy offer");
+  await act(async () => sockets[0].onmessage?.(offer));
+  const answer = vi.mocked(sendSignal).mock.calls[0][1];
+  if (connected) {
+    pc.connectionState = "connected";
+    await act(async () => pc.onconnectionstatechange!());
+  }
+  vi.mocked(sendSignal).mockClear();
+  await act(async () => { sockets[0].onclose?.({ code: 1006 }); await vi.advanceTimersByTimeAsync(1000); });
+  await act(async () => {
+    await sockets[1].onopen?.();
+    await sockets[1].onmessage?.(offer);
+    await vi.advanceTimersByTimeAsync(2000);
+  });
+  if (connected) expect(sendSignal).not.toHaveBeenCalled();
+  else expect(sendSignal).toHaveBeenCalledExactlyOnceWith(sockets[1], answer);
+  expect(acceptCallOffer).toHaveBeenCalledOnce();
+});
+
+it("relays end-of-candidates in both directions and applies one buffered before the remote SDP", async () => {
+  const pc = mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => sockets[0].onopen?.());
+  await act(async () => {
+    pc.onicecandidate!({ candidate: null });
+    pc.onicecandidate!({ candidate: { candidate: "", sdpMid: "0" } });
+    await sockets[0].onmessage?.(remoteSignal("ice-candidate", ""));
+  });
+  expect(sendSignal).toHaveBeenCalledTimes(2);
+  expect(sendSignal).toHaveBeenLastCalledWith(sockets[0], expect.objectContaining({ kind: "ice-candidate", candidate: "", sdpMid: "0" }));
+  expect(pc.addIceCandidate).not.toHaveBeenCalled();
+  await act(async () => sockets[0].onmessage?.(remoteSignal("answer", "answer")));
+  expect(pc.addIceCandidate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ candidate: "" }));
+});
+
+it("accepts a restarted replay sequence after rollback and resumes using its new generation", async () => {
+  const pc = mockTransport();
+  await act(async () => root.render(<Harness><Probe /></Harness>));
+  await act(async () => {
+    await sockets[0].onopen?.();
+    await sockets[0].onmessage?.(remoteSignal("answer", "answer", 30, "original"));
+    await sockets[0].onmessage?.(resumeAck);
+  });
+  await act(async () => { sockets[0].onclose?.({ code: 1006 }); await vi.advanceTimersByTimeAsync(1000); });
+  expect(sockets[1].url).toContain("&after=30&replay=original");
+  await act(async () => {
+    await sockets[1].onopen?.();
+    await sockets[1].onmessage?.(remoteSignal("ice-candidate", "during-rollback", 2, "new"));
+    await sockets[1].onmessage?.(resumeAck);
+  });
+  expect(pc.addIceCandidate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ candidate: "during-rollback" }));
+  await act(async () => { sockets[1].onclose?.({ code: 1006 }); await vi.advanceTimersByTimeAsync(1000); });
+  expect(sockets[2].url).toContain("&after=2&replay=new");
+});
+
+it("turns the parked camera off during a switch and keeps an independent screen share live", async () => {
+  const { front, rear, screen, devices, replaceTrack } = camerasForTest();
+  await act(async () => root.render(<RoutingHarness />));
+  await act(async () => getByRole(container, "button", { name: "Share screen" }).click());
+  let finish!: (value: TestMediaStream) => void;
+  devices.getUserMedia.mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+  await act(async () => getByRole(container, "button", { name: "Switch camera" }).click());
+  await act(async () => getByRole(container, "button", { name: "Turn off camera" }).click());
+  expect(front.readyState).toBe("ended");
+  expect(screen.readyState).toBe("live");
+  expect(state.localStream!.getVideoTracks()).toEqual([screen]);
+  await act(async () => finish(new TestMediaStream([rear])));
+  expect(rear.readyState).toBe("ended");
+  await act(async () => getByRole(container, "button", { name: "Stop sharing screen" }).click());
+  expect(screen.readyState).toBe("ended");
+  expect(replaceTrack.mock.calls).toEqual([[screen], [null]]);
+  expect(state.localStream!.getVideoTracks()).toEqual([]);
 });

@@ -17,7 +17,7 @@ import {
 } from "@e2ee-chat/crypto";
 import { getAppDB, getSession, saveMessage as writeOwnedMessage, saveSession } from "../db/index.js";
 import { api } from "../services/api.js";
-import { decryptMessage as decryptMessageAndCommit, type IncomingMessage } from "./message-processor.js";
+import { decryptMessage as decryptMessageAndCommit, encryptGroupCallControl, type IncomingMessage } from "./message-processor.js";
 import { decryptFromDevice as decryptFromDeviceAndCommit, decryptInitialMessage as decryptInitialMessageAndCommit, encryptForDevice, resetSession } from "./session-manager.js";
 import { consumeOneTimePreKey, findOneTimePreKey } from "./key-manager.js";
 
@@ -141,6 +141,51 @@ describe("initial-message session safety", () => {
     expect(await decryptMessage("direct", incoming(restarted, "restart"))).toBe("restarted");
     expect((await getSession("alice:alice-device"))?.x3dhEphemeralKey).toBe(restarted.initialHeader?.ephemeralKey);
     expect(consumeOneTimePreKey).toHaveBeenCalledTimes(2);
+  });
+
+  it("decrypts a crossed high-user ring proof and low-user media grant without changing the chat ratchet", async () => {
+    otps = [];
+    const chat = await send("bob", "bob-device", "chat before call");
+    const bobSigned = signed;
+    const aliceSigned = await generateSignedPreKey(2, alice.privateEd25519);
+    identity = bob;
+    expect(await decryptMessage("direct", incoming(chat, "chat-before"))).toBe("chat before call");
+    const directBefore = await getSession("alice:alice-device");
+    vi.mocked(api.get).mockImplementation(async (path) => {
+      const isAlice = path.split("?")[0].endsWith("/alice-device");
+      const preKey = isAlice ? aliceSigned : bobSigned;
+      return {
+        identityKey: toBase64Url((isAlice ? alice : bob).publicEd25519), signedPreKey: toBase64Url(preKey.keyPair.publicKey),
+        signedPreKeyId: preKey.id, signedPreKeySig: toBase64Url(preKey.signature),
+      };
+    });
+
+    // Bob starts ringing Alice. Alice can join from the banner before Bob's
+    // control arrives. Both initial envelopes exist before either receipt.
+    const scope = { conversationId: "group", callId: "call", epoch: 2 };
+    const ring = await encryptGroupCallControl("ring proof", "alice", "alice-device",
+      { ...scope, sessionId: "bob-session", inviteUntil: 1000 });
+    expect(api.get).toHaveBeenLastCalledWith("/api/keys/bundle/alice/alice-device?callControl=1&conversationId=group&callId=call&sessionId=bob-session&epoch=2&inviteUntil=1000");
+    identity = alice;
+    signed = aliceSigned;
+    const grant = await encryptGroupCallControl("first grant", "bob", "bob-device", { ...scope, sessionId: "alice-session" });
+    expect(api.get).toHaveBeenLastCalledWith("/api/keys/bundle/bob/bob-device?callControl=1&conversationId=group&callId=call&sessionId=alice-session&epoch=2");
+    const asControl = (wire: Awaited<ReturnType<typeof encryptGroupCallControl>>, id: string, senderId: string) =>
+      decryptMessageAndCommit("direct", { ...wire, id, senderId, senderDeviceId: `${senderId}-device`, type: "system" }, receive(id), true);
+    expect(await asControl(ring, "higher-ring", "bob")).toBe("ring proof");
+    identity = bob;
+    signed = bobSigned;
+    expect(await asControl(grant, "lower-grant", "alice")).toBe("first grant");
+    expect(await getSession("alice:alice-device")).toEqual(directBefore);
+
+    const reply = await encryptGroupCallControl("reply grant", "alice", "alice-device", { ...scope, sessionId: "bob-session" });
+    identity = alice;
+    signed = aliceSigned;
+    expect(await asControl(reply, "higher-grant", "bob")).toBe("reply grant");
+    const next = await send("bob", "bob-device", "chat after call");
+    identity = bob;
+    signed = bobSigned;
+    expect(await decryptMessage("direct", incoming(next, "chat-after"))).toBe("chat after call");
   });
 
   it("records a fresh ephemeral key when recovering a responder-only send session", async () => {

@@ -227,24 +227,18 @@ export async function ratchetEncrypt(
   return { header, ciphertext, iv, ...(editKey && { sealedEditKey: await sealEditKey(messageKey, iv, ciphertext, editKey) }) };
 }
 
-export async function ratchetDecrypt(
+async function takeReceivingKey(
   session: RatchetSession,
   header: RatchetHeader,
-  ciphertext: Uint8Array,
-  iv: Uint8Array,
-  editKey?: EditKeyToOpen,
-): Promise<Uint8Array> {
+): Promise<{ messageKey: Uint8Array; borrowed: boolean }> {
   const remotePublicKey = fromBase64Url(header.dhPublicKey);
-  const headerBytes = canonicalHeaderAAD(header);
 
   // Check skipped keys first
   const skId = skippedKeyId(remotePublicKey, header.n);
   const skippedKey = session.skippedKeys.get(skId);
   if (skippedKey) {
     session.skippedKeys.delete(skId);
-    const plaintext = await aesGcm.decrypt(skippedKey, iv, ciphertext, headerBytes);
-    if (editKey) await openEditKey(skippedKey, iv, ciphertext, editKey);
-    return plaintext;
+    return { messageKey: skippedKey, borrowed: true };
   }
 
   // Check if we need a DH ratchet step
@@ -268,8 +262,41 @@ export async function ratchetDecrypt(
   const { messageKey, nextChainKey } = await kdfCK(session.receivingChainKey);
   session.receivingChainKey = nextChainKey;
   session.recvMessageNumber++;
+  return { messageKey, borrowed: false };
+}
 
+export async function ratchetDecrypt(
+  session: RatchetSession,
+  header: RatchetHeader,
+  ciphertext: Uint8Array,
+  iv: Uint8Array,
+  editKey?: EditKeyToOpen,
+): Promise<Uint8Array> {
+  const headerBytes = canonicalHeaderAAD(header);
+  const { messageKey } = await takeReceivingKey(session, header);
   const plaintext = await aesGcm.decrypt(messageKey, iv, ciphertext, headerBytes);
   if (editKey) await openEditKey(messageKey, iv, ciphertext, editKey);
   return plaintext;
+}
+
+/** Commit a copied receive state only after authenticating the deleted envelope. */
+export async function ratchetAdvanceOnly(
+  session: RatchetSession,
+  header: RatchetHeader,
+  ciphertext: Uint8Array,
+  iv: Uint8Array,
+): Promise<void> {
+  const headerBytes = canonicalHeaderAAD(header);
+  // State transitions replace key arrays and mutate the skipped-key map.
+  const next = { ...session, skippedKeys: new Map(session.skippedKeys) };
+  const { messageKey, borrowed } = await takeReceivingKey(next, header);
+  let authenticated = false;
+  try {
+    authenticated = await aesGcm.verifyTag(messageKey, iv, ciphertext, headerBytes);
+    if (!authenticated) throw new Error("Invalid ratchet authentication tag");
+    Object.assign(session, next);
+  } finally {
+    // A borrowed skipped key still belongs to the live state after a failed tag.
+    if (!borrowed || authenticated) messageKey.fill(0);
+  }
 }

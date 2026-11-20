@@ -17,6 +17,50 @@ export async function captureUserMedia(constraints: MediaStreamConstraints): Pro
   return register(await navigator.mediaDevices.getUserMedia(constraints));
 }
 
+export interface CallCamera {
+  id: string;
+  label: string;
+  facingMode?: "user" | "environment";
+}
+
+export const callCameraConstraints: MediaTrackConstraints = {
+  width: { ideal: 1280 },
+  height: { ideal: 720 },
+  frameRate: { ideal: 30 },
+};
+
+export async function listCallCameras(track?: MediaStreamTrack | null): Promise<CallCamera[]> {
+  const devices = await navigator.mediaDevices?.enumerateDevices?.() ?? [];
+  const cameras = new Map(devices.filter((device) => device.kind === "videoinput" && device.deviceId)
+    .map(({ deviceId, label }) => [deviceId, { id: deviceId, label }]));
+  const facing = track?.getSettings?.().facingMode;
+  if (cameras.size < 2 && (facing === "user" || facing === "environment")) {
+    // Some mobile WebViews expose only the active camera ID.
+    return [
+      { id: "facing:user", label: "", facingMode: "user" },
+      { id: "facing:environment", label: "", facingMode: "environment" },
+    ];
+  }
+  return [...cameras.values()];
+}
+
+export function captureCallCamera(camera?: CallCamera): Promise<MediaStream> {
+  return captureUserMedia({
+    audio: false,
+    video: {
+      ...callCameraConstraints,
+      ...(camera?.facingMode ? { facingMode: { exact: camera.facingMode } }
+        : camera ? { deviceId: { exact: camera.id } } : {}),
+    },
+  });
+}
+
+export function watchCallCameras(onChange: () => void): () => void {
+  const devices = navigator.mediaDevices;
+  devices?.addEventListener?.("devicechange", onChange);
+  return () => devices?.removeEventListener?.("devicechange", onChange);
+}
+
 export async function captureDisplayMedia(constraints?: DisplayMediaStreamOptions): Promise<MediaStream> {
   return register(await navigator.mediaDevices.getDisplayMedia(constraints));
 }

@@ -4,6 +4,7 @@ import { useAuthStore } from "../stores/authStore.js";
 import { isNative } from "../platform/environment.js";
 import { navigate } from "../platform/navigation.js";
 import { clearAccountScopedState } from "../platform/session.js";
+import { assertNotAborted } from "../platform/native-wait.js";
 
 import { resolveApiUrl, API_BASE_URL } from "./api-url.js";
 export { resolveApiUrl } from "./api-url.js";
@@ -198,8 +199,10 @@ class ApiClient {
     const refreshPasswordVerification = path === "/auth/password/verify" && !options.headers?.Authorization;
     if (res.status === 401 && accessToken && (!this.isAuthPath(path) ||
       (refreshPasswordVerification && (await res.clone().json().catch(() => null))?.error === "Invalid token"))) {
+      assertNotAborted(options.signal);
       if (!isSameSession(before, useAuthStore.getState())) throw new ApiError("Session changed", 401);
       await this.refreshToken(accessToken, refreshToken);
+      assertNotAborted(options.signal);
       // Never replay a request from one session under another session's token.
       if (!isSameSession(before, useAuthStore.getState())) throw new ApiError("Session changed", 401);
       res = await send(useAuthStore.getState().accessToken);
@@ -207,8 +210,8 @@ class ApiClient {
     return this.handleResponse<T>(res);
   }
 
-  async get<T>(path: string): Promise<T> {
-    return this.request<T>(path);
+  async get<T>(path: string, signal?: AbortSignal): Promise<T> {
+    return this.request<T>(path, signal ? { signal } : undefined);
   }
 
   async post<T>(path: string, body?: unknown, authorization?: { bearerToken?: string; signal?: AbortSignal }): Promise<T> {

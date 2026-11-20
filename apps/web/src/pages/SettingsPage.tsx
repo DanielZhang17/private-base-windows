@@ -13,6 +13,7 @@ import { AvatarPicker } from "../features/settings/AvatarPicker.js";
 import { RecoveryKeyDialog } from "../features/settings/RecoveryKeyDialog.js";
 import { SETTINGS_SECTIONS, SettingsFrame } from "../features/settings/SettingsFrame.js";
 import { useSettings } from "../features/settings/useSettings.js";
+import { useCaptureToggleHidden } from "../features/settings/hiddenOptions.js";
 import { Avatar, Badge, Button, ConfirmDialog, Dialog, Field, Select, Icon, IconButton, Input, ListItem, Notice, Spinner, TopBar, useToast } from "../ui/index.js";
 
 function ColorField({ label, value, normalized, error, onChange }: { label: string; value: string; normalized: string; error?: string | null; onChange: (value: string) => void }) {
@@ -37,6 +38,7 @@ function ColorField({ label, value, normalized, error, onChange }: { label: stri
 }
 
 function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
+  const captureHidden = useCaptureToggleHidden();
   const vault = useUnlockSettings(s.section === "security");
   const [addPassword, setAddPassword] = useState(false);
   const [guardPasskey, setGuardPasskey] = useState(false);
@@ -177,7 +179,7 @@ function SettingsView({ s }: { s: ReturnType<typeof useSettings> }) {
               <option value="nobody">{t("groupInvitesNobody")}</option>
             </Select>
           </Field>
-          {s.privacy.capture.capability && <section className="space-y-3 border-t border-line pt-6">
+          {s.privacy.capture.capability && !captureHidden && <section className="space-y-3 border-t border-line pt-6">
             {s.privacy.capture.enabled !== undefined && <label className="flex min-h-11 cursor-pointer items-center gap-3 text-sm">
               <input type="checkbox" role="switch" className="toggle" checked={s.privacy.capture.enabled}
                 disabled={s.privacy.capture.busy} aria-describedby="capture-protection-help"

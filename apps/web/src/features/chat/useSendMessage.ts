@@ -16,14 +16,18 @@ import { captureMessageActionSession, isMessageActionSessionCurrent } from "./me
 import { getIdentityKeyPair, getUnlockGeneration, keysLoaded } from "../../lib/key-manager.js";
 import { messageEditScope } from "../../lib/message-edit.js";
 import { isSticker } from "../../lib/stickers.js";
+import { groupTimeoutRemaining } from "./group-timeout.js";
 
 export function useSendMessage(conversation: ConversationWithMembers | undefined) {
   useLocale();
   const { outgoing, retry, discard } = useOutgoingQueue();
   const [sendError, setSendError] = useState<LocalizedMessage | null>(null);
+  const isTimedOut = (userId: string) => conversation?.type === "group"
+    && groupTimeoutRemaining(conversation, conversation.members.find((member) => member.userId === userId)?.timedOutUntil) > 0;
   const enqueue = async (content: string, type: "text" | "file", options: { ttlSeconds: number | null }, file?: File, fileKey?: ReturnType<typeof generateFileKey>) => {
     const { user, device, sessionId } = useAuthStore.getState();
     if (!conversation || !user || !device) return;
+    if (isTimedOut(user.id)) { setSendError(localized("groupTimedOut")); return; }
     const timestamp = Date.now();
     const message: DecryptedMessage = {
       id: crypto.randomUUID(), ownerId: user.id, conversationId: conversation.id, senderId: user.id, content, type, timestamp,
@@ -84,6 +88,7 @@ export function useSendMessage(conversation: ConversationWithMembers | undefined
     const current = () => isMessageActionSessionCurrent(session) && keysLoaded() && getUnlockGeneration() === generation;
     if (!conversation || !session.userId || !session.deviceId
       || !conversation.members.some((member) => member.userId === session.userId && member.acceptedAt != null)) return false;
+    if (isTimedOut(session.userId)) { setSendError(localized("groupTimedOut")); return false; }
     setSendError(null);
     if (isSticker({ type: "text", content })) {
       setSendError(localized("messageEditStickerReplacement"));

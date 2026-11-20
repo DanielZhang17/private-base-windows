@@ -13,8 +13,8 @@ import { getMessageById, saveMessage, saveOutgoing } from "../db/index.js";
 import * as outgoingQueue from "../features/chat/outgoingQueue.js";
 import { click, press } from "../ui/test-utils.js";
 vi.mock("../features/chat/useConversation.js", () => ({ useConversation: vi.fn() }));
-vi.mock("../components/chat/MessageInput.js", () => ({ default: ({ editing, editConflict }: { editing?: { id: string; content: string }; editConflict?: boolean }) =>
-  <div data-testid="message-composer" data-editing={editing?.id} data-content={editing?.content} data-conflict={editConflict} /> }));
+vi.mock("../components/chat/MessageInput.js", () => ({ default: ({ editing, editConflict, disabled }: { editing?: { id: string; content: string }; editConflict?: boolean; disabled?: boolean }) =>
+  <div data-testid="message-composer" data-editing={editing?.id} data-content={editing?.content} data-conflict={editConflict} data-disabled={disabled} /> }));
 let root: Root;
 let container: HTMLDivElement;
 beforeEach(() => {
@@ -41,6 +41,37 @@ const renderFlow = async (state: Record<string, unknown>) => {
   vi.mocked(useConversation).mockReturnValue({ conversationMessages: [], outgoing: [], conversationName: "Mara", user: { id: "alice" }, ...state } as never);
   await act(async () => root.render(<QueryClientProvider client={new QueryClient()}><ToastProvider><ChatPage /></ToastProvider></QueryClientProvider>));
 };
+
+it("shows the admin queue and refreshes after approval and decline", async () => {
+  const prior = useAuthStore.getState();
+  const path = "/api/conversations/chat/join-requests";
+  let pending = [{ id: "approve-id", username: "mara", displayName: "Mara" }, { id: "decline-id", username: "lee", displayName: "Lee" }];
+  const get = vi.spyOn(api, "get").mockImplementation(async url => (url === path ? [...pending] : []) as never);
+  const post = vi.spyOn(api, "post").mockImplementation(async url => {
+    pending = pending.filter(request => !url.includes(request.id));
+    return { success: true } as never;
+  });
+  try {
+    useAuthStore.setState({ user: { id: "alice" } as never });
+    const conversation = { id: "chat", type: "group", joinByName: true,
+      members: [{ userId: "alice", role: "admin", acceptedAt: 1, user: { displayName: "Alice", username: "alice" } }] };
+    await renderFlow({ conversationId: "chat", conversation, showGroupSettings: true, isGroupAdmin: false });
+    expect(queryByRole(document.body, "region", { name: "Join requests" })).toBeNull();
+    expect(get).not.toHaveBeenCalledWith(path);
+    await renderFlow({ conversationId: "chat", conversation, showGroupSettings: true, isGroupAdmin: true });
+    const region = getByRole(document.body, "region", { name: "Join requests" });
+    await act(async () => { await waitFor(() => expect(region.textContent).toContain("@mara")); });
+    await act(async () => getByRole<HTMLButtonElement>(region, "button", { name: "Approve Mara" }).click());
+    await act(async () => { await waitFor(() => expect(region.textContent).not.toContain("@mara")); });
+    await act(async () => getByRole<HTMLButtonElement>(region, "button", { name: "Decline Lee" }).click());
+    await act(async () => { await waitFor(() => expect(region.textContent).toContain("No pending join requests.")); });
+    expect(post.mock.calls).toEqual([[`${path}/approve-id/approve`], [`${path}/decline-id/decline`]]);
+  } finally {
+    get.mockRestore();
+    post.mockRestore();
+    await act(async () => useAuthStore.setState(prior));
+  }
+});
 it.each([false, true])("shows local history guidance in an older empty conversation, with transfer gated (%s)", async historyTransfer => {
   const previous = capabilities.historyTransfer;
   capabilities.historyTransfer = historyTransfer;
@@ -228,12 +259,88 @@ it("shows the default unverified contact state in details and links to Verify", 
   await act(async () => verify.click()); expect(navigate).toHaveBeenCalledWith("/verify/mara");
 });
 it("requires acknowledgement before permanently deleting a group", async () => {
-  await renderFlow({ conversation: { id: "group", type: "group", name: "Field team", members: [] }, conversationName: "Field team", isGroupAdmin: true, showDeleteConfirm: true, setShowDeleteConfirm: vi.fn() });
+  const state = { conversationId: "group", conversation: { id: "group", type: "group", name: "Field team", members: [] },
+    conversationName: "Field team", isGroupAdmin: true, setShowGroupSettings: vi.fn() };
+  await renderFlow(state);
+  await click(getByRole(container, "button", { name: "Conversation details" }));
+  await click(getByRole(document.body, "button", { name: "Delete group" }));
+  await renderFlow({ ...state, isGroupAdmin: false });
   const dialog = document.body.querySelector('[role="alertdialog"]')!;
   const confirm = [...dialog.querySelectorAll("button")].find((button) => button.textContent === "Delete group")!;
   expect(confirm.disabled).toBe(true);
   await act(async () => dialog.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
   expect(confirm.disabled).toBe(false);
+});
+
+it("confirms only self-removal when Leave was opened before group metadata arrived", async () => {
+  const remove = vi.spyOn(api, "delete").mockResolvedValue({ success: true });
+  const list = vi.spyOn(api, "get").mockResolvedValue([]);
+  const state = { conversationId: "group", conversationName: "Field team", setShowGroupSettings: vi.fn(), navigate: vi.fn() };
+  try {
+    await renderFlow({ ...state, conversationLoading: true });
+    await click(getByRole(container, "button", { name: "Conversation details" }));
+    await click(getByRole(document.body, "button", { name: "Leave conversation" }));
+    await renderFlow({ ...state, isGroupAdmin: true, conversation: { id: "group", type: "group", members: [] } });
+    const confirm = getByRole(document.body, "alertdialog");
+    await click(getByRole(confirm, "button", { name: "Leave conversation" }));
+    await waitFor(() => expect(state.navigate).toHaveBeenCalledWith("/"));
+    expect(remove).toHaveBeenCalledExactlyOnceWith("/api/conversations/group/membership");
+  } finally { list.mockRestore(); remove.mockRestore(); }
+});
+
+it("offers role, timeout and removal controls only to eligible group admins", async () => {
+  const update = vi.spyOn(api, "patch").mockResolvedValue({ success: true });
+  const alice = { userId: "alice", role: "admin", acceptedAt: 1, user: { username: "alice", displayName: "Alice" } };
+  const bob = { userId: "bob", role: "member", acceptedAt: 1, user: { username: "bob", displayName: "Bob" } };
+  const carol = { userId: "carol", role: "admin", acceptedAt: null, user: { username: "carol", displayName: "Carol" } };
+  const conversation = { id: "group", type: "group", members: [alice, bob, carol] };
+  const state = { conversationId: "group", conversation, isGroupAdmin: true, setShowGroupSettings: vi.fn() };
+  try {
+    await renderFlow(state);
+    await click(getByRole(container, "button", { name: "Conversation details" }));
+    const details = getByRole(document.body, "dialog", { name: "Conversation details" });
+    await click(getByRole(details, "button", { name: "Actions for Alice" }));
+    expect(getByRole<HTMLButtonElement>(details, "button", { name: "Remove admin role" }).disabled).toBe(true);
+    expect(queryByRole(details, "button", { name: "Time out for 10 minutes" })).toBeNull();
+    await click(getByRole(details, "button", { name: "Actions for Carol" }));
+    expect(queryByRole(details, "button", { name: "Make admin" })).toBeNull();
+    expect(getByRole(details, "button", { name: "Remove Carol" })).toBeTruthy();
+    await click(getByRole(details, "button", { name: "Actions for Bob" }));
+    expect(getByRole(details, "button", { name: "Make admin" })).toBeTruthy();
+    expect(getByRole(details, "button", { name: "Time out for 1 hour" })).toBeTruthy();
+    await click(getByRole(details, "button", { name: "Time out for 10 minutes" }));
+    expect(update).toHaveBeenCalledWith("/api/conversations/group/members/bob", { timeoutSeconds: 600 });
+    await renderFlow({ ...state, conversation: { ...conversation, serverTime: Date.now(), groupClockObservedAt: performance.now(),
+      members: [alice, { ...bob, timedOutUntil: Date.now() + 600_000 }, carol] } });
+    expect(getByRole(details, "button", { name: "Clear timeout" })).toBeTruthy();
+    await renderFlow({ ...state, isGroupAdmin: false });
+    expect(queryByRole(details, "button", { name: "Actions for Bob" })).toBeNull();
+  } finally { update.mockRestore(); }
+});
+
+it("counts down against the server despite wall-clock skew and re-enables the composer at expiry", async () => {
+  vi.useFakeTimers();
+  try {
+    const serverTime = Date.now() + 3_600_000;
+    await renderFlow({
+      conversationId: "group",
+      conversation: { id: "group", type: "group", serverTime, groupClockObservedAt: performance.now(),
+        members: [{ userId: "alice", role: "member", acceptedAt: 1,
+          timedOutUntil: serverTime + 2_000, user: { username: "alice", displayName: "Alice" } }] },
+      conversationMessages: [{ id: "old", conversationId: "group", type: "text", content: "Still readable",
+        senderId: "bob", timestamp: Date.now() - 1_000, status: "sent" }],
+    });
+    const composer = container.querySelector('[data-testid="message-composer"]')!;
+    expect(composer.getAttribute("data-disabled")).toBe("true");
+    expect(getByRole(container, "timer").textContent).toContain("0:02");
+    expect(getByRole(container, "log").textContent).toContain("Still readable");
+    vi.setSystemTime(Date.now() - 3_600_000);
+    await act(async () => { vi.advanceTimersByTime(1000); });
+    expect(getByRole(container, "timer").textContent).toContain("0:01");
+    await act(async () => { vi.advanceTimersByTime(1000); });
+    expect(queryByRole(container, "timer")).toBeNull();
+    expect(composer.getAttribute("data-disabled")).toBe("false");
+  } finally { vi.useRealTimers(); }
 });
 
 const selectionRows = [
@@ -485,5 +592,50 @@ it("copies from the header and requires confirmation before deleting for everyon
     post.mockRestore();
     if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard);
     else Reflect.deleteProperty(navigator, "clipboard");
+  }
+});
+
+it.each([
+  ["direct", "member", 1, true], ["group", "admin", 1, true],
+  ["group", "member", 1, false], ["group", "admin", null, false],
+])("offers clear-for-everyone only to eligible %s %s participants (acceptance %s)", async (type, role, acceptedAt, allowed) => {
+  const base = selectionFlow();
+  await renderFlow({ ...base, isGroupAdmin: type === "group" && role === "admin",
+    conversation: { ...base.conversation, type, members: [
+      { userId: "alice", role, acceptedAt, user: { displayName: "Alice" } },
+    ] },
+  });
+  await click(getByRole(container, "button", { name: "Conversation details" }));
+  expect(getByRole(document.body, "button", { name: "Clear history for me" })).toBeTruthy();
+  expect(!!queryByRole(document.body, "button", { name: "Clear history for everyone" })).toBe(allowed);
+});
+
+it("confirms the scope of a clear and exits selection with an optimistic transcript", async () => {
+  const prior = useAuthStore.getState();
+  let finish!: (result: { nextCursor: null; deletions: [] }) => void;
+  const post = vi.spyOn(api, "post").mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+  try {
+    useAuthStore.setState({ user: { id: "alice" } as never, device: { id: "device" } as never, sessionId: "ui-clear" });
+    await renderFlow({ ...selectionFlow(), setShowGroupSettings: vi.fn() });
+    await selectFromMenu("A later message");
+    await click(getByRole(container, "button", { name: "Conversation details" }));
+    await click(getByRole(document.body, "button", { name: "Clear history for me" }));
+    const local = getByRole(document.body, "alertdialog", { name: "Clear history for me" });
+    expect(local.textContent).toContain("saved on this device");
+    await click(getByRole(local, "button", { name: "Cancel" }));
+    await click(getByRole(container, "button", { name: "Conversation details" }));
+    await click(getByRole(document.body, "button", { name: "Clear history for everyone" }));
+    const all = getByRole(document.body, "alertdialog", { name: "Clear history for everyone" });
+    expect(all.textContent).toContain("The chat and its members stay in place.");
+    expect(post).not.toHaveBeenCalled();
+    await click(getByRole(all, "button", { name: "Clear history for everyone" }));
+    await waitFor(() => expect(post).toHaveBeenCalledWith("/api/conversations/chat/clear-messages", {}));
+    expect(queryByRole(container, "checkbox")).toBeNull();
+    expect(getByRole(container, "log").textContent).not.toContain("An earlier message");
+    await act(async () => { finish({ nextCursor: null, deletions: [] }); });
+    await waitFor(() => expect(queryByRole(document.body, "alertdialog")).toBeNull());
+  } finally {
+    post.mockRestore();
+    useAuthStore.setState(prior);
   }
 });

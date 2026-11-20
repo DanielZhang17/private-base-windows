@@ -3,10 +3,17 @@ import en from "../../i18n/locales/en.json";
 import { LocalizedError, renderMessage, type LocalizedMessage } from "../../i18n/messages.js";
 
 const codes: Record<string, TranslationKey> = {
+  GROUP_LAST_ADMIN: "groupLastAdmin",
+  GROUP_MEMBER_PENDING: "groupMemberPending",
+  GROUP_TIMEOUT_TARGET: "groupTimeoutTarget",
+  GROUP_TIMED_OUT: "groupTimedOut",
   FILE_EXPIRED: "fileExpired",
   E2EE_CALL_UNSUPPORTED: "endToEndEncryptedCallsAreUnavailableOn",
   SAVE_UNSUPPORTED: "savingFilesIsUnavailableOnThisDeviceImages",
   PASSKEY_UNSUPPORTED: "errorPasskeysAreUnavailableInThisAppUseASupported",
+  GROUP_NAME_TAKEN: "groupNameTaken",
+  GROUP_JOIN_UNAVAILABLE: "groupJoinUnavailable",
+  GROUP_ADMISSION_UPGRADE_REQUIRED: "groupJoinUpgradeRequired",
 };
 
 // Only exact English diagnostics emitted by the server/lib belong here.

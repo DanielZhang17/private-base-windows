@@ -1,4 +1,5 @@
 import { encryptMessageEdit, generateAESKey, generateIdentityKeyPair, serializeIdentityKeyPair, toBase64Url } from "@e2ee-chat/crypto";
+import { WSFrameType, type WSMessageFrame } from "@e2ee-chat/shared";
 import { openDB, type IDBPDatabase } from "idb";
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, expect, it, vi } from "vitest";
@@ -37,7 +38,7 @@ it("waits for v5 writers, quarantines ambiguous rows, and fences even an unversi
   old.close();
   const next = await opening;
   try {
-    expect(next.version).toBe(8);
+    expect(next.version).toBe(9);
     expect(db.isDatabaseUpgradeBlocked()).toBe(false);
     expect(await db.getMessageById("unverified", "user")).toBeUndefined();
     expect(await next.get("legacyMessages", "unverified")).toMatchObject({ content: "cached" });
@@ -154,7 +155,7 @@ it("adds key-only revision checks to v7 without rewriting queued uploads", async
   old.close();
   const db = await opening;
   try {
-    expect(db.version).toBe(8);
+    expect(db.version).toBe(9);
     expect(await db.getKeyFromIndex("accountState", "byOutgoingRevision", [id, "queued-revision"])).toBe(id);
     const persisted = await db.get("accountState", id);
     expect(persisted.outgoing.revision).toBe(entry.outgoing.revision);
@@ -167,6 +168,41 @@ it("adds key-only revision checks to v7 without rewriting queued uploads", async
     expect(await db.get("accountState", id)).toBeUndefined();
     expect(await db.get("accountState", standalone)).toBeUndefined();
     expect(await db.get("accountState", ambiguous)).toBeDefined();
+  } finally { db.close(); }
+});
+
+it("indexes queued v8 ciphertext by account, device, chain and sequence without changing the envelope", async () => {
+  vi.stubGlobal("indexedDB", new IDBFactory());
+  vi.resetModules();
+  const old = await openDB("e2ee-chat", 8, { upgrade(db, _, __, tx) {
+    createCanonicalStores(db);
+    tx.objectStore("legacyMessages").createIndex("byExpiry", "quarantineExpiresAt");
+    tx.objectStore("accountState").createIndex("byOutgoingRevision", ["id", "outgoing.revision"]);
+  } });
+  const predecessor: WSMessageFrame = { id: "earlier", type: WSFrameType.Message, conversationId: "chat",
+    senderId: "peer", senderDeviceId: "peer-device", msgType: "text", ciphertext: "opaque", iv: "iv",
+    header: JSON.stringify({ n: 5, dhPublicKey: "old" }), timestamp: Date.now(), expiresAt: Date.now() + 60_000, expiryKind: "retention" };
+  const seed = (frame: WSMessageFrame, userId = "user", deviceId = "device") => old.put("accountState", {
+    id: "pending-receive:" + JSON.stringify([userId, deviceId, frame.id]), userId, deviceId, frame,
+  });
+  await seed(predecessor);
+  await seed({ ...predecessor, id: "other-account" }, "other");
+  await seed({ ...predecessor, id: "other-device" }, "user", "other");
+  await seed({ ...predecessor, id: "other-peer", senderDeviceId: "other" });
+  await seed({ ...predecessor, id: "other-chain", header: JSON.stringify({ n: 5, dhPublicKey: "new" }) });
+  await seed({ ...predecessor, id: "expired", expiresAt: 0 });
+  await seed({ ...predecessor, id: "out-of-range", header: JSON.stringify({ n: 6, dhPublicKey: "old" }) });
+  old.close();
+  const database = await import("../../db/index.js");
+  const db = await database.getAppDB();
+  try {
+    const successor = { ...predecessor, id: "successor" };
+    const gaps = [{ chain: "old", from: 5, until: 6 }];
+    expect(await database.getQueuedPredecessorIds(successor, "user", "device", gaps)).toEqual([predecessor.id]);
+    expect(await database.getPendingReceives("user", "device")).toContainEqual(predecessor);
+    const queued = await database.getPendingReceiveEntries("user", "device");
+    await database.retireUnavailableReceives(queued.filter(({ frame }) => frame.id === predecessor.id), "user", "device");
+    expect(await database.getQueuedPredecessorIds(successor, "user", "device", gaps)).toEqual([]);
   } finally { db.close(); }
 });
 
@@ -208,14 +244,14 @@ it("preserves a sparse v6 preview's sync cursor and quarantines its unscoped que
   } finally { db.close(); }
 });
 
-it.each([6, 7, 8, 9])("fails closed on an unknown v%s layout without replacing it", async (version) => {
+it.each([6, 7, 8, 9, 10])("fails closed on an unknown v%s layout without replacing it", async (version) => {
   vi.stubGlobal("indexedDB", new IDBFactory());
   vi.resetModules();
   const newer = await openDB("e2ee-chat", version, { upgrade(db) { db.createObjectStore("unrelated"); } });
   newer.close();
   try {
     const db = await import("../../db/index.js");
-    if (version > 8) await expect(db.getAppDB()).rejects.toMatchObject({ name: "VersionError" });
+    if (version > 9) await expect(db.getAppDB()).rejects.toMatchObject({ name: "VersionError" });
     else await expect(db.getAppDB()).rejects.toThrow("Unsupported pre-release local database layout");
     const original = await openDB("e2ee-chat");
     expect(original.version).toBe(version);
@@ -224,7 +260,7 @@ it.each([6, 7, 8, 9])("fails closed on an unknown v%s layout without replacing i
   } finally { newer.close(); }
 });
 
-it("upgrades main's v5 device vault, wrapped edit keys and deferred edits into v8", async () => {
+it("upgrades main's v5 device vault, wrapped edit keys and deferred edits into v9", async () => {
   vi.stubGlobal("indexedDB", new IDBFactory());
   vi.resetModules();
   const { encryptData } = await import("../../lib/local-key-encryption.js");
@@ -304,7 +340,7 @@ it("upgrades main's v5 device vault, wrapped edit keys and deferred edits into v
 
   const next = await database.getAppDB();
   try {
-    expect(next.version).toBe(8);
+    expect(next.version).toBe(9);
     expect(await next.getAll("deviceKeys")).toEqual(vaultRecords.sort((a, b) => a.id < b.id ? -1 : 1));
     expect(await database.readPendingSetupRecord()).toEqual(setup);
     expect(await next.get("accountState", unlockAttempts.id)).toEqual(unlockAttempts);

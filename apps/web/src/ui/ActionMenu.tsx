@@ -6,20 +6,26 @@ import { useOverlayLayer } from "./useOverlayLayer.js";
 import { Icon } from "./Icon.js";
 import type { IconName } from "./icons/paths.js";
 
-export interface ActionMenuItem { id: string; label: string; onSelect: () => void; icon?: IconName; hint?: string; separatorBefore?: boolean; danger?: boolean; disabled?: boolean; keepOpen?: boolean }
+export interface ActionMenuItem { id: string; label: string; onSelect: () => void; icon?: IconName; hint?: string; separatorBefore?: boolean; danger?: boolean; disabled?: boolean; keepOpen?: boolean;
+  /** Makes the item a radio option (menuitemradio) in a single-choice group; true marks the current choice. */
+  checked?: boolean }
 export interface ActionMenuPosition { x: number; y: number; top?: number; source?: "button" | "pointer"; align?: "start" | "end"; keyboard?: boolean }
 
 /** Pointer popover on wide screens; the shared modal Sheet on phones. */
-export function ActionMenu({ open, position, title, items, onClose, children, preview, previewPlacement = "sheet" }: {
+export function ActionMenu({ open, position, title, items, onClose, children, preview, previewPlacement = "sheet", elevated = false, surface }: {
   open: boolean; position: ActionMenuPosition; title: string;
   items: ActionMenuItem[]; onClose: () => void; children?: ReactNode; preview?: ReactNode; previewPlacement?: "sheet" | "always";
+  /** Opened from a full-window surface (the call screen, z-50): render above it. */
+  elevated?: boolean;
+  /** "dark" keeps the menu in the dark call tokens. */
+  surface?: "dark";
 }) {
   const [phone, setPhone] = useState(() => window.matchMedia?.("(max-width: 639px)").matches ?? false);
   const panel = useRef<HTMLDivElement>(null), menu = useRef<HTMLDivElement>(null), first = useRef<HTMLButtonElement>(null);
   const hintId = useId();
   const search = useRef({ value: "", at: 0 });
   const closeRef = useRef(onClose); closeRef.current = onClose;
-  const isTop = useOverlayLayer(open && !phone, "popover", OVERLAY_RANK.actionMenu);
+  const isTop = useOverlayLayer(open && !phone, "popover", elevated ? OVERLAY_RANK.dialog + 5 : OVERLAY_RANK.actionMenu);
   useEffect(() => {
     const query = window.matchMedia?.("(max-width: 639px)");
     if (!query) return;
@@ -81,18 +87,19 @@ export function ActionMenu({ open, position, title, items, onClose, children, pr
     {children}
     {items.map((item) => <Fragment key={item.id}>
       {item.separatorBefore && <div role="separator" className="my-1 border-t border-line" />}
-      <button ref={item.id === firstId ? first : undefined} role="menuitem" type="button" disabled={item.disabled} data-label={item.label} aria-label={item.label} aria-describedby={item.hint ? `${hintId}-${item.id}` : undefined}
+      <button ref={item.id === firstId ? first : undefined} role={item.checked === undefined ? "menuitem" : "menuitemradio"} aria-checked={item.checked} type="button" disabled={item.disabled} data-label={item.label} aria-label={item.label} aria-describedby={item.hint ? `${hintId}-${item.id}` : undefined}
         className={`flex w-full items-center gap-3 rounded-control px-3 py-1 text-start focus-visible:outline-2 focus-visible:outline-brand hover:bg-sunken disabled:opacity-50 ${phone ? "min-h-[52px]" : "min-h-9 pointer-coarse:min-h-11"} ${item.danger ? "text-danger" : "text-ink"}`}
         onClick={() => {
           if (item.keepOpen) menu.current?.focus();
           else onClose();
           item.onSelect();
         }}>
-        {item.icon && <Icon name={item.icon} size={phone ? 20 : 18} className="shrink-0" />}
+        {item.checked !== undefined ? <Icon name="check" size={phone ? 20 : 18} className={`shrink-0 ${item.checked ? "" : "invisible"}`} />
+          : item.icon && <Icon name={item.icon} size={phone ? 20 : 18} className="shrink-0" />}
         <span className="flex min-w-0 flex-1 flex-col"><span>{item.label}</span>{item.hint && <span id={`${hintId}-${item.id}`} className="text-xs text-ink-muted">{item.hint}</span>}</span>
       </button>
     </Fragment>)}
   </div>;
-  if (phone) return <Sheet open dismissOnBack onClose={onClose} title={preview ?? title} ariaLabel={title} closeButtonSize="md" initialFocusRef={position.keyboard ? first : menu} className="message-action-sheet">{content}</Sheet>;
-  return <Portal><div ref={panel} className="message-action-popover fixed z-[45] max-h-[calc(100dvh-1rem)] min-w-52 max-w-[calc(100vw-1rem)] overflow-y-auto rounded-card border border-line bg-raised p-1 text-ink shadow-overlay" style={{ left: position.x, top: position.y }}>{previewPlacement === "always" && preview && <>{preview}<div role="separator" className="my-1 border-t border-line" /></>}{content}</div></Portal>;
+  if (phone) return <Sheet open dismissOnBack onClose={onClose} title={preview ?? title} ariaLabel={title} closeButtonSize="md" initialFocusRef={position.keyboard ? first : menu} className="message-action-sheet" surface={surface}>{content}</Sheet>;
+  return <Portal><div ref={panel} data-theme={surface} className={`message-action-popover fixed ${elevated ? "z-[55]" : "z-[45]"} ${surface === "dark" ? "ui-dark-surface" : ""} max-h-[calc(100dvh-1rem)] min-w-52 max-w-[calc(100vw-1rem)] overflow-y-auto rounded-card border border-line bg-raised p-1 text-ink shadow-overlay`} style={{ left: position.x, top: position.y }}>{previewPlacement === "always" && preview && <>{preview}<div role="separator" className="my-1 border-t border-line" /></>}{content}</div></Portal>;
 }

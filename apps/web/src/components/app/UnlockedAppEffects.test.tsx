@@ -19,7 +19,7 @@ vi.mock("../../stores/authStore.js", async () => {
   return { useAuthStore: create(() => ({ user: null, device: null, accessToken: null })) };
 });
 vi.mock("../../services/notifications.js", () => ({ createNotificationWebSocket: vi.fn() }));
-vi.mock("../../services/api.js", () => ({ api: { get: vi.fn() } }));
+vi.mock("../../services/api.js", () => ({ api: { get: vi.fn(), post: vi.fn(async () => undefined) } }));
 vi.mock("../../db/index.js", () => ({ commitAbandonedMessageHides: vi.fn(), getAppDB: vi.fn(async () => ({})), cleanupExpiredFileCache: vi.fn(), cleanupExpiredPendingCalls: vi.fn(), deletePendingCall: vi.fn(), getPendingCall: vi.fn() }));
 vi.mock("../../lib/message-sync.js", () => ({ startLocalHiddenMessageSync: vi.fn(() => vi.fn()), handleMessageDeletion: vi.fn(), pruneExpiredPlaintext: vi.fn(), reconcileConversationEdits: vi.fn(), resetMessageSyncState: vi.fn(), syncMessages: vi.fn(), runUnlockSync: vi.fn() }));
 vi.mock("../../lib/conversation-cache.js", () => ({ refreshConversationList: vi.fn() }));
@@ -60,6 +60,37 @@ afterEach(async () => {
 const incoming: CallEventPayload = { event: "incoming", callId: "call-1", conversationId: "chat-1", callType: "audio", status: "ringing", fromUserId: "alice", initiatorId: "alice" };
 const conversation = { id: "chat-1", members: [{ userId: "alice", user: { displayName: "Alice" } }] };
 const emit = (payload: CallEventPayload) => vi.mocked(createNotificationWebSocket).mock.calls.at(-1)![0].onCallEvent(payload);
+const openNotifications = () => vi.mocked(createNotificationWebSocket).mock.calls.at(-1)![0].onOpen?.();
+
+it("retries admission readiness on the open socket with backoff and deduplicates reconnects", async () => {
+  vi.mocked(api.get).mockResolvedValue(null);
+  vi.mocked(api.post)
+    .mockRejectedValueOnce({ status: 429, body: { retryAfterSeconds: 3 } })
+    .mockRejectedValueOnce({ status: 503 })
+    .mockResolvedValue(undefined);
+  await act(async () => root.render(<UnlockedAppEffects />));
+  await act(async () => { openNotifications(); openNotifications(); });
+  expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/conversations/group-admissions-ready", undefined, { signal: expect.any(AbortSignal) });
+  await act(async () => { openNotifications(); await vi.advanceTimersByTimeAsync(2_999); });
+  expect(api.post).toHaveBeenCalledTimes(1);
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  expect(api.post).toHaveBeenCalledTimes(2);
+  await act(async () => vi.advanceTimersByTimeAsync(2_000));
+  expect(api.post).toHaveBeenCalledTimes(3);
+  await act(async () => { openNotifications(); await vi.advanceTimersByTimeAsync(30_000); });
+  expect(api.post).toHaveBeenCalledTimes(3);
+});
+
+it("stops admission readiness retries when the current session changes", async () => {
+  vi.mocked(api.get).mockResolvedValue(null);
+  vi.mocked(api.post).mockRejectedValueOnce(new TypeError("offline"));
+  await act(async () => root.render(<UnlockedAppEffects />));
+  await act(async () => { openNotifications(); });
+  await act(async () => useAuthStore.setState({ device: { id: "replacement" } as Device }));
+  await act(async () => vi.advanceTimersByTimeAsync(30_000));
+  expect(api.post).toHaveBeenCalledTimes(1);
+});
+
 it("reconciles cached edits when a conversation membership notification arrives", async () => {
   await act(async () => root.render(<UnlockedAppEffects />));
   await act(async () => vi.mocked(createNotificationWebSocket).mock.calls.at(-1)![0].onConversationEvent({ conversationId: "rejoined" }));

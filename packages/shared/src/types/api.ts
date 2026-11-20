@@ -131,6 +131,7 @@ export interface RecoverDeviceLinkResponse {
 
 // Messages
 export interface SendMessageRequest {
+  groupEpoch?: number;
   id: string;
   conversationId: string;
   type: MessageType;
@@ -139,9 +140,11 @@ export interface SendMessageRequest {
   header: string;
   ttlSeconds?: number | null;
   fileId?: string | null;
+  groupAdmissionVersion?: number;
 }
 
 export interface SendDirectBatchRequest {
+  groupEpoch?: number;
   conversationId: string;
   type: MessageType;
   ttlSeconds?: number | null;
@@ -152,6 +155,7 @@ export interface SendDirectBatchRequest {
     iv: string;
     header: string;
   }>;
+  groupAdmissionVersion?: number;
 }
 
 export interface SendMessageResponse {

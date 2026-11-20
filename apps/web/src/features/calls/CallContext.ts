@@ -1,5 +1,6 @@
 import { createContext, useContext } from "react";
 import type { useCallSession } from "./useCall.js";
+export type { CallDiagnostics, CallMediaStats } from "../../services/call-stats.js";
 
 export const CallContext = createContext<ReturnType<typeof useCallSession> | null>(null);
 

@@ -20,6 +20,7 @@ import { messageVisibleToAccount } from "../../lib/message-account.js";
 import { hydrateImportedConversationPreviews } from "../../lib/message-sync.js";
 import { usePresenceStore } from "../../stores/presenceStore.js";
 import { linkedDeviceTime, predatesDeviceLink } from "./presentation.js";
+import { useHistoryGuidanceDismissal } from "./historyGuidance.js";
 
 function relativeTime(timestamp: number): string {
   return Date.now() - timestamp < 604_800_000 ? formatRelativeTimestamp(timestamp) : formatDate(timestamp, { month: "short", day: "numeric" });
@@ -49,16 +50,21 @@ export function useChatList() {
   const sessionId = useAuthStore((s) => s.sessionId);
   const deviceId = useAuthStore((s) => s.device?.id);
   const linkedAt = useAuthStore(({ device }) => linkedDeviceTime(device));
+  const historyGuidance = useHistoryGuidanceDismissal(deviceId);
   const previewScope = JSON.stringify([user?.id, sessionId, deviceId]);
   const previewedChats = useRef<{ scope: string; ids: Set<string> } | undefined>(undefined);
   const onlineUsers = usePresenceStore((s) => s.onlineUsers);
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const unreadCounts = useChatStore((s) => s.unreadCounts);
   const allMessages = useChatStore((s) => s.messages);
+  const clearingHistory = useChatStore((s) => s.clearingHistory);
   const [showNewChat, setShowNewChat] = useState(false);
   const [showNewGroup, setShowNewGroup] = useState(false);
+  const [showJoinGroup, setShowJoinGroup] = useState(false);
   const [newChatUsername, setNewChatUsername] = useState("");
   const [groupName, setGroupName] = useState("");
+  const [joinGroupName, setJoinGroupName] = useState("");
+  const [joinSubmitted, setJoinSubmitted] = useState(false);
   const [groupMembers, setGroupMembers] = useState<PickerUser[]>([]);
   const [newChatError, setNewChatError] = useState<LocalizedMessage | null>(null);
   const [creatingChat, setCreatingChat] = useState(false);
@@ -149,6 +155,8 @@ export function useChatList() {
   };
 
   const startNewGroup = async () => {
+    const name = groupName.trim();
+    if (!name || name.length > 128) return;
     if (groupMembers.length === 0) {
       setNewChatError(localized("addAtLeastOneMember"));
       return;
@@ -164,10 +172,10 @@ export function useChatList() {
       const created = await api.post<{ id: string }>("/api/conversations", {
         type: "group",
         memberUserIds: memberIds,
-        name: groupName.trim() || undefined,
+        name,
       });
 
-      await refreshConversationList();
+      void refreshConversationList().catch(() => undefined);
       setShowNewGroup(false);
       setGroupName("");
       setGroupMembers([]);
@@ -178,6 +186,30 @@ export function useChatList() {
       creating.current = false;
       setCreatingChat(false);
     }
+  };
+
+  const requestGroupJoin = async () => {
+    const name = joinGroupName.trim();
+    if (!name || name.length > 128 || creating.current || joinSubmitted) return;
+    creating.current = true;
+    setCreatingChat(true);
+    setNewChatError(null);
+    try {
+      await api.post("/api/conversations/join-by-name", { name });
+      setJoinSubmitted(true);
+    } catch (error) {
+      setNewChatError(toErrorMessage(error, "groupJoinRequestFailed"));
+    } finally {
+      creating.current = false;
+      setCreatingChat(false);
+    }
+  };
+
+  const closeJoinGroup = () => {
+    setShowJoinGroup(false);
+    setJoinGroupName("");
+    setJoinSubmitted(false);
+    setNewChatError(null);
   };
 
   const respondToRequest = async (id: string, action: "accept" | "decline") => {
@@ -193,8 +225,8 @@ export function useChatList() {
   const pendingConversations = conversations?.filter((conv) => conv.members.find((m) => m.userId === user?.id)?.acceptedAt === null) ?? [];
   const acceptedConversations = conversations?.filter((conv) => conv.members.find((m) => m.userId === user?.id)?.acceptedAt !== null) ?? [];
   const getLastVisibleMessage = (conversationId: string) => allMessages.get(conversationId)
-    ?.filter((message) => messageVisibleToAccount(message, user?.id ?? null)).at(-1);
-  const showHistoryGuidance = linkedAt !== undefined && acceptedConversations.some((conversation) =>
+    ?.filter((message) => messageVisibleToAccount(message, user?.id ?? null) && !clearingHistory.get(conversationId)?.has(message.id)).at(-1);
+  const showHistoryGuidance = linkedAt !== undefined && !historyGuidance.dismissed && acceptedConversations.some((conversation) =>
     !getLastVisibleMessage(conversation.id) &&
     predatesDeviceLink(conversation, linkedAt, conversation.members.find(member => member.userId === user?.id)?.joinedAt));
 
@@ -211,6 +243,7 @@ export function useChatList() {
     unreadCounts,
     getLastVisibleMessage,
     showHistoryGuidance,
+    dismissHistoryGuidance: historyGuidance.dismiss,
     showNewChat,
     setShowNewChat,
     showNewGroup,
@@ -222,6 +255,7 @@ export function useChatList() {
     groupMembers,
     setGroupMembers,
     newChatError: newChatError ? renderMessage(newChatError) : newChatError,
+    groupNameTaken: newChatError?.key === "groupNameTaken",
     setNewChatError,
     creatingChat,
     conversations,
@@ -230,6 +264,13 @@ export function useChatList() {
     getConversationName,
     startNewChat,
     startNewGroup,
+    showJoinGroup,
+    setShowJoinGroup,
+    closeJoinGroup,
+    joinGroupName,
+    setJoinGroupName,
+    joinSubmitted,
+    requestGroupJoin,
     relativeTime,
     getLastMessagePreview
   };

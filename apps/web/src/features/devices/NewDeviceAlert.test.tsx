@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { beforeEach, expect, it, vi } from "vitest";
 import type { DeviceAlert } from "@e2ee-chat/shared";
 import { NewDeviceAlerts } from "./NewDeviceAlert.js";
+import { useUnlockOfferHeld } from "../auth/unlockOfferGate.js";
 import { publishDeviceAlertsChanged } from "../../services/device-alerts.js";
 import { api } from "../../services/api.js";
 import { isOnlyLocalPasskeyUnlock, signWithIdentityKey } from "../../lib/key-manager.js";
@@ -64,6 +65,25 @@ it("surfaces an arriving browser alert in the app banner and rolls back a failed
     "privatebase-device-action-v1", "ack_device_alert", JSON.stringify(["current", "first"]), "challenge",
   ]));
   expect(api.post).toHaveBeenNthCalledWith(2, "/api/devices/alerts/first/ack", { challengeId: "challenge", signature: "device-signature" });
+});
+
+it("holds the unlock offer while a security alert is on screen", async () => {
+  let held: boolean | undefined;
+  function Probe() { held = useUnlockOfferHeld(); return null; }
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  await render(<QueryClientProvider client={client}><MemoryRouter><ToastProvider>
+    <NewDeviceAlerts /><Probe />
+  </ToastProvider></MemoryRouter></QueryClientProvider>);
+  await flushQuery();
+  expect(held).toBe(false);
+  alerts = [alert];
+  await act(async () => publishDeviceAlertsChanged("current"));
+  await flushQuery();
+  expect(held).toBe(true);
+  alerts = [];
+  await act(async () => publishDeviceAlertsChanged("current"));
+  await flushQuery();
+  expect(held).toBe(false);
 });
 
 it("uses the amber warning surface and the same device name in the compact alert", async () => {

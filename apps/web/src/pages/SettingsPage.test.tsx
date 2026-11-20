@@ -191,7 +191,8 @@ it("can turn Touch ID off without Web Locks and suppresses the new enrollment of
   } finally { sessionStorage.removeItem("unlock-offer:this-device"); }
 });
 
-it.each(["Security switch", "unlock offer"] as const)("explains unsupported Windows Hello enrollment from the %s", async entry => {
+// The unlock offer itself only opens on the chat list; its unsupported path is covered in UnlockOffer.test.tsx.
+it("explains unsupported Windows Hello enrollment from the Security switch", async () => {
   vi.stubGlobal("__TAURI_INTERNALS__", {});
   vi.stubGlobal("__PRIVATEBASE_NATIVE_CAPABILITIES__", { biometricUnlock: "windows-hello" });
   vi.stubGlobal("navigator", { userAgent: "Windows", locks: { request: vi.fn() } });
@@ -202,8 +203,8 @@ it.each(["Security switch", "unlock offer"] as const)("explains unsupported Wind
   try {
     await show("security");
     const toggle = getByRole<HTMLInputElement>(document.body, "switch", { name: "Windows Hello" });
-    const offer = getByRole(document.body, "button", { name: "Turn on Windows Hello" });
-    await click(entry === "Security switch" ? toggle : offer);
+    expect(queryByRole(document.body, "button", { name: "Turn on Windows Hello" })).toBeNull(); // no offer in Settings
+    await click(toggle);
     expect(enroll).toHaveBeenCalledExactlyOnceWith({ method: "native" });
     expect(toggle.checked).toBe(false);
     expect(toggle.disabled).toBe(true);

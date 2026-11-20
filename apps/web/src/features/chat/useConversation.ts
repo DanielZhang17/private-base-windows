@@ -2,6 +2,7 @@ import { localized, renderMessage, LocalizedError, type LocalizedMessage } from 
 import { translateError, toErrorMessage } from "../shared/errors.js";
 import { t, useLocale } from "../../i18n/index.js";
 import { useSendMessage } from "./useSendMessage.js";
+import { observeGroupClock } from "./group-timeout.js";
 import { useFeedback } from "../shared/useFeedback.js";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
@@ -32,6 +33,7 @@ import {
   loadOlderPersistedConversationMessages,
   loadPersistedConversationMessages, refreshImportedConversationMessages, restoreVerifiedLegacyHistory,
   syncConversationMessages,
+  syncMessages,
   ingestMessageEdit,
 } from "../../lib/message-sync.js";
 
@@ -112,6 +114,7 @@ export function useConversation() {
   const [showRenameGroup, setShowRenameGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
   const [renamingGroup, setRenamingGroup] = useState(false);
+  const [renameGroupError, setRenameGroupError] = useState<LocalizedMessage | null>(null);
   const [updatingInvitePolicy, setUpdatingInvitePolicy] = useState(false);
   const [deletingConversation, setDeletingConversation] = useState(false);
   const [hasOlderCachedMessages, setHasOlderCachedMessages] = useState(false);
@@ -149,7 +152,7 @@ export function useConversation() {
 
   const { data: conversation, isLoading: conversationLoading, error: conversationError } = useQuery({
     queryKey: ["conversation", conversationId],
-    queryFn: () => api.get<ConversationWithMembers>(`/api/conversations/${conversationId}`),
+    queryFn: async () => observeGroupClock(await api.get<ConversationWithMembers>(`/api/conversations/${conversationId}`)),
     enabled: !!conversationId,
   });
 
@@ -241,11 +244,12 @@ export function useConversation() {
     try {
       ws = createChatWebSocket(conversationId, (frame) => {
         if (frame.type === "message") {
-          void ingestMessageFrame({ ...frame, conversationId }).catch(() => syncConversationMessages(conversationId).catch(() => undefined));
+          void ingestMessageFrame({ ...frame, conversationId }).catch(() => syncMessages({ force: true }).catch(() => undefined));
           return;
         }
         if (frame.type === "message_event") {
           void handleMessageDeletion(frame.payload);
+          if (frame.payload.deletionSync) void syncMessages({ force: true }).catch(() => undefined);
           if (frame.payload.edit?.conversationId === conversationId) {
             void ingestMessageEdit(frame.payload.edit).catch(() => syncConversationMessages(conversationId).catch(() => undefined));
           }
@@ -336,8 +340,8 @@ export function useConversation() {
   const peerOnline = usePresenceStore((state) => directPeer ? state.onlineUsers.has(directPeer.userId) : false);
   const callingSupported = useMemo(() => supportsE2EECalling(), []);
   const callDisabled = !!activeCallId && (activeCallStatus === "ringing" || activeCallStatus === "active");
-  const isGroupAdmin = conversation?.type === "group" && conversation.members.find((m) => m.userId === user?.id)?.role === "admin";
   const myMembership = conversation?.members.find((m) => m.userId === user?.id);
+  const isGroupAdmin = conversation?.type === "group" && myMembership?.role === "admin" && myMembership.acceptedAt != null;
   const isPendingRequest = myMembership?.acceptedAt === null;
   // Pending group members can receive messages before accepting the invitation.
   const showHistoryGuidance = linkedAt !== undefined && !!conversation && predatesDeviceLink(conversation, linkedAt, myMembership?.joinedAt);
@@ -401,25 +405,27 @@ export function useConversation() {
   };
 
   const handleRenameGroup = async () => {
-    if (!conversationId || !newGroupName.trim()) return;
+    const name = newGroupName.trim();
+    if (!conversationId || !name || name.length > 128 || renamingGroup) return;
+    setRenameGroupError(null);
     setRenamingGroup(true);
     try {
-      await api.patch(`/api/conversations/${conversationId}`, { name: newGroupName.trim() });
-      await queryClient.invalidateQueries({ queryKey: ["conversation", conversationId] });
-      await refreshConversationList();
+      await api.patch(`/api/conversations/${conversationId}`, { name });
       setShowRenameGroup(false);
+      void queryClient.invalidateQueries({ queryKey: ["conversation", conversationId] });
+      void refreshConversationList().catch(() => undefined);
     } catch (error: any) {
-      setNotice(toErrorMessage(error, "failedToRenameGroup"));
+      setRenameGroupError(toErrorMessage(error, "failedToRenameGroup"));
     } finally {
       setRenamingGroup(false);
     }
   };
 
   const handleDeleteConversation = async () => {
-    if (!conversationId) return;
+    if (!conversationId || !user) return;
     setDeletingConversation(true);
     try {
-      await api.delete(`/api/conversations/${conversationId}`);
+      await api.delete(`/api/conversations/${conversationId}/membership`);
       await refreshConversationList();
       useChatStore.getState().removeConversationMessages(conversationId);
       navigate("/");
@@ -609,7 +615,8 @@ export function useConversation() {
     showRenameGroup,
     setShowRenameGroup,
     newGroupName,
-    setNewGroupName,
+    setNewGroupName: (value: string) => { setNewGroupName(value); setRenameGroupError(null); },
+    renameGroupError: renameGroupError ? renderMessage(renameGroupError) : null,
     renamingGroup,
     updatingInvitePolicy,
     deletingConversation,

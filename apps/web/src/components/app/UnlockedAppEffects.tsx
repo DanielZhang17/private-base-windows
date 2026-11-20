@@ -1,3 +1,4 @@
+import { groupCallPresenceOpened, handleGroupCallNotice, refreshGroupCallStatus, useGroupCallStore } from "../../features/calls/group-call-store.js";
 import { t, useLocale } from "../../i18n/index.js";
 import { useEffect } from "react";
 import type { CallEventPayload, ConversationWithMembers } from "@e2ee-chat/shared";
@@ -20,6 +21,8 @@ import { useConnectionStore } from "../../stores/connectionStore.js";
 import { startBackgroundSession } from "../../platform/android-background-service.js";
 import { registerUnlockedSessionCleanup } from "../../platform/session-cleanup.js";
 import { refreshOutgoingQueue } from "../../features/chat/outgoingQueue.js";
+import { groupJoinRequestsKey } from "../../features/chat/useGroupJoinRequests.js";
+import { queryClient } from "../../lib/query-client.js";
 
 function getConversationName(conversation: ConversationWithMembers, localUserId: string): string {
   if (conversation.name) return conversation.name;
@@ -60,7 +63,39 @@ export default function UnlockedAppEffects() {
     const stopBackground = startBackgroundSession(userId, current);
     const sweepMessageHides = () => { void getAppDB().then(commitAbandonedMessageHides).catch(() => undefined); };
     const stopLocalMessageSync = startLocalHiddenMessageSync(refreshOutgoingQueue);
-    const unregister = registerUnlockedSessionCleanup(() => { disposed = true; stopLocalMessageSync(); sweepMessageHides(); });
+    let readinessRegistered = false;
+    let readinessRequest: AbortController | undefined;
+    let readinessTimer: number | undefined;
+    let readinessDelay = 1_000;
+    const registerReadiness = async () => {
+      if (!current() || readinessRegistered || readinessRequest || readinessTimer !== undefined) return;
+      readinessRequest = new AbortController();
+      try {
+        await api.post("/api/conversations/group-admissions-ready", undefined, { signal: readinessRequest.signal });
+        readinessRegistered = true;
+      } catch (error) {
+        const { status, body } = (error ?? {}) as { status?: number; body?: { retryAfterSeconds?: number } };
+        if (!current() || (status && status < 500 && status !== 408 && status !== 429)) return;
+        const retryAfterMs = (body?.retryAfterSeconds ?? 0) * 1_000;
+        readinessTimer = window.setTimeout(() => {
+          readinessTimer = undefined;
+          void registerReadiness();
+        }, Math.max(readinessDelay, retryAfterMs));
+        readinessDelay = Math.min(readinessDelay * 2, 30_000);
+      } finally {
+        readinessRequest = undefined;
+      }
+    };
+    const stopReadiness = () => {
+      if (readinessTimer !== undefined) window.clearTimeout(readinessTimer);
+      readinessRequest?.abort();
+    };
+    const unregister = registerUnlockedSessionCleanup(() => {
+      disposed = true;
+      stopReadiness();
+      stopLocalMessageSync();
+      sweepMessageHides();
+    });
     sweepMessageHides();
     const retiredCallIds = new Set<string>();
     let socketDispose: (() => void) | null = null;
@@ -156,12 +191,22 @@ export default function UnlockedAppEffects() {
       if (disposed) return;
 
       const socket = createNotificationWebSocket({
+        onGroupCall: (payload) => { if (current()) handleGroupCallNotice(payload); },
         onCallEvent: (payload) => {
           void handleCallEvent(payload);
         },
-        onConversationEvent: ({ conversationId }) => {
-          void refreshConversationList().catch(() => undefined);
-          if (current()) void reconcileConversationEdits(conversationId, true).catch(() => undefined);
+        onConversationEvent: ({ conversationId, joinRequest }) => {
+          if (!current()) return;
+          void refreshConversationList().catch(() => undefined).then(() => {
+            if (current() && !joinRequest) return reconcileConversationEdits(conversationId, true);
+          }).catch(() => undefined);
+          if (useGroupCallStore.getState().statuses[conversationId]) void refreshGroupCallStatus(conversationId);
+          void queryClient.invalidateQueries({ queryKey: groupJoinRequestsKey(conversationId) });
+          if (joinRequest === "created" && (isNative() || document.visibilityState === "hidden")) {
+            void notify({ title: "Private Base", body: t("groupJoinNotification"), tag: "group-join-request",
+              onClick: () => { if (current()) navigate(`/chat/${conversationId}`); },
+            }).catch(() => undefined);
+          }
         },
         onMessageEvent: (payload) => {
           if (payload.deletion || payload.replayedDeletions) void handleMessageDeletion(payload).catch(scheduleMessageSync);
@@ -201,7 +246,10 @@ export default function UnlockedAppEffects() {
           }
         },
         onOpen: () => {
+          if (current()) groupCallPresenceOpened();
           publishDeviceAlertsChanged(deviceId);
+          void queryClient.invalidateQueries({ queryKey: ["groupJoinRequests"] });
+          void registerReadiness();
           void Promise.all([
             syncMessages(),
             refreshConversationList(),
@@ -243,6 +291,7 @@ export default function UnlockedAppEffects() {
 
     return () => {
       disposed = true;
+      stopReadiness();
       stopLocalMessageSync();
       sweepMessageHides();
       unregister();

@@ -29,6 +29,8 @@ interface ChatState {
   conversations: ConversationWithMembers[];
   activeConversationId: string | null;
   messages: Map<string, DecryptedMessage[]>;
+  clearingHistory: Map<string, ReadonlySet<string>>;
+  setClearingHistory: (id: string, messages?: ReadonlySet<string>) => void;
   drafts: Map<string, string>;
   typingUsers: Map<string, Set<string>>;
   outgoingRemovalNotices: Set<string>;
@@ -53,6 +55,13 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   conversations: [],
   activeConversationId: null,
   messages: new Map(),
+  clearingHistory: new Map(),
+  setClearingHistory: (id, messages) => set((state) => {
+    const clearingHistory = new Map(state.clearingHistory);
+    if (messages) clearingHistory.set(id, messages);
+    else clearingHistory.delete(id);
+    return { clearingHistory };
+  }),
   drafts: new Map(),
   typingUsers: new Map(),
   outgoingRemovalNotices: new Set(),

@@ -26,9 +26,17 @@ it("keeps a failed member removal open and retries the same member", async () =>
 });
 it("keeps deletion failures in the confirmation and only leaves after success", async () => {
   vi.mocked(api.delete).mockRejectedValueOnce(new Error("Could not leave"));
-  await act(async () => result.deleteConversation());
+  await act(async () => result.deleteConversation("leave"));
   expect(result.deleteError).toBe("Could not leave conversation\nCould not leave"); expect(deleted).not.toHaveBeenCalled();
   vi.mocked(api.delete).mockResolvedValueOnce({} as never);
-  await act(async () => result.deleteConversation());
+  await act(async () => result.deleteConversation("leave"));
   expect(deleted).toHaveBeenCalledOnce();
+});
+
+it("uses distinct endpoints for group self-removal and intentional whole-group deletion", async () => {
+  vi.mocked(api.delete).mockResolvedValue({} as never);
+  await act(async () => result.deleteConversation("leave"));
+  expect(api.delete).toHaveBeenLastCalledWith("/api/conversations/group/membership");
+  await act(async () => result.deleteConversation("deleteGroup"));
+  expect(api.delete).toHaveBeenLastCalledWith("/api/conversations/group?action=delete");
 });

@@ -27,6 +27,7 @@ import {
   rememberMessageDeletion,
   subscribeOutgoingMessageReady,
   type LocalOutgoing,
+  type LocalHideTarget,
   type LocalMessage,
   type OutgoingStep,
   type OutgoingEditStatus,
@@ -37,7 +38,8 @@ import { deleteMessagesForLocalUserOnly, publishCachedEdit } from "../../lib/mes
 import { prepareDirectPayloadFanout } from "../../lib/direct-messages.js";
 import { encryptGroupText } from "../../lib/message-processor.js";
 import { finishSenderKeyDistribution, prepareSenderKeyDistribution } from "../../lib/group-session.js";
-import { touchConversationInCache } from "../../lib/conversation-cache.js";
+import { CONVERSATION_QUERY_KEY, touchConversationInCache } from "../../lib/conversation-cache.js";
+import { queryClient } from "../../lib/query-client.js";
 import { keysLoaded } from "../../lib/key-manager.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { useChatStore } from "../../stores/chatStore.js";
@@ -158,7 +160,17 @@ function isRetryableSendError(error: unknown): boolean {
   return status === undefined ? error instanceof TypeError : status === 0 || status === 429 || status >= 500;
 }
 
+function isGroupTimeout(error: unknown): boolean {
+  return (error as { code?: string } | null)?.code === "GROUP_TIMED_OUT";
+}
+
+function needsFreshGroupKeys(error: unknown): boolean {
+  const code = (error as { code?: string } | null)?.code;
+  return code === "GROUP_MEMBERSHIP_CHANGED" || code === "GROUP_KEYS_UPGRADE_REQUIRED";
+}
+
 class DiscardedSend extends Error {}
+
 async function persistOutgoing(row: LocalOutgoing, message?: LocalMessage, editKeyResetToken?: string | null) {
   if (!await updateOutgoingIfPresent(row, message, { ifUnchanged: true, prepareEditKey: !!message, editKeyResetToken })) throw new DiscardedSend();
 }
@@ -259,6 +271,11 @@ async function prepare(row: LocalOutgoing, message: LocalMessage | undefined, cu
       if (!current()) return;
       row.steps = [{ path: "/api/messages/send-direct-batch", body, sendDispatched: false }];
     } else {
+      const epoch = conversation.groupEpoch;
+      const admission = conversation.groupAdmissionVersion;
+      row.steps = row.steps.filter((step) => step.path !== "/api/messages/edit"
+        && (step.body.groupEpoch ?? 0) === (epoch ?? 0)
+        && (step.body.groupAdmissionVersion ?? 0) === (admission ?? 0));
       const distribution = row.steps.length ? null : await prepareSenderKeyDistribution(conversation);
       if (!current()) return;
       // Persist a prepared distribution even if encrypting the following message fails.
@@ -267,9 +284,13 @@ async function prepare(row: LocalOutgoing, message: LocalMessage | undefined, cu
         await persistOutgoing(row);
       }
       const content = contentToSend(row, message);
-      const encrypted = editKey ? await encryptGroupText(row.conversationId, content, editKey) : await encryptGroupText(row.conversationId, content);
+      const encrypted = epoch !== undefined ? await encryptGroupText(row.conversationId, content, editKey, epoch)
+        : editKey ? await encryptGroupText(row.conversationId, content, editKey) : await encryptGroupText(row.conversationId, content);
       if (!current()) return;
-      row.steps.push({ path: "/api/messages/send", body: { id: row.id, conversationId: row.conversationId, type: message.type as DecryptedMessage["type"], ...encrypted, ttlSeconds: row.ttlSeconds, fileId: row.fileId }, sendDispatched: false });
+      row.steps.push({ path: "/api/messages/send", body: { id: row.id, conversationId: row.conversationId,
+        type: message.type as DecryptedMessage["type"], ...encrypted, ttlSeconds: row.ttlSeconds, fileId: row.fileId,
+        ...(epoch !== undefined && { groupEpoch: epoch }),
+        ...(admission !== undefined && { groupAdmissionVersion: admission }) }, sendDispatched: false });
     }
     await persistOutgoing(row, prepared, editKeyResetToken);
   });
@@ -337,8 +358,10 @@ async function attempt(id: string, ownerId: string, scheduledEdit?: { online: bo
     if (!current()) return;
     let result: SendMessageResponse | null = null;
     let editReceipt: MessageEditReceipt | null = null;
-    for (let renewal = 0; ; renewal++) {
-      let awaitingEnvelope = false;
+    let renewedUpload = false, refreshedGroupKeys = false;
+    for (;;) {
+      let awaitingEnvelope: OutgoingStep | undefined;
+      let dispatch: false | "first" | "replay" = false;
       try {
         for (const [index, step] of row.steps.entries()) {
           if (step.completed) continue;
@@ -346,20 +369,21 @@ async function attempt(id: string, ownerId: string, scheduledEdit?: { online: bo
           if (isMessageStep(step)) {
             step.sendDispatched = true;
             row.sendDispatched = true;
-            if (!await claimOutgoingDispatch(row, index, current) || !current()) return;
+            dispatch = await claimOutgoingDispatch(row, index, current);
+            if (!dispatch || !current()) return;
           } else if (!step.sendDispatched) {
             step.sendDispatched = true;
             await persistOutgoing(row);
             if (!current()) return;
           }
-          awaitingEnvelope = isMessageStep(step);
+          awaitingEnvelope = isMessageStep(step) ? step : undefined;
           if (step.path === "/api/messages/edit") {
             editReceipt = await api.post<MessageEditReceipt>(step.path, step.body);
             if (!Number.isSafeInteger(editReceipt?.editedAt) || !Number.isSafeInteger(editReceipt?.mutationSeq) || editReceipt.mutationSeq < 1 || editReceipt.editSeq !== step.body.editSeq) {
               throw new SyntaxError("Invalid edit receipt");
             }
           } else result = await api.post<SendMessageResponse>(step.path, step.body);
-          awaitingEnvelope = false;
+          awaitingEnvelope = undefined;
           if (!current()) return;
           if (step.distributed) await finishSenderKeyDistribution(row.conversationId, step);
           if (step !== row.steps[row.steps.length - 1]) {
@@ -371,8 +395,26 @@ async function attempt(id: string, ownerId: string, scheduledEdit?: { online: bo
       } catch (error) {
         if (!current()) return;
         const status = (error as { status?: number } | null)?.status;
-        rejectedDispatch = awaitingEnvelope && status !== undefined && status >= 400 && status < 500 && status !== 408;
-        if (renewal > 0 || !row.upload || message?.type !== "file" || !expiredReservation(error, true)) throw error;
+        rejectedDispatch = !!awaitingEnvelope && status !== undefined && status >= 400 && status < 500 && status !== 408
+          && (!isGroupTimeout(error) || dispatch === "first");
+        if (awaitingEnvelope && isGroupTimeout(error) && dispatch === "first") {
+          awaitingEnvelope.sendDispatched = false;
+          row.sendDispatched = false;
+        }
+        if (row.conversationType === "group" && !row.editTargetId && needsFreshGroupKeys(error)) {
+          // The membership error is authoritative. Exact committed envelopes get their
+          // original receipt, so we can replace these stale prepared steps.
+          row.steps = [];
+          row.sendDispatched = false;
+          if (!await updateOutgoingIfPresent(row, undefined, { ifUnchanged: true, releaseDispatch: true })) return;
+          if (!message) throw new Error("messageNotSent");
+          if (refreshedGroupKeys) throw error;
+          refreshedGroupKeys = true;
+          await prepare(row, message, current);
+          continue;
+        }
+        if (renewedUpload || !row.upload || message?.type !== "file" || !expiredReservation(error, true)) throw error;
+        renewedUpload = true;
         await renewUpload(row);
         await prepare(row, message, current);
       }
@@ -395,12 +437,14 @@ async function attempt(id: string, ownerId: string, scheduledEdit?: { online: bo
     touchConversationInCache(row.conversationId, result.serverTimestamp);
   } catch (error) {
     if (!current() || error instanceof DiscardedSend) return;
-    const retryable = isRetryableSendError(error) || (!!row.editTargetId && error instanceof SyntaxError);
+    const timedOut = isGroupTimeout(error);
+    if (timedOut) void queryClient.invalidateQueries({ queryKey: [...CONVERSATION_QUERY_KEY, row.conversationId] });
+    const retryable = needsFreshGroupKeys(error) || isRetryableSendError(error) || (!!row.editTargetId && error instanceof SyntaxError);
     // Preparation can fail on a network lookup before the first POST too.
     row.attempts = Math.max(1, row.attempts);
     row.status = "failed";
     row.retryable = retryable;
-    row.error = row.editTargetId && !retryable ? "messageEditFailed"
+    row.error = timedOut ? "groupTimedOut" : row.editTargetId && !retryable ? "messageEditFailed"
       : !retryable && row.upload && !row.upload.uploaded ? "fileCouldNotBeUploaded" : outgoingErrorKey(error);
     row.nextAttemptAt = retryable ? Date.now() + RETRY_DELAYS[Math.min(row.attempts - 1, RETRY_DELAYS.length - 1)] : null;
     const failed = message && !row.editTargetId ? { ...message, status: "failed" } : undefined;
@@ -457,11 +501,19 @@ export async function discardOutgoing(id: string, conversationId?: string): Prom
 }
 
 export async function discardAndHideMessages(conversationId: string | undefined, ids: string[], expectedQueued?: ReadonlySet<string>) {
+  return discardLocally(conversationId, [...new Set(ids)], expectedQueued);
+}
+
+export function discardConversationHistory(conversationId: string, visibleIds: ReadonlySet<string>, direct: boolean) {
+  return discardLocally(conversationId, { history: visibleIds, direct });
+}
+
+async function discardLocally(conversationId: string | undefined, target: LocalHideTarget, expectedQueued?: ReadonlySet<string>) {
   const session = captureMessageActionSession();
   const current = () => isMessageActionSessionCurrent(session);
-  const result = await deleteMessagesForLocalUserOnly(conversationId, [...new Set(ids)], current, expectedQueued);
+  const { hidden, ...result } = await deleteMessagesForLocalUserOnly(conversationId, target, current, expectedQueued);
   if (result.discarded && current()) {
-    for (const id of ids) if (preparingFiles.has(id)) cancelledPreparations.add(id);
+    for (const id of hidden) if (preparingFiles.has(id)) cancelledPreparations.add(id);
     void drain().catch(console.error);
   }
   return result;

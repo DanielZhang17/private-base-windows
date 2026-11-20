@@ -151,11 +151,26 @@ it("exposes invitation, rename and acceptance failures to the page", async () =>
   expect(state.updatingInvitePolicy).toBe(false);
   await act(async () => state.setNewGroupName("New group"));
   await act(async () => { await state.handleRenameGroup(); });
-  expect(state.notice).toBe("Failed to rename group\nPermission denied");
+  expect(state.renameGroupError).toBe("Failed to rename group\nPermission denied");
   expect(state.renamingGroup).toBe(false);
   vi.mocked(api.post).mockRejectedValue(new Error("Request failed"));
   await act(async () => { await state.handleAcceptRequest(); });
   expect(state.notice).toBe("Failed to accept request\nRequest failed");
+});
+
+it("keeps the attempted group name editable after a collision", async () => {
+  await render();
+  vi.mocked(api.patch).mockRejectedValueOnce(Object.assign(new Error("Group name already exists"), { code: "GROUP_NAME_TAKEN" }));
+  await act(async () => {
+    state.setShowRenameGroup(true);
+    state.setNewGroupName(" Café ");
+  });
+  await act(async () => state.handleRenameGroup());
+  expect(api.patch).toHaveBeenCalledWith("/api/conversations/chat", { name: "Café" });
+  expect(state.showRenameGroup).toBe(true);
+  expect(state.renameGroupError).toBe("This group name is already taken.");
+  await act(async () => state.setNewGroupName("Other name"));
+  expect(state.renameGroupError).toBeNull();
 });
 it("waits for hook confirmation before removing a member and surfaces failures", async () => {
   await render();

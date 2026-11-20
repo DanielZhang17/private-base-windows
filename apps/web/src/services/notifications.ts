@@ -1,5 +1,5 @@
 import {
-  HEARTBEAT_INTERVAL,
+  HEARTBEAT_INTERVAL, GROUP_CALL_CAPABILITY, type GroupCallNotice,
   WSFrameType,
   type CallEventPayload,
   type DeviceAlert,
@@ -9,10 +9,12 @@ import {
   type ProfileEventPayload,
   type WSFrame,
 } from "@e2ee-chat/shared";
+import { supportsE2EECalling } from "../platform/calls.js";
 import { useAuthStore } from "../stores/authStore.js";
 import { api, resolveWsBaseUrl } from "./api.js";
 
 interface NotificationSocketOptions {
+  onGroupCall?: (payload: GroupCallNotice) => void;
   onCallEvent: (payload: CallEventPayload) => void;
   onConversationEvent: (payload: ConversationEventPayload) => void;
   onMessageEvent: (payload: MessageEventPayload) => void;
@@ -42,7 +44,7 @@ export function createNotificationWebSocket(options: NotificationSocketOptions):
     if (!token) return;
 
     const socket = new WebSocket(
-      `${resolveWsBaseUrl()}/ws/presence?logicalDeletionIds=1`,
+      `${resolveWsBaseUrl()}/ws/presence?logicalDeletionIds=1${supportsE2EECalling() ? `&cap=${GROUP_CALL_CAPABILITY}` : ""}`,
       [`token.${token}`],
     );
     ws = socket;
@@ -68,6 +70,10 @@ export function createNotificationWebSocket(options: NotificationSocketOptions):
         const frame: WSFrame | { type: "ping" } = JSON.parse(event.data);
         if (frame.type === "ping") {
           socket.send(JSON.stringify({ type: "heartbeat" }));
+          return;
+        }
+        if (frame.type === "group-call") {
+          options.onGroupCall?.(frame.payload);
           return;
         }
         if (frame.type === WSFrameType.Call) {

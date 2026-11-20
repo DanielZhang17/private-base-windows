@@ -340,6 +340,15 @@ it("hides metadata within a run and styles incoming tombstones without content a
   await click(getByRole(document.body, "button", { name: "Message actions" }));
   expect(getByRole(document.body, "menu").querySelectorAll('[role="menuitem"]')).toHaveLength(1);
 });
+it.each([
+  ["alice", "admin", true, "This message was deleted"],
+  ["bob", "alice", false, "You deleted this message"],
+])("attributes a cleared %s message to the recorded actor %s", async (senderId, deletedByUserId, isOwn, label) => {
+  await dom.render(<ToastProvider><MessageBubble message={{
+    ...message, senderId, ownerId: "alice", deletedByUserId, deletedAt: 200, content: "",
+  }} isOwn={isOwn} /></ToastProvider>);
+  expect(dom.container().querySelector(".bubble-deleted")?.textContent).toBe(label);
+});
 it("shows the phone file preview with sender, size and extension", async () => {
   vi.stubGlobal("matchMedia", () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   await render({ type: "file", content: JSON.stringify({ ...JSON.parse(fileContent), size: 28 }) });

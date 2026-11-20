@@ -10,6 +10,7 @@ import { ingestMessageFrame, loadPersistedConversationMessages, reconcileImporte
 import { capabilities } from "../platform/capabilities.js";
 import { exportHistoryTransfer, historyArchiveIsCurrent, importHistoryTransferItem } from "../db/history-transfer.js";
 import { showMessageNotification } from "./browser-notifications.js";
+import * as conversationCache from "./conversation-cache.js";
 
 const saveMessage = (row: Parameters<typeof writeOwnedMessage>[0], current?: () => boolean, ownerId = row.ownerId ?? "bob") =>
   writeOwnedMessage(row, current, ownerId);
@@ -28,6 +29,8 @@ vi.mock("./conversation-cache.js", () => ({
 }));
 
 const syncStateId = "message-sync:bob:bob-device";
+const receiveProvenSocket = (frame: WSMessageFrame) =>
+  ingestMessageFrame(frame, undefined, { source: "socket", liveConfirmed: true });
 const saveCommittedMessage = (message: Parameters<typeof writeOwnedMessage>[0]) =>
   commitReceivedMessage(message.id, {
     message, ownerId: "bob", deviceId: "bob-device", direct: true,
@@ -41,6 +44,10 @@ function frame(id: string, ts = 100): WSMessageFrame {
   };
 }
 async function completeDecrypt(content: string, receive: Parameters<typeof decryptMessage>[2]) {
+  if (receive.advanceOnly) {
+    await commitReceivedMessage(receive.messageId, { ...receive.advanceOnly(), deviceId: receive.deviceId });
+    return null;
+  }
   await commitReceivedMessage(receive.messageId, await receive.prepare(new TextEncoder().encode(content)));
   return content;
 }
@@ -59,6 +66,40 @@ beforeEach(async () => {
 });
 afterEach(() => vi.restoreAllMocks());
 
+it.each([false, true])("renders cached history while deletion reconciliation after readmission is pending (older page %s)", async (older) => {
+  const timestamp = Date.now();
+  vi.spyOn(conversationCache, "getCachedConversation").mockReturnValue({
+    id: "conv", type: "group", members: [{ userId: "bob", joinAdmissionId: "new-admission" }],
+  } as ConversationWithMembers);
+  await saveMessage({ id: "cached", conversationId: "conv", ownerId: "bob", senderId: "alice", type: "file",
+    content: "old attachment key", status: "delivered", timestamp, expiresAt: timestamp + 60_000 });
+  await saveSyncState("message-mutations:bob:bob-device", 55);
+  let resolveLookup!: (value: unknown) => void;
+  vi.mocked(api.post).mockReturnValue(new Promise(resolve => { resolveLookup = resolve; }));
+  if (older) {
+    for (let index = 0; index < 100; index++) {
+      await saveMessage({ id: `system-${index}`, conversationId: "conv", ownerId: "bob", senderId: "alice", type: "system",
+        content: "", status: "delivered", timestamp: timestamp + index + 1, expiresAt: timestamp + 60_000 });
+    }
+    expect(await loadPersistedConversationMessages("conv")).toMatchObject({ loadedCount: 100, hasOlder: true });
+    expect(await loadOlderPersistedConversationMessages("conv")).toMatchObject({ loadedCount: 1, hasOlder: false });
+  } else {
+    expect(await loadPersistedConversationMessages("conv")).toMatchObject({ loadedCount: 1, hasOlder: false });
+  }
+
+  const cached = () => useChatStore.getState().messages.get("conv")?.find(row => row.id === "cached");
+  expect(cached()?.content).toBe("old attachment key");
+  expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/messages/history-deletions", {
+    messages: [{ id: "cached", conversationId: "conv", senderId: "alice" }],
+  });
+  resolveLookup({ deletions: [
+    { id: "cached", conversationId: "conv", senderId: "alice", deletedAt: timestamp + 1, deletedByUserId: "alice" },
+  ] });
+  await vi.waitFor(() => expect(cached()).toMatchObject({ content: "", deletedAt: timestamp + 1 }));
+  expect(await getMessageById("cached", "bob")).toMatchObject({ content: "", deletedAt: timestamp + 1 });
+  expect(await getSyncState("message-mutations:bob:bob-device")).toMatchObject({ value: 55 });
+});
+
 it.each([false, true])("keeps a finalized v5 hide invisible during live replay (decrypt fails %s)", async (fails) => {
   const db = await getAppDB();
   await db.put("accountState", { id: "hidden-message:legacy-hidden" });
@@ -71,8 +112,8 @@ it.each([false, true])("keeps a finalized v5 hide invisible during live replay (
     return "hidden plaintext";
   });
   const incoming = frame("legacy-hidden");
-  await ingestMessageFrame(incoming);
-  await ingestMessageFrame(incoming);
+  await receiveProvenSocket(incoming);
+  await receiveProvenSocket(incoming);
   expect(decryptMessage).toHaveBeenCalledOnce();
   expect(await getReceiveReceipt(incoming.id, "bob", "bob-device")).toMatchObject({ ownerId: "bob" });
   expect(await db.get("displayMessages", ["bob", incoming.id])).toBeUndefined();
@@ -92,7 +133,7 @@ it("advances the live receive ratchet without unread counts or notifications for
     return "hidden plaintext";
   });
   const incoming = frame("family:this-device", Date.now());
-  await ingestMessageFrame(incoming);
+  await receiveProvenSocket(incoming);
   expect(await getReceiveReceipt(incoming.id, "bob", "bob-device")).toMatchObject({ hidden: true });
   expect(await getSession("alice:alice-device")).toMatchObject({ state: "ratchet after hidden fanout" });
   expect(useChatStore.getState().messages.get("conv")).toBeUndefined();
@@ -301,13 +342,13 @@ it.each([false, true])("notifies a hidden active conversation only on the native
   vi.spyOn(capabilities, "nativeCallNotifications", "get").mockReturnValue(native);
   vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
   useChatStore.setState({ conversations: [{ id: "conv", members: [{ userId: "alice", user: { displayName: "Alice" } }] }] as ConversationWithMembers[] });
-  await ingestMessageFrame(frame("new-message", Date.now()));
+  await receiveProvenSocket(frame("new-message", Date.now()));
   expect(vi.mocked(showMessageNotification).mock.calls).toEqual(native ? [["Alice", "conv"]] : []);
 });
 it("never notifies the visible active conversation even with native notifications", async () => {
   vi.spyOn(capabilities, "nativeCallNotifications", "get").mockReturnValue(true);
   vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
-  await ingestMessageFrame(frame("visible-message", Date.now()));
+  await receiveProvenSocket(frame("visible-message", Date.now()));
   expect(showMessageNotification).not.toHaveBeenCalled();
 });
 
@@ -338,7 +379,7 @@ describe("failed message persistence", () => {
     const live = frame("live", 100);
     const restore = await failNextWrites(1);
     try {
-      await expect(ingestMessageFrame(live)).rejects.toThrow("QuotaExceededError");
+      await expect(receiveProvenSocket(live)).rejects.toThrow("QuotaExceededError");
       // Failed commits publish no plaintext; the unchanged ratchet can decrypt the replay.
       expect(useChatStore.getState().messages.get("conv")).toBeUndefined();
       expect(await getMessageById("live")).toBeUndefined();
@@ -379,7 +420,7 @@ describe("message ingest dedupe", () => {
   it("merges an IndexedDB-only message without decrypting after reload", async () => {
     await saveCommittedMessage({ id: "saved", conversationId: "conv", senderId: "alice", type: "text", content: "original", timestamp: 1, expiresAt: null, status: "read" });
     const update = frame("saved", 200);
-    await ingestMessageFrame(update);
+    await receiveProvenSocket(update);
     expect(decryptMessage).not.toHaveBeenCalled();
     expect(await getMessageById("saved")).toMatchObject({ content: "original", timestamp: 200, expiresAt: update.expiresAt, expiryKind: "retention", status: "read" });
     expect(useChatStore.getState().messages.get("conv")).toHaveLength(1);
@@ -387,7 +428,7 @@ describe("message ingest dedupe", () => {
 
   it("merges an IndexedDB-only local echo as delivered without decrypting", async () => {
     await saveMessage({ id: "echo", conversationId: "conv", senderId: "bob", type: "text", content: "sent locally", timestamp: 1, expiresAt: null, status: "sent" });
-    await ingestMessageFrame({ ...frame("echo", 200), senderId: "bob", senderDeviceId: "bob-device" });
+    await receiveProvenSocket({ ...frame("echo", 200), senderId: "bob", senderDeviceId: "bob-device" });
     expect(decryptMessage).not.toHaveBeenCalled();
     expect(await getMessageById("echo")).toMatchObject({ content: "sent locally", timestamp: 200, status: "delivered" });
   });
@@ -399,7 +440,7 @@ describe("message ingest dedupe", () => {
         editKeyAccepted: true };
       await saveMessage({ id: echo.id, conversationId: echo.conversationId, senderId: echo.senderId, type: "text", content: "sent locally",
         timestamp: 100, expiresAt: null, status: previous, editKey: "A".repeat(43), editSigningKey: "signing-key", editSenderDeviceId: echo.senderDeviceId });
-      await ingestMessageFrame(echo);
+      await receiveProvenSocket(echo);
       expect(decryptMessage).not.toHaveBeenCalled();
       expect(await getMessageById(echo.id)).toMatchObject({ status, editKeyAccepted: true, timestamp: 200 });
       expect(useChatStore.getState().messages.get(echo.conversationId)).toMatchObject([{ id: echo.id, status, editKeyAccepted: true }]);
@@ -414,7 +455,7 @@ describe("message ingest dedupe", () => {
     await saveMessage(local);
     await loadPersistedConversationMessages("conv");
     const header = keyed ? JSON.stringify({ editKey: { nonce: "x".repeat(16), ciphertext: "x".repeat(107) } }) : "{}";
-    await ingestMessageFrame({ ...echo, senderId: "bob", senderDeviceId: "bob-device", header, editKeyAccepted: keyed });
+    await receiveProvenSocket({ ...echo, senderId: "bob", senderDeviceId: "bob-device", header, editKeyAccepted: keyed });
     expect(decryptMessage).not.toHaveBeenCalled();
     const stored = await getMessageById(echo.id, "bob", undefined, true);
     const displayed = useChatStore.getState().messages.get("conv")?.[0];
@@ -430,14 +471,14 @@ describe("message ingest dedupe", () => {
 
   it("neither rewrites IndexedDB nor updates the store when a re-synced message is unchanged", async () => {
     const live = frame("live", 100);
-    await ingestMessageFrame(live);
+    await receiveProvenSocket(live);
     const db = await getAppDB();
     const transaction = vi.spyOn(db, "transaction");
     const storeUpdates = vi.fn();
     const unsubscribe = useChatStore.subscribe(storeUpdates);
     const messagesBefore = useChatStore.getState().messages;
 
-    await ingestMessageFrame({ ...live });
+    await receiveProvenSocket({ ...live });
     expect(decryptMessage).toHaveBeenCalledTimes(1);
     expect(transaction.mock.calls.filter(([, mode]) => mode === "readwrite")).toEqual([]);
     transaction.mockRestore();
@@ -446,7 +487,7 @@ describe("message ingest dedupe", () => {
 
     // A copy that does differ (here: a new expiry and server timestamp) is still applied to both.
     const changed = { ...live, serverTimestamp: 150, expiresAt: live.expiresAt! + 1_000 };
-    await ingestMessageFrame(changed);
+    await receiveProvenSocket(changed);
     unsubscribe();
     expect(storeUpdates).toHaveBeenCalled();
     expect(useChatStore.getState().messages.get("conv")).toMatchObject([{ id: "live", timestamp: 150, expiresAt: changed.expiresAt }]);
@@ -459,7 +500,7 @@ describe("message ingest dedupe", () => {
     await saveCommittedMessage({ id: "saved", conversationId: "conv", senderId: "alice", type: "text", content: "original", timestamp: 200, expiresAt: saved.expiresAt, expiryKind: "retention", status: "read" });
     const db = await getAppDB();
     const transaction = vi.spyOn(db, "transaction");
-    await ingestMessageFrame(saved);
+    await receiveProvenSocket(saved);
     expect(decryptMessage).not.toHaveBeenCalled();
     expect(transaction.mock.calls.filter(([, mode]) => mode === "readwrite")).toEqual([]);
     transaction.mockRestore();
@@ -468,7 +509,7 @@ describe("message ingest dedupe", () => {
 
   it("serializes overlapping live/sync copies and decrypts only once", async () => {
     const same = frame("same");
-    await Promise.all([ingestMessageFrame(same), ingestMessageFrame(same)]);
+    await Promise.all([receiveProvenSocket(same), receiveProvenSocket(same)]);
     expect(decryptMessage).toHaveBeenCalledTimes(1);
     expect(useChatStore.getState().messages.get("conv")).toHaveLength(1);
   });
@@ -481,10 +522,10 @@ describe("message ingest dedupe", () => {
       started();
       return new Promise<string>((resolve) => { finish = resolve; }).then((content) => completeDecrypt(content, args[2]));
     });
-    const pending = ingestMessageFrame(frame("stale"));
+    const pending = receiveProvenSocket(frame("stale"));
     await ready;
     resetMessageSyncState();
-    const duplicate = ingestMessageFrame(frame("stale"));
+    const duplicate = receiveProvenSocket(frame("stale"));
     finish("cached plaintext");
     await Promise.all([pending, duplicate]);
     expect(await getMessageById("stale")).toMatchObject({ content: "cached plaintext" });
@@ -548,7 +589,7 @@ describe("composite sync cursor", () => {
 
   it("never advances the cursor from live frames, even after an empty sync", async () => {
     await saveSyncState(syncStateId, 100, "b");
-    await ingestMessageFrame(frame("live", 500));
+    await receiveProvenSocket(frame("live", 500));
     vi.mocked(api.get).mockResolvedValue({ messages: [], hasMore: false });
     await syncMessages({ force: true });
     expect(requestParams().get("since")).toBe("100");
@@ -594,7 +635,7 @@ describe("composite sync cursor", () => {
 describe("message deletion", () => {
   it("applies an offline deletion even to a previously cached message and advances the mutation cursor", async () => {
     const original = frame("deleted", 100);
-    await ingestMessageFrame(original);
+    await receiveProvenSocket(original);
     vi.mocked(decryptMessage).mockClear();
     await saveSyncState(syncStateId, 200, "later");
     vi.mocked(api.get).mockResolvedValue({ messages: [], hasMore: false, mutationCursor: 1, mutations: [
@@ -636,15 +677,15 @@ describe("message deletion", () => {
     expect(useChatStore.getState().messages.get("conv")?.[0].content).toBe("");
     // A stale ACK or delayed original frame cannot put plaintext back.
     await saveMessage(attachment);
-    await ingestMessageFrame({ ...frame(attachment.id), msgType: "file" });
+    await receiveProvenSocket({ ...frame(attachment.id), msgType: "file" });
     expect(await getMessageById(attachment.id)).toMatchObject({ content: "", deletedAt: 300 });
-    expect(decryptMessage).not.toHaveBeenCalled();
+    expect(decryptMessage).toHaveBeenCalledWith("direct", expect.anything(), expect.objectContaining({ advanceOnly: expect.any(Function) }));
   });
   it("remembers an early deletion event before a delayed original message arrives", async () => {
     const { handleMessageDeletion } = await import("./message-sync.js");
     await handleMessageDeletion({ conversationId: "conv", deletion: { ids: ["late"], deletedAt: 300, deletedByUserId: "alice" } });
-    await ingestMessageFrame(frame("late"));
-    expect(decryptMessage).not.toHaveBeenCalled();
+    await receiveProvenSocket(frame("late"));
+    expect(decryptMessage).toHaveBeenCalledWith("direct", expect.anything(), expect.objectContaining({ advanceOnly: expect.any(Function) }));
     expect(await getMessageById("late")).toMatchObject({ content: "", deletedAt: 300 });
   });
   it("hides a message persistently, clears fileCache, and never restores it from sync or a stale save", async () => {
@@ -687,7 +728,7 @@ it.each([
   await saveMessage(original);
   await loadPersistedConversationMessages("conv");
   const ids = ["logical", "logical:recipient-2", "logical:sender-other"];
-  for (const id of ids) await ingestMessageFrame({ ...frame(id), senderId: "bob", senderDeviceId: "bob-device", ciphertext: "", header: "", iv: "", deletedAt: 300, deletedByUserId: "bob" });
+  for (const id of ids) await receiveProvenSocket({ ...frame(id), senderId: "bob", senderDeviceId: "bob-device", ciphertext: "", header: "", iv: "", deletedAt: 300, deletedByUserId: "bob" });
   const displayed = useChatStore.getState().messages.get("conv");
   expect(displayed).toHaveLength(1);
   expect(displayed![0]).toMatchObject({ id: "logical", content: "", deletedAt: 300 });
@@ -696,7 +737,7 @@ it.each([
   expect(decryptMessage).not.toHaveBeenCalled();
 });
 it("ignores unknown local tombstone echoes for every direct fanout envelope", async () => {
-  for (const id of ["unknown", "unknown:other-device"]) await ingestMessageFrame({ ...frame(id), senderId: "bob", senderDeviceId: "bob-device", deletedAt: 300 });
+  for (const id of ["unknown", "unknown:other-device"]) await receiveProvenSocket({ ...frame(id), senderId: "bob", senderDeviceId: "bob-device", deletedAt: 300 });
   expect(useChatStore.getState().messages.get("conv") ?? []).toEqual([]);
   expect(await (await getAppDB()).getAll("displayMessages")).toEqual([]);
   expect(decryptMessage).not.toHaveBeenCalled();
@@ -706,10 +747,11 @@ it("keeps an envelope deletion barrier when an unknown fanout tombstone creates 
   const { savePendingReceive, getPendingReceives } = await import("../db/index.js");
   const delayed = frame("new-logical:recipient-2");
   await savePendingReceive(delayed, "bob", "bob-device");
-  await ingestMessageFrame({ ...delayed, ciphertext: "", header: "", iv: "", deletedAt: 300 });
+  await receiveProvenSocket({ ...delayed, ciphertext: "", header: "", iv: "", deletedAt: 300 });
+  expect(await getPendingReceives("bob", "bob-device")).toEqual([delayed]);
+  await receiveProvenSocket(delayed);
   expect(await getPendingReceives("bob", "bob-device")).toEqual([]);
-  await ingestMessageFrame(delayed);
-  expect(decryptMessage).not.toHaveBeenCalled();
+  expect(decryptMessage).toHaveBeenCalledWith("direct", expect.anything(), expect.objectContaining({ advanceOnly: expect.any(Function) }));
   expect(useChatStore.getState().messages.get("conv")).toHaveLength(1);
   expect(useChatStore.getState().messages.get("conv")![0]).toMatchObject({ id: "new-logical", content: "", deletedAt: 300 });
 });
@@ -751,7 +793,7 @@ describe("delete for me Undo", () => {
     expect(await db.get("accountFiles", "undo-attachment")).toBeUndefined();
     expect(await undo!()).toBe(false);
     await saveMessage(message);
-    await ingestMessageFrame({ ...frame(message.id), msgType: "file" });
+    await receiveProvenSocket({ ...frame(message.id), msgType: "file" });
     expect(await simulateReload()).toEqual([]);
     expect(decryptMessage).not.toHaveBeenCalled();
   });
@@ -839,7 +881,7 @@ describe("delete for me Undo", () => {
     const { message, db } = await prepare();
     const undo = await hideMessageWithUndo("conv", message.id);
     if (route === "event") await handleMessageDeletion({ conversationId: "conv", deletion: { ids: [message.id], deletedAt: 300, deletedByUserId: "alice" } });
-    else await ingestMessageFrame({ ...frame(message.id), msgType: "file", deletedAt: 300, deletedByUserId: "alice" });
+    else await receiveProvenSocket({ ...frame(message.id), msgType: "file", deletedAt: 300, deletedByUserId: "alice" });
     expect(await db.get("accountFiles", "undo-attachment")).toBeUndefined();
     expect(await undo!()).toBe(true);
     expect((await simulateReload())[0]).toMatchObject({ content: "", deletedAt: 300 });
@@ -847,7 +889,7 @@ describe("delete for me Undo", () => {
 });
 
 it("applies mutations even on an empty message page and persists a separate account/device cursor", async () => {
-  await ingestMessageFrame(frame("old", 100));
+  await receiveProvenSocket(frame("old", 100));
   await saveSyncState(syncStateId, 10_000, "newer");
   const mutation = { ...frame("old", 100), ciphertext: "", deletedAt: 200, deletedByUserId: "alice", mutationSeq: 7 };
   vi.mocked(api.get).mockResolvedValue({ messages: [], hasMore: false, mutations: [mutation], editStream: true, hasMoreMutations: false });
@@ -1003,7 +1045,7 @@ it("merges cached history with WS/local entries arriving while the page snapshot
   const original = database.getCachedConversationMessagesPage;
   const race: typeof original = async (...args) => {
     const snapshot = await original(...args);
-    await ingestMessageFrame(frame("live", 200));
+    await receiveProvenSocket(frame("live", 200));
     useChatStore.getState().addMessage("conv", { ...collision, content: "new local/live value", timestamp: 300, status: "read" });
     return snapshot;
   };
@@ -1045,7 +1087,7 @@ it.each([false, true])("pages all 220 cached messages past an injected oldest to
   const ids = Array.from({ length: 220 }, (_, index) => `m${String(index).padStart(3, "0")}`);
   await Promise.all(ids.map((id, index) => tx.store.put({ ...base, id, timestamp: tied ? 1000 : 1000 + index, content: `cached ${id}` })));
   await tx.done;
-  await ingestMessageFrame({ ...frame(ids[0], 1000), deletedAt: 2000, deletedByUserId: "alice" });
+  await receiveProvenSocket({ ...frame(ids[0], 1000), deletedAt: 2000, deletedByUserId: "alice" });
   expect(useChatStore.getState().messages.get("conv")).toHaveLength(1);
   expect(await loadPersistedConversationMessages("conv")).toMatchObject({ loadedCount: 100, hasOlder: true });
   expect(useChatStore.getState().messages.get("conv")).toHaveLength(101);
@@ -1062,13 +1104,13 @@ it.each(["other-sender", "other-conversation"])("never maps a crafted victim:suf
   const victim = { id: "victim", conversationId: mismatch === "other-conversation" ? "other" : "conv", senderId: mismatch === "other-sender" ? "charlie" : "alice", type: "file" as const, content: JSON.stringify({ fileId: "victim-file", fileKey: "victim-key", iv: "iv" }), timestamp: 100, expiresAt: Date.now() + 60000, expiryKind: "retention" as const, status: "delivered" as const };
   await saveMessage(victim); useChatStore.getState().addMessage(victim.conversationId, victim);
   const db = await getAppDB(); await db.put("accountFiles", { id: "victim-file", blob: new Blob(["private"]) });
-  await ingestMessageFrame({ ...frame("victim:suffix"), deletedAt: 300, deletedByUserId: "alice" });
+  await receiveProvenSocket({ ...frame("victim:suffix"), deletedAt: 300, deletedByUserId: "alice" });
   expect((await getMessageById("victim"))?.content).toBe(victim.content);
   expect(await db.get("accountFiles", "victim-file")).toBeDefined();
   expect(await getMessageById("victim:suffix")).toBeUndefined();
   expect(await db.get("accountState", "deleted-message:victim")).toBeUndefined();
   // Even an exact-ID tombstone/event cannot cross that ownership boundary.
-  await ingestMessageFrame({ ...frame("victim"), deletedAt: 400, deletedByUserId: "alice" });
+  await receiveProvenSocket({ ...frame("victim"), deletedAt: 400, deletedByUserId: "alice" });
   const { handleMessageDeletion } = await import("./message-sync.js");
   await handleMessageDeletion({ conversationId: "conv", deletion: { ids: ["victim"], deletedAt: 500, deletedByUserId: "alice" } });
   expect((await getMessageById("victim"))?.content).toBe(victim.content);
@@ -1121,7 +1163,35 @@ it("labels only a known, decrypted sticker for the local notification", async ()
   useChatStore.setState({ activeConversationId: null, conversations: [{ id: "conv", members: [{ userId: "alice", user: { displayName: "Alice" } }] }] as ConversationWithMembers[] });
   vi.mocked(decryptMessage).mockImplementationOnce((...args) => completeDecrypt("[[sticker:genshin:genshin_hoyolab_21]]", args[2]))
     .mockImplementationOnce((...args) => completeDecrypt("[[sticker:genshin:genshin_hoyolab_818]]", args[2]));
-  await ingestMessageFrame(frame("known-sticker", Date.now()));
-  await ingestMessageFrame(frame("unknown-sticker", Date.now()));
+  await receiveProvenSocket(frame("known-sticker", Date.now()));
+  await receiveProvenSocket(frame("unknown-sticker", Date.now()));
   expect(vi.mocked(showMessageNotification).mock.calls).toEqual([["Alice", "conv", "sticker"], ["Alice", "conv"]]);
+});
+
+it("uses the call-control budget for a coalesced follow-up without advancing chat cursors twice", async () => {
+  useChatStore.setState({ activeConversationId: null });
+  let finish!: (result: { messages: WSMessageFrame[]; hasMore: boolean }) => void;
+  vi.mocked(api.get).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }))
+    .mockResolvedValue({ messages: [], hasMore: false });
+  const ordinary = syncMessages({ force: true });
+  await vi.waitFor(() => expect(api.get).toHaveBeenCalledOnce());
+  const call = syncMessages({ force: true, callControl: true });
+  finish({ messages: [frame("before-follow-up", 100)], hasMore: false });
+  await Promise.all([ordinary, call]);
+  expect(requestParams(0).has("callControl")).toBe(false);
+  expect(requestParams(1).get("callControl")).toBe("1");
+  expect(requestParams(1).get("sinceId")).toBe("before-follow-up");
+  expect(await getSyncState(syncStateId)).toMatchObject({ value: 100, cursorId: "before-follow-up" });
+});
+
+it("resumes ordinary sync from the same cursor when the call-control budget loses its active room", async () => {
+  useChatStore.setState({ activeConversationId: null });
+  await saveSyncState(syncStateId, 50, "known");
+  vi.mocked(api.get).mockRejectedValueOnce({ status: 403, code: "CALL_CONTROL_UNAVAILABLE" })
+    .mockResolvedValue({ messages: [frame("after-room", 100)], hasMore: false });
+  await syncMessages({ force: true, callControl: true });
+  expect(requestParams(0).get("callControl")).toBe("1");
+  expect(requestParams(1).has("callControl")).toBe(false);
+  expect(requestParams(1).get("sinceId")).toBe("known");
+  expect(await getSyncState(syncStateId)).toMatchObject({ value: 100, cursorId: "after-room" });
 });

@@ -1,5 +1,5 @@
 /** Cross-tab hints contain opaque IDs only. IndexedDB remains the source of truth. */
-export interface LocalMessageChange { id: string; kind: "hide" | "commit" | "undo" | "history" | "edit" | "outbox" | "outbox-batch" | "repair"; conversationId?: string }
+export interface LocalMessageChange { id: string; kind: "hide" | "clear-history" | "commit" | "undo" | "history" | "edit" | "outbox" | "outbox-batch" | "repair"; conversationId?: string }
 const hideGenerations = new Map<string, number>();
 const historyPreviewListeners = new Set<(id: string) => void>();
 export function subscribeHistoryPreviews(listener: (id: string) => void): () => void {
@@ -14,7 +14,7 @@ export function subscribeMessageRemovals(listener: (conversationId?: string) => 
   return () => { removalListeners.delete(listener); };
 }
 function notifyRemoval(change: LocalMessageChange): void {
-  if (change.kind === "hide" || change.kind === "commit") {
+  if (change.kind === "hide" || change.kind === "commit" || change.kind === "clear-history") {
     for (const listener of removalListeners) listener(change.conversationId);
   }
 }
@@ -36,7 +36,7 @@ export function subscribeHistoryImports(conversationId: string, listener: () => 
 }
 
 function notifyHistory(change: LocalMessageChange): void {
-  if (change.kind === "history" && change.conversationId) {
+  if ((change.kind === "history" || change.kind === "clear-history") && change.conversationId) {
     for (const listener of historyListeners.get(change.conversationId) ?? []) listener();
     for (const listener of historyPreviewListeners) listener(change.conversationId);
   }
@@ -49,15 +49,15 @@ export function createLocalMessageChannel(scope: { userId: string; deviceId: str
   const receive = (value: unknown) => {
     if (!value || typeof value !== "object") return;
     const event = value as LocalMessageChange & { nonce?: string };
-    if (typeof event.id !== "string" || !["hide", "commit", "undo", "history", "edit", "outbox", "outbox-batch", "repair"].includes(event.kind) || typeof event.nonce !== "string" || seen.has(event.nonce)) return;
+    if (typeof event.id !== "string" || !["hide", "clear-history", "commit", "undo", "history", "edit", "outbox", "outbox-batch", "repair"].includes(event.kind) || typeof event.nonce !== "string" || seen.has(event.nonce)) return;
     seen.add(event.nonce);
     if (seen.size > 128) seen.delete(seen.values().next().value!);
     const conversationId = typeof event.conversationId === "string" ? event.conversationId : undefined;
     if (event.kind !== "outbox" && event.kind !== "outbox-batch") noteHideChange(conversationId);
     const change = { id: event.id, kind: event.kind, ...(conversationId ? { conversationId } : {}) };
     notifyRemoval(change);
-    if (change.kind === "history") notifyHistory(change);
-    else onChange(change);
+    notifyHistory(change);
+    if (change.kind !== "history") onChange(change);
   };
   if (channel) channel.onmessage = (event) => receive(event.data);
   const storage = (event: StorageEvent) => {

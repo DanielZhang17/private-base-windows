@@ -75,7 +75,9 @@ export default function MessageBubble({ message, isOwn, isGroup, senderName, fai
   const queued = !!onDiscard || message.status === "sending" || failed;
   const file = !deleted && message.type === "file" ? parseFilePayload(message.content) : null;
   const time = formatTime(message.timestamp);
-  const deletedText = t(isOwn ? "youDeletedMessage" : "messageDeleted");
+  const viewerId = message.ownerId ?? (isOwn ? message.senderId : undefined);
+  const deletedByViewer = (message.deletedByUserId ?? message.senderId) === viewerId;
+  const deletedText = t(deletedByViewer ? "youDeletedMessage" : "messageDeleted");
   const status = message.status === "sending" ? t("messageSendingStatus") : message.status === "sent" ? t("messageSentStatus") : message.status === "delivered" ? t("messageDeliveredStatus") : message.status === "read" ? t("messageReadStatus") : t("notSent");
   useEffect(() => {
     if (actions.error && !actions.confirmDelete && !actions.confirmLocalDelete) { toast.show({ tone: "danger", message: actions.error }); actions.clearError(); }

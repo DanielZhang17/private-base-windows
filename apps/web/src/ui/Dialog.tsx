@@ -6,6 +6,7 @@ import { Icon } from "./Icon.js";
 import type { IconName } from "./icons/paths.js";
 import { useModalFocus } from "./useModalFocus.js";
 import { Portal } from "./Portal.js";
+import "./DarkSurface.css";
 import { OVERLAY_RANK } from "./overlay-stack.js";
 import { useOverlayLayer } from "./useOverlayLayer.js";
 
@@ -27,6 +28,8 @@ interface OverlayProps {
   footer?: ReactNode;
   children?: ReactNode;
   className?: string;
+  /** "dark" keeps an overlay opened from an always-dark surface (the call screen) in that surface's dark tokens. */
+  surface?: "dark";
 }
 
 interface OverlayInternalProps extends OverlayProps {
@@ -48,6 +51,7 @@ function Overlay({
   children,
   className,
   placement,
+  surface,
 }: OverlayInternalProps) {
   useLocale();
   const titleId = useId();
@@ -62,8 +66,10 @@ function Overlay({
 
   return <Portal>
     <div
+      data-theme={surface}
       className={cx(
         "fixed inset-0 z-50 flex animate-ui-fade bg-scrim",
+        surface === "dark" && "ui-dark-surface",
         placement === "center" && "items-end sm:items-center justify-center sm:p-6",
         placement === "bottom" && "items-end justify-center",
         placement === "end" && "items-stretch justify-end",
@@ -146,6 +152,8 @@ export interface ConfirmDialogProps {
   onConfirm: () => void;
   onCancel: () => void;
   children?: ReactNode;
+  /** Keeps the dialog in the dark call surface when opened from a call screen. */
+  surface?: "dark";
 }
 
 /** Replacement for window.confirm. The caller owns `open` and performs the action in onConfirm. */
@@ -164,6 +172,7 @@ export function ConfirmDialog({
   onConfirm,
   onCancel,
   children,
+  surface,
 }: ConfirmDialogProps) {
   useLocale();
   const cancelRef = useRef<HTMLButtonElement>(null);
@@ -183,6 +192,7 @@ export function ConfirmDialog({
       onClose={onCancel}
       role="alertdialog"
       placement="center"
+      surface={surface}
       dismissible={!busy}
       initialFocusRef={cancelRef}
       title={

@@ -1,3 +1,4 @@
+import { groupCallIdSchema } from "./group-calls.js";
 import { z } from "zod";
 import { MAX_LATEST_EDIT_IDS } from "./types/messages.js";
 import {
@@ -86,14 +87,23 @@ export const replenishOTPKeysSchema = z.object({
     .min(1),
 });
 
-export const createConversationSchema = z.object({
-  type: z.enum(["direct", "group"]),
-  memberUserIds: z.array(z.string()).min(1),
-  name: z.string().max(128).optional(),
-}).refine(data => data.type !== "direct" || data.memberUserIds.length === 1, {
-  message: "Direct conversations require exactly one other member",
-  path: ["memberUserIds"],
-});
+export const groupNameSchema = z.string().trim().min(1).max(128)
+  .refine(name => !/[\u0000\uD800-\uDFFF]/u.test(name), "Invalid group name");
+
+export const createConversationSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("direct"),
+    memberUserIds: z.array(z.string()).length(1, "Direct conversations require exactly one other member"),
+    name: z.string().max(128).optional(),
+  }),
+  z.object({
+    type: z.literal("group"),
+    memberUserIds: z.array(z.string()).min(1),
+    name: groupNameSchema,
+  }),
+]);
+
+export const requestGroupJoinSchema = z.object({ name: groupNameSchema }).strict();
 
 export const updatePrivacySchema = z.object({
   discoverable: z.boolean().optional(),
@@ -113,10 +123,16 @@ export const addMembersSchema = z.object({
   role: z.enum(["admin", "member"]).optional(),
 });
 
+export const updateConversationMemberSchema = z.union([
+  z.object({ role: z.enum(["admin", "member"]) }).strict(),
+  z.object({ timeoutSeconds: z.union([z.literal(600), z.literal(3600), z.null()]) }).strict(),
+]);
+
 export const updateConversationSchema = z.object({
-  name: z.string().min(1).max(128).optional(),
+  name: groupNameSchema.optional(),
   invitePolicy: z.enum(["any_member", "admins_only"]).optional(),
-}).refine(data => data.name !== undefined || data.invitePolicy !== undefined, {
+  joinByName: z.boolean().optional(),
+}).refine(data => data.name !== undefined || data.invitePolicy !== undefined || data.joinByName !== undefined, {
   message: "At least one field required",
 });
 
@@ -166,6 +182,7 @@ export const deleteMessagesSchema = z.object({
 });
 
 export const sendMessageSchema = z.object({
+  groupEpoch: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
   id: familyMessageId,
   conversationId: z.string(),
   type: z.enum(["text", "file", "key_exchange", "sender_key_distribution", "system"]),
@@ -174,6 +191,7 @@ export const sendMessageSchema = z.object({
   header: z.string(),
   ttlSeconds: ttlSeconds.nullable().optional(),
   fileId: z.string().trim().min(1).nullable().optional(),
+  groupAdmissionVersion: z.number().int().nonnegative().safe().optional(),
 }).superRefine((value, ctx) => {
   if (value.type !== "file" && value.fileId) {
     ctx.addIssue({
@@ -185,6 +203,9 @@ export const sendMessageSchema = z.object({
 });
 
 export const sendDirectBatchSchema = z.object({
+  groupCall: z.object({ callId: groupCallIdSchema, sessionId: groupCallIdSchema,
+    epoch: z.number().int().positive().safe(), inviteUntil: z.number().int().positive().safe().optional() }).strict().optional(),
+  groupEpoch: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
   conversationId: z.string(),
   type: z.enum(["text", "file", "key_exchange", "sender_key_distribution", "system"]),
   ttlSeconds: ttlSeconds.nullable().optional(),
@@ -197,12 +218,13 @@ export const sendDirectBatchSchema = z.object({
       header: z.string(),
     }),
   ).min(1).max(64),
+  groupAdmissionVersion: z.number().int().nonnegative().safe().optional(),
 }).superRefine((value, ctx) => {
   const root = value.messages[0].id;
   for (const [index, message] of value.messages.entries()) {
     let recipient: unknown;
     try { recipient = JSON.parse(message.header).recipientDeviceId; } catch { /* Route rejects invalid headers. */ }
-    const valid = value.type === "sender_key_distribution"
+    const valid = value.type === "sender_key_distribution" || value.groupCall?.inviteUntil !== undefined
       ? familyMessageId.safeParse(message.id).success
       : index === 0 ? familyMessageId.safeParse(root).success
         : message.id === `${root}:${recipient}` && typeof recipient === "string";

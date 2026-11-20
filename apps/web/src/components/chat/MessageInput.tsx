@@ -43,7 +43,7 @@ export default function MessageInput(props: ComposerOptions) {
     return () => registerSender?.(undefined);
   }, [registerSender, stickerSendBlocked]);
   useLayoutEffect(() => { if (blocked) dismiss(); }, [blocked, dismiss]);
-  useLayoutEffect(() => { if (editing) setAttachOpen(false); }, [editing]);
+  useLayoutEffect(() => { if (editing || props.disabled) setAttachOpen(false); }, [editing, props.disabled]);
   useLayoutEffect(() => { if (inline && document.activeElement === input.inputRef.current) geometry.blurForPanel(); }, [inline]);
   useEffect(() => {
     const query = window.matchMedia?.("(max-width: 639px)");
@@ -105,7 +105,7 @@ export default function MessageInput(props: ComposerOptions) {
       <IconButton icon={editing ? "check" : "send"} label={t(editing ? "saveChangesAction" : "sendMessageAction")} type="submit" className="send-button-themed" disabled={(!input.text.trim() && (editing || !input.pendingFile)) || blocked || props.editConflict} />
     </div>
     {phone && geometry.overlay > 0 && <div aria-hidden="true" style={{ blockSize: geometry.overlay }} />}
-    <Sheet open={attachOpen && !editing} onClose={() => setAttachOpen(false)} title={t("attach")}>
+    <Sheet open={attachOpen && !editing && !props.disabled} onClose={() => setAttachOpen(false)} title={t("attach")}>
       <div className="space-y-4">
         {props.onSendFile && <Button variant="secondary" leadingIcon="attach" fullWidth onClick={() => { setAttachOpen(false); input.fileInputRef.current?.click(); }}>{t("chooseFile")}</Button>}
         <Field label={t("timedMessageExpiry")}><Select aria-label={t("timedMessageExpiry")} className="h-11 rounded-control border border-line-strong bg-surface px-3" value={input.ttlSeconds} onChange={(event) => { input.setTtlSeconds(event.target.value); setAttachOpen(false); }}>{TTL_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.value ? formatDuration(Number(option.value)) : t("messageTimerOff")}</option>)}</Select></Field>

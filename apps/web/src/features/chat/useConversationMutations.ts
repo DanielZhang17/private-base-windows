@@ -7,6 +7,8 @@ import { api } from "../../services/api.js";
 import { refreshConversationList } from "../../lib/conversation-cache.js";
 import { useChatStore } from "../../stores/chatStore.js";
 
+export type ConversationExit = "leave" | "deleteGroup";
+
 /** Same conversation endpoints; confirmations retain failures until retried. */
 export function useConversationMutations(conversationId: string | undefined, onDeleted: () => void) {
   useLocale();
@@ -27,11 +29,12 @@ export function useConversationMutations(conversationId: string | undefined, onD
     } catch (error) { setRemoveError(toErrorMessage(error, "couldNotRemoveMember")); }
     finally { setRemoving(false); }
   };
-  const deleteConversation = async () => {
+  const deleteConversation = async (exit: ConversationExit) => {
     if (!conversationId || deleting) return;
     setDeleting(true); setDeleteError(null);
     try {
-      await api.delete(`/api/conversations/${conversationId}`);
+      const path = `/api/conversations/${encodeURIComponent(conversationId)}`;
+      await api.delete(exit === "leave" ? `${path}/membership` : `${path}?action=delete`);
       await refreshConversationList();
       useChatStore.getState().removeConversationMessages(conversationId);
       onDeleted();

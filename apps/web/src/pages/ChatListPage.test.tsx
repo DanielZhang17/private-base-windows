@@ -1,4 +1,4 @@
-import { getByRole, queryByRole, waitFor } from "@testing-library/dom";
+import { fireEvent, getByRole, queryByRole, waitFor } from "@testing-library/dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -7,6 +7,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AppShell } from "../ui/index.js";
 import { useAppUpdates } from "../features/updates/UpdateProvider.js";
 import ChatListPage from "./ChatListPage.js";
+import { useUnlockOfferHeld } from "../features/auth/unlockOfferGate.js";
 import { api } from "../services/api.js";
 import { fetchConversationList } from "../lib/conversation-cache.js";
 import { setLocalePreference } from "../i18n/index.js";
@@ -52,6 +53,14 @@ it("uses the latest message visible to the signed-in account for the preview", a
   });
   expect(container.textContent).toContain("Visible history");
   expect(container.textContent).not.toContain("Other account history");
+  await act(async () => { useChatStore.getState().setClearingHistory("existing", new Set(["own"])); });
+  expect(container.textContent).not.toContain("Visible history");
+  await act(async () => {
+    const chat = useChatStore.getState();
+    chat.addMessage("existing", { ...row, id: "own", ownerId: "alice", content: "", deletedAt: 3 });
+    chat.setClearingHistory("existing");
+  });
+  expect(container.textContent).toContain("This message was deleted");
   await act(async () => { useChatStore.getState().removeConversationMessages("existing"); });
 });
 it("restores the latest imported direct-chat preview when the list mounts after reload", async () => {
@@ -143,6 +152,47 @@ it.each([false, true])("guides a linked device with older conversations to recei
     await act(async () => useAuthStore.setState({ device: null }));
   }
 });
+it("lets the user close the other-devices history notice, remembered per linked device", async () => {
+  const now = Date.now();
+  const previous = capabilities.historyTransfer;
+  capabilities.historyTransfer = true;
+  const linked = (id: string) => ({ id, linkMethod: "passkey", activatedAt: now }) as ReturnType<typeof useAuthStore.getState>["device"];
+  let held: boolean | undefined;
+  function Probe() { held = useUnlockOfferHeld(); return null; }
+  const page = () => <QueryClientProvider client={client}><MemoryRouter><ChatListPage /><Probe /></MemoryRouter></QueryClientProvider>;
+  const notice = "Earlier messages stay on your other devices.";
+  try {
+    await act(async () => {
+      useAuthStore.setState({ device: linked("phone-1") });
+      client.setQueryData(["conversations"], [
+        { ...conversations[0], createdAt: now - 1000, members: [{ userId: "alice", joinedAt: now - 1000, acceptedAt: now - 1000 }] },
+      ]);
+      root.render(page());
+    });
+    expect(container.textContent).toContain(notice);
+    expect(held).toBe(true); // the unlock offer waits while the new device is still setting up
+    // The transfer action has its own row, apart from the close button.
+    const transfer = getByRole(container, "button", { name: "Transfer history" });
+    const close = getByRole(container, "button", { name: "Dismiss" });
+    expect(transfer.parentElement).not.toBe(close.parentElement);
+    await act(async () => close.click());
+    expect(container.textContent).not.toContain(notice);
+    expect(localStorage.getItem("pb.historyGuidanceDismissed:phone-1")).toBe("1");
+    expect(held).toBe(false);
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await act(async () => root.render(page()));
+    expect(container.textContent).toContain("Existing chat");
+    expect(container.textContent).not.toContain(notice);
+    // A relinked device (new device ID) gets its own guidance again.
+    await act(async () => useAuthStore.setState({ device: linked("phone-2") }));
+    expect(container.textContent).toContain(notice);
+  } finally {
+    capabilities.historyTransfer = previous;
+    localStorage.removeItem("pb.historyGuidanceDismissed:phone-1");
+    await act(async () => useAuthStore.setState({ device: null }));
+  }
+});
 it("F7: keeps cached chats and request actions available and lets the user dismiss action errors", async () => {
   vi.mocked(api.post).mockRejectedValue(new Error("Accept failed"));
   await act(async () => button("Accept").click());
@@ -151,6 +201,21 @@ it("F7: keeps cached chats and request actions available and lets the user dismi
   expect(button("Accept")).toBeDefined();
   await act(async () => button("Dismiss").click());
   expect(container.textContent).not.toContain("Accept failed");
+  expect(container.textContent).toContain("Existing chat");
+});
+
+it("requests an exact group name and shows neutral confirmation without opening a chat", async () => {
+  await act(async () => { await setLocalePreference("en"); });
+  vi.mocked(api.post).mockResolvedValue({ submitted: true } as never);
+  await act(async () => getByRole<HTMLButtonElement>(container, "button", { name: "New Chat" }).click());
+  await act(async () => getByRole<HTMLButtonElement>(document.body, "button", { name: "Request to join a group" }).click());
+  const dialog = getByRole(document.body, "dialog", { name: "Request to join a group" });
+  const submit = getByRole<HTMLButtonElement>(dialog, "button", { name: "Send request" });
+  expect(submit.disabled).toBe(true);
+  await act(async () => { fireEvent.change(getByRole(dialog, "textbox", { name: /group name/i }), { target: { value: "  Study Group  " } }); });
+  await act(async () => submit.click());
+  expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/conversations/join-by-name", { name: "Study Group" });
+  expect(dialog.textContent).toContain("If the group accepts requests and you’re eligible, an admin will review your request.");
   expect(container.textContent).toContain("Existing chat");
 });
 it("F7: clears action errors on retry and on successful background refetch", async () => {

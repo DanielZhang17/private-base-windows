@@ -23,6 +23,7 @@ export function clearAccountScopedState(): void {
       conversations: [],
       activeConversationId: null,
       messages: new Map(),
+      clearingHistory: new Map(),
       drafts: new Map(),
       typingUsers: new Map(),
       unreadCounts: new Map(),

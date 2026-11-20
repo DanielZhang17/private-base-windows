@@ -125,6 +125,25 @@ it("aborts an in-flight attachment when the composer unmounts", async () => {
   expect(sendFile).not.toHaveBeenCalled();
   root = createRoot(document.createElement("div"));
 });
+
+it("keeps a staged attachment and caption when a timeout disables the composer during compression", async () => {
+  await render();
+  const image = new File(["image"], "photo.jpg", { type: "image/jpeg" });
+  let finish!: (file: File) => void;
+  vi.mocked(compressAttachment).mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+  await act(async () => { drop(image); result.setCompress(true); result.setText("Caption"); });
+  let submitting!: Promise<void>;
+  await act(async () => { submitting = result.handleSubmit({ preventDefault() {} } as never); });
+  const signal = vi.mocked(compressAttachment).mock.calls[0][1];
+  await render(true);
+  expect(signal.aborted).toBe(true);
+  await act(async () => { finish(image); await submitting; });
+  expect(result.compressing).toBe(false);
+  expect(result.pendingFile).toBe(image);
+  expect(result.text).toBe("Caption");
+  expect(sendFile).not.toHaveBeenCalled();
+  expect(send).not.toHaveBeenCalled();
+});
 it("keeps Enter as a newline on a touch keyboard and while composing text", async () => {
   await render(); await act(async () => result.setText("Hello"));
   vi.stubGlobal("matchMedia", () => ({ matches: true }));

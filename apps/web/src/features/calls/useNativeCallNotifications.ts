@@ -9,6 +9,8 @@ import { getPendingCall } from "../../db/index.js";
 import { capabilities } from "../../platform/capabilities.js";
 import { cancelIncomingCall, showIncomingCall, takeNotificationActions, type NotificationAction } from "../../platform/android-background.js";
 import { navigate } from "../../platform/navigation.js";
+import { currentGroupInvitation, groupCallActions, useGroupCallStore } from "./group-call-store.js";
+import { getCachedConversation } from "../../lib/conversation-cache.js";
 import { registerUnlockedSessionCleanup } from "../../platform/session-cleanup.js";
 import type { useCallInvitationOwner } from "./useCallInvitationOwner.js";
 
@@ -33,7 +35,8 @@ export function useNativeCallNotifications(enabled: boolean, respond: Respond) {
     };
     const decisions = new Map<string, Decision>();
     const pending: (Decision | { kind: "open-conversation"; id: string })[] = [];
-    let posted: { id: string } | null = null;
+    let posted: { id: string; group: boolean } | null = null;
+    const groupActions = new Map<string, "accept" | "decline">();
     let retryTimer: number | undefined;
     let retriedCallId: string | null = null;
     let draining = false;
@@ -44,6 +47,12 @@ export function useNativeCallNotifications(enabled: boolean, respond: Respond) {
       const call = useCallStore.getState();
       return current() && call.activeCallId === id && call.direction === "incoming" && call.callStatus === "ringing";
     };
+    const groupInvite = () => {
+      const group = useGroupCallStore.getState();
+      const direct = useCallStore.getState();
+      return currentGroupInvitation(group.invitations, Date.now(),
+        !current() || !!group.session || group.busy || !!direct.pendingCallStart || direct.callStatus === "ringing" || direct.callStatus === "active");
+    };
     const validDecision = (decision: Decision) => {
       const call = useCallStore.getState();
       return current() && decisions.get(decision.id) === decision && call.localCallEpoch === decision.epoch &&
@@ -53,20 +62,25 @@ export function useNativeCallNotifications(enabled: boolean, respond: Respond) {
     const cancel = (id: string) => { void cancelIncomingCall(id).catch(() => undefined); };
     const syncCall = () => {
       const call = useCallStore.getState();
-      if (posted && !ringing(posted.id)) { cancel(posted.id); posted = null; }
+      const invite = groupInvite();
+      if (posted && !(posted.group ? invite?.callId === posted.id : ringing(posted.id))) { cancel(posted.id); posted = null; }
       if (retryTimer !== undefined && call.activeCallId !== retriedCallId) {
         window.clearTimeout(retryTimer);
         retryTimer = undefined;
       }
       for (const [id, decision] of decisions) if (!validDecision(decision)) decisions.delete(id);
-      if (!current() || !document.hidden || !call.activeCallId || !ringing(call.activeCallId) || posted || retryTimer !== undefined) return;
-      const notification = { id: call.activeCallId };
+      if (!current() || !document.hidden || posted || retryTimer !== undefined) return;
+      const direct = call.activeCallId && ringing(call.activeCallId) ? call.activeCallId : null;
+      const callId = direct ?? invite?.callId;
+      if (!callId) return;
+      const notification = { id: callId, group: !direct };
+      const callerName = direct ? call.callerName : invite && getCachedConversation(invite.conversationId)?.name;
       posted = notification;
-      void showIncomingCall({ callId: notification.id, callerName: call.callerName ?? "", video: call.callType === "video" })
+      void showIncomingCall({ callId: notification.id, callerName: callerName ?? "", video: (direct ? call.callType : invite?.callType) === "video" })
         .catch(() => false)
         .then((shown) => {
           // Cancellation can finish before the asynchronous show reaches native.
-          if (!current() || posted !== notification || !ringing(notification.id)) {
+          if (!current() || posted !== notification || !(notification.group ? groupInvite()?.callId === notification.id : ringing(notification.id))) {
             if (shown) cancel(notification.id);
             return;
           }
@@ -83,6 +97,16 @@ export function useNativeCallNotifications(enabled: boolean, respond: Respond) {
     const process = () => {
       if (!current() || draining || responding) return;
       syncCall();
+      for (const [id, action] of groupActions) {
+        const invite = groupInvite();
+        if (invite?.callId !== id) { groupActions.delete(id); continue; }
+        if (action === "accept" && document.hidden) continue;
+        groupActions.delete(id);
+        cancel(id);
+        if (action === "decline") void groupCallActions.decline(invite);
+        // Bring the group into view. Join remains a local consent action.
+        else navigate(`/chat/${encodeURIComponent(invite.conversationId)}`);
+      }
       let decision: Decision | undefined;
       while (pending.length) {
         const action = pending[0];
@@ -148,6 +172,10 @@ export function useNativeCallNotifications(enabled: boolean, respond: Respond) {
     const receive = (actions: NotificationAction[]) => {
       for (const action of actions) {
         if (action.kind === "open-conversation") { pending.push({ kind: action.kind, id: action.id }); continue; }
+        if (groupInvite()?.callId === action.id) {
+          groupActions.set(action.id, action.kind);
+          continue;
+        }
         if (!ringing(action.id)) continue;
         const previous = decisions.get(action.id);
         if (previous?.kind === action.kind) continue;
@@ -176,6 +204,7 @@ export function useNativeCallNotifications(enabled: boolean, respond: Respond) {
     };
     const wake = () => { void drain(); };
     const visibility = () => { syncCall(); if (!document.hidden) wake(); };
+    const unsubscribeGroup = useGroupCallStore.subscribe(() => { syncCall(); process(); });
     const unsubscribe = useCallStore.subscribe(() => { syncCall(); process(); });
     window.addEventListener("privatebase-notification-action", wake);
     window.addEventListener("focus", wake);
@@ -186,8 +215,8 @@ export function useNativeCallNotifications(enabled: boolean, respond: Respond) {
       if (disposed) return;
       disposed = true;
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
-      decisions.clear(); pending.length = 0;
-      unsubscribe(); unregister();
+      decisions.clear(); pending.length = 0; groupActions.clear();
+      unsubscribe(); unsubscribeGroup(); unregister();
       window.removeEventListener("privatebase-notification-action", wake);
       window.removeEventListener("focus", wake);
       document.removeEventListener("visibilitychange", visibility);

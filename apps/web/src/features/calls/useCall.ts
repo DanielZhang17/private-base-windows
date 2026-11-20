@@ -4,33 +4,36 @@ import { t, useLocale } from "../../i18n/index.js";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { useToast } from "../../ui/index.js";
-import type { ConversationWithMembers, GetCallResponse, WSSignalFrame } from "@e2ee-chat/shared";
-import { WSFrameType } from "@e2ee-chat/shared";
+import type { ConversationWithMembers, GetCallResponse } from "@e2ee-chat/shared";
 import { fromBase64Url } from "@e2ee-chat/crypto";
 import { useCallStore } from "../../stores/callStore.js";
 import { useAuthStore } from "../../stores/authStore.js";
 
 import { cleanupCallBestEffort } from "../../services/call-cleanup.js";
-import { api, resolveWsBaseUrl } from "../../services/api.js";
+import { api } from "../../services/api.js";
 import {
   addSenderTransform,
   attachLocalTracks,
   createPeerConnection,
-  acceptCallOffer,
   deriveCallKey,
   disposeCallTransforms,
   supportsE2EECalling,
-  sendSignal,
   type CallFrameKey,
 } from "../../services/webrtc.js";
 import { deletePendingCall, getPendingCall } from "../../db/index.js";
 import { syncMessages } from "../../lib/message-sync.js";
-import { captureUserMedia, captureDisplayMedia } from "../../platform/media.js";
+import {
+  captureUserMedia, captureDisplayMedia, captureCallCamera, callCameraConstraints, listCallCameras, watchCallCameras,
+  type CallCamera,
+} from "../../platform/media.js";
 import { E2EECallUnsupportedError } from "../../platform/calls.js";
 import type { PendingLocalAcceptance } from "./useCallInvitationOwner.js";
 import { isSameSession } from "../../services/session-identity.js";
+import { startCallSignaling } from "./call-signaling.js";
+import { startCallMediaMonitor } from "../../services/call-media-monitor.js";
+import type { CallDiagnostics } from "../../services/call-stats.js";
 
-type Stage = "loading" | "ringing" | "connecting" | "connected" | "ended";
+type Stage = "loading" | "ringing" | "connecting" | "connected" | "reconnecting" | "ended";
 
 function conversationDisplayName(conversation: ConversationWithMembers | null, localUserId: string | undefined): string {
   if (!conversation) return t("callScreenTitle");
@@ -86,10 +89,12 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
   } = useCallStore();
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const signalingRef = useRef<ReturnType<typeof startCallSignaling> | null>(null);
   const videoSenderRef = useRef<RTCRtpSender | null>(null);
   const callKeyRef = useRef<CallFrameKey | null>(null);
   const cameraTrackRef = useRef<MediaStreamTrack | null>(null);
+  const pendingCameraTrack = useRef<MediaStreamTrack | null>(null);
+  const cameraIntent = useRef(0);
   const acquiredTracks = useRef(new Set<MediaStreamTrack>());
   const rememberStream = (stream: MediaStream) => {
     const muted = useCallStore.getState().isMuted;
@@ -104,19 +109,26 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
     acquiredTracks.current.clear();
   };
   const screenTrackRef = useRef<MediaStreamTrack | null>(null);
+  const screenRequest = useRef<symbol | null>(null);
   const setupStartedRef = useRef(false);
   const endingRef = useRef(false);
   const endHandledRef = useRef(false);
   const connectingTimeoutCleanupRef = useRef<(() => void) | null>(null);
   const [stage, setStage] = useState<Stage>("loading");
   const [isSharingScreen, setIsSharingScreen] = useState(false);
+  const [cameras, setCameras] = useState<CallCamera[]>([]);
+  const selectedCamera = useRef<CallCamera | undefined>(undefined);
+  const mediaAction = useRef<Promise<void> | null>(null);
+  const [cameraId, setCameraId] = useState("");
+  const [videoBusy, setVideoBusy] = useState(false);
   const [stateCallId, setStateCallId] = useState<string>();
   const [callInfo, setCallInfo] = useState<GetCallResponse | null>(null);
   const [conversation, setConversation] = useState<ConversationWithMembers | null>(null);
   const [error, setError] = useState<LocalizedMessage | null>(null);
   const [callUnsupported, setCallUnsupported] = useState(false);
   const [callDuration, setCallDuration] = useState(0);
-  const durationTimerRef = useRef<number | null>(null);
+  const [diagnostics, setDiagnostics] = useState<CallDiagnostics | null>(null);
+  const connectedAtRef = useRef<number | null>(null);
   const canShareScreen = typeof navigator !== "undefined" && typeof navigator.mediaDevices?.getDisplayMedia === "function";
 
   const conversationName = conversation
@@ -150,19 +162,15 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
 
   useEffect(() => {
     const epoch = sessionEpochRef.current;
-    if (stage === "connected") {
-      durationTimerRef.current = window.setInterval(() => {
-        if (isRunningSession(epoch)) setCallDuration((d) => isRunningSession(epoch) ? d + 1 : d);
-      }, 1000);
-    } else if (stage !== "ended") {
-      setCallDuration(0);
-    }
-    return () => {
-      if (durationTimerRef.current) {
-        window.clearInterval(durationTimerRef.current);
-        durationTimerRef.current = null;
+    if (stage !== "connected" && stage !== "reconnecting") return;
+    const update = () => {
+      if (isRunningSession(epoch) && connectedAtRef.current !== null) {
+        setCallDuration(Math.floor((Date.now() - connectedAtRef.current) / 1000));
       }
     };
+    update();
+    const timer = window.setInterval(update, 1000);
+    return () => window.clearInterval(timer);
   }, [stage, callId]);
 
   // The provider stays mounted across routes and calls. Reset per-call UI/refs here.
@@ -178,12 +186,23 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
     setConversation(null);
     setError(null);
     setCallUnsupported(false);
+    connectedAtRef.current = null;
     setCallDuration(0);
+    setDiagnostics(null);
     setIsSharingScreen(false);
+    setCameras([]);
+    selectedCamera.current = undefined;
+    setCameraId("");
+    setVideoBusy(false);
+    mediaAction.current = null;
+    cameraTrackRef.current = null;
+    pendingCameraTrack.current = null;
+    screenTrackRef.current = null;
+    screenRequest.current = null;
     setStage("loading");
     return () => {
       sessionEpochRef.current += 1;
-      wsRef.current?.close();
+      signalingRef.current?.stop();
       pcRef.current?.close();
       stopAcquiredTracks();
       useCallStore.getState().remoteStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
@@ -280,9 +299,11 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
     const epoch = sessionEpochRef.current;
     const isCurrent = () => !cancelled && isRunningSession(epoch);
     let sessionPc: RTCPeerConnection | null = null;
-    let sessionWs: WebSocket | null = null;
+    let signaling: ReturnType<typeof startCallSignaling> | null = null;
     let sessionStream: MediaStream | null = null;
     let clearConnectingTimeout = () => {};
+    let unwatchCameras = () => {};
+    let stopMediaMonitor = () => {};
     const visibilityWait = new AbortController();
     const waitForNativeVisibility = async () => {
       while (isCurrent() && nativeAcceptanceRef.current?.callId === currentCallId && document.hidden) {
@@ -301,6 +322,18 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
       return isCurrent();
     };
     setupStartedRef.current = true;
+    const fail = (error?: unknown) => {
+      if (!isCurrent()) return;
+      endingRef.current = true;
+      if (error) {
+        setCallUnsupported(error instanceof E2EECallUnsupportedError);
+        setError(toErrorMessage(error, "callSignalingFailed"));
+      } else {
+        setError(localized("connectionFailed"));
+        void cleanupCallBestEffort(currentCallId, callAuthRef.current);
+      }
+      setStage("ended");
+    };
 
     async function startCall() {
       try {
@@ -314,7 +347,6 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
         const pc = await createPeerConnection(currentCallId, currentCallKey, (remoteStream) => {
           if (!isCurrent()) { remoteStream.getTracks().forEach((track) => track.stop()); return; }
           addRemoteStream("remote", remoteStream);
-          setStage("connected");
         }, isCurrent);
         if (!isCurrent()) {
           pc.close();
@@ -333,10 +365,10 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
           finishCaptureWaitRef.current?.(acceptance.callId, acceptance.epoch);
         }
 
-        const mediaStream = await captureUserMedia({
+        let mediaStream = await captureUserMedia({
           audio: true,
-          video: currentCallInfo.type === "video"
-            ? { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }
+          video: currentCallInfo.type === "video" && !useCallStore.getState().isVideoOff
+            ? callCameraConstraints
             : false,
         });
         if (!isCurrent()) {
@@ -345,170 +377,50 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
           return;
         }
 
+        if (useCallStore.getState().isVideoOff && mediaStream.getVideoTracks().length) {
+          mediaStream.getVideoTracks().forEach((track) => track.stop());
+          mediaStream = new MediaStream(mediaStream.getAudioTracks());
+        }
         sessionStream = mediaStream;
         rememberStream(mediaStream);
         setLocalStream(mediaStream);
-        cameraTrackRef.current = mediaStream.getVideoTracks()[0] ?? null;
+        const cameraTrack = mediaStream.getVideoTracks()[0] ?? null;
+        cameraTrackRef.current = cameraTrack;
+        if (cameraTrack) monitorCamera(cameraTrack, epoch);
 
-        const { videoSender } = attachLocalTracks(pc, mediaStream, currentCallKey);
+        const { videoSender } = attachLocalTracks(pc, mediaStream, currentCallKey, currentCallInfo.type === "video");
         videoSenderRef.current = videoSender;
+        stopMediaMonitor = startCallMediaMonitor(pc, videoSender, isCurrent, setDiagnostics, () => screenTrackRef.current !== null);
+        if (currentCallInfo.type === "video") {
+          const refresh = () => { void refreshCameras(epoch, true); };
+          unwatchCameras = watchCallCameras(refresh);
+          void refreshCameras(epoch);
+        }
 
-        // --- Connection state monitoring with ICE restart ---
-        pc.onconnectionstatechange = () => {
-          if (!isCurrent()) return;
-          const state = pc.connectionState;
-          if (state === "connected") {
-            setStage("connected");
-          } else if (state === "failed") {
-            // Attempt ICE restart before giving up
-            const restartSocket = sessionWs;
-            if (restartSocket?.readyState === WebSocket.OPEN) {
-              void (async () => {
-                try {
-                  const restartOffer = await pc.createOffer({ iceRestart: true });
-                  if (!isCurrent()) return;
-                  await pc.setLocalDescription(restartOffer);
-                  if (!isCurrent()) return;
-                  sendSignal(restartSocket, { kind: "offer", sdp: restartOffer.sdp, fromUserId: currentUser.id });
-                } catch {
-                  if (!isCurrent()) return;
-                  setError(localized("connectionFailed"));
-                  setStage("ended");
-                }
-              })();
-            } else {
-              setError(localized("connectionFailed"));
-              setStage("ended");
-            }
-          }
-        };
-
-        // --- Queues for buffering signals ---
-        const outgoingCandidateQueue: RTCIceCandidateInit[] = [];
-        const incomingCandidateQueue: RTCIceCandidateInit[] = [];
-        let wsOpen = false;
-
-        const flushOutgoingCandidates = () => {
-          while (isCurrent() && outgoingCandidateQueue.length > 0) {
-            const c = outgoingCandidateQueue.shift()!;
-            sendSignal(ws, {
-              kind: "ice-candidate",
-              candidate: c.candidate!,
-              sdpMid: c.sdpMid ?? null,
-              sdpMLineIndex: c.sdpMLineIndex ?? null,
-              fromUserId: currentUser.id,
-            });
-          }
-        };
-
-        const flushIncomingCandidates = async () => {
-          while (isCurrent() && incomingCandidateQueue.length > 0) {
-            const c = incomingCandidateQueue.shift()!;
-            await pc.addIceCandidate(new RTCIceCandidate(c));
+        signaling = startCallSignaling({
+          pc, callId: currentCallId, userId: currentUser.id,
+          caller: currentCallInfo.initiatorId === currentUser.id,
+          isCurrent,
+          onStage: (next) => {
+            connectedAtRef.current ??= Date.now();
+            setStage(next);
+          },
+          onTerminal: () => {
             if (!isCurrent()) return;
-          }
-        };
-
-        const ws = new WebSocket(`${resolveWsBaseUrl()}/ws/call/${currentCallId}`, [`token.${useAuthStore.getState().accessToken}`]);
-        sessionWs = ws;
-        wsRef.current = ws;
-
-        // Buffer outgoing ICE candidates until WS is open
-        pc.onicecandidate = (event) => {
-          if (!isCurrent() || !event.candidate) return;
-          const candidate: RTCIceCandidateInit = {
-            candidate: event.candidate.candidate,
-            sdpMid: event.candidate.sdpMid,
-            sdpMLineIndex: event.candidate.sdpMLineIndex,
-          };
-          if (wsOpen) {
-            sendSignal(ws, {
-              kind: "ice-candidate",
-              candidate: candidate.candidate!,
-              sdpMid: candidate.sdpMid ?? null,
-              sdpMLineIndex: candidate.sdpMLineIndex ?? null,
-              fromUserId: currentUser.id,
-            });
-          } else {
-            outgoingCandidateQueue.push(candidate);
-          }
-        };
-
-        // Queue incoming ICE candidates until remote description is set
-        ws.onmessage = async (event) => {
-          if (!isCurrent()) return;
-          try {
-            const frame = JSON.parse(event.data);
-            if (frame.type !== WSFrameType.Signal) return;
-            const signal = (frame as WSSignalFrame).payload;
-
-            if (signal.kind === "offer") {
-              await acceptCallOffer(pc, ws, signal.sdp!, isCurrent);
-              if (!isCurrent()) return;
-              // Remote description is now set — flush queued incoming candidates
-              await flushIncomingCandidates();
-              if (!isCurrent()) return;
-            } else if (signal.kind === "answer") {
-              await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp! }));
-              if (!isCurrent()) return;
-              // Remote description is now set — flush queued incoming candidates
-              await flushIncomingCandidates();
-              if (!isCurrent()) return;
-            } else if (signal.kind === "ice-candidate" && signal.candidate) {
-              const candidate: RTCIceCandidateInit = {
-                candidate: signal.candidate,
-                sdpMid: signal.sdpMid,
-                sdpMLineIndex: signal.sdpMLineIndex ?? undefined,
-              };
-              if (pc.remoteDescription) {
-                await pc.addIceCandidate(new RTCIceCandidate(candidate));
-                if (!isCurrent()) return;
-              } else {
-                incomingCandidateQueue.push(candidate);
-              }
-            }
-          } catch (error: any) {
-            if (isCurrent()) { setCallUnsupported(error instanceof E2EECallUnsupportedError); setError(toErrorMessage(error, "callSignalingFailed")); setStage("ended"); }
-          }
-        };
-
-        ws.onopen = async () => {
-          if (!isCurrent()) return;
-          try {
-            wsOpen = true;
-            // Flush any ICE candidates that were generated before WS connected
-            flushOutgoingCandidates();
-
-            if (currentCallInfo.initiatorId !== currentUser.id) return;
-            const offer = await pc.createOffer();
-            if (!isCurrent()) return;
-            await pc.setLocalDescription(offer);
-            if (!isCurrent()) return;
-            sendSignal(ws, { kind: "offer", sdp: offer.sdp, fromUserId: currentUser.id });
-          } catch (error: any) {
-            if (isCurrent()) { setCallUnsupported(error instanceof E2EECallUnsupportedError); setError(toErrorMessage(error, "callSignalingFailed")); setStage("ended"); }
-          }
-        };
-
-        ws.onerror = () => {
-          if (!isCurrent()) return;
-          console.error("Call signaling WebSocket error");
-        };
-
-        ws.onclose = (event) => {
-          if (!isCurrent()) return;
-          wsOpen = false;
-          if (event.code === 4403) {
-            setError(localized("callSignalingFailed"));
+            endingRef.current = true;
             setStage("ended");
-          }
-        };
+          },
+          onError: fail,
+        });
+        signalingRef.current = signaling;
 
         // --- Connecting timeout: give up after 30s if still not connected ---
         const connectingTimeout = window.setTimeout(() => {
-          if (isCurrent() && pc.connectionState !== "connected") {
+          if (isCurrent() && !signaling?.hasConnected()) {
+            endingRef.current = true;
             setError(localized("couldNotEstablishConnection"));
             setStage("ended");
+            void cleanupCallBestEffort(currentCallId, callAuthRef.current);
           }
         }, 30_000);
         clearConnectingTimeout = () => {
@@ -520,6 +432,7 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
         setStage("connecting");
       } catch (err: any) {
         if (!isCurrent()) return;
+        endingRef.current = true;
         console.error("Call setup failed:", err);
         setCallUnsupported(err instanceof E2EECallUnsupportedError);
         setError(toErrorMessage(err, "callSetupFailed"));
@@ -534,11 +447,13 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
       visibilityWait.abort();
       setupStartedRef.current = false;
       clearConnectingTimeout();
-      sessionWs?.close();
+      unwatchCameras();
+      stopMediaMonitor();
+      signaling?.stop();
       sessionPc?.close();
       sessionStream?.getTracks().forEach((track) => track.stop());
       if (useCallStore.getState().localStream === sessionStream) setLocalStream(null);
-      if (wsRef.current === sessionWs) wsRef.current = null;
+      if (signalingRef.current === signaling) signalingRef.current = null;
       if (pcRef.current === sessionPc) { pcRef.current = null; videoSenderRef.current = null; }
     };
   }, [addRemoteStream, callId, callInfo, callStatus, localCallOwnership, setLocalStream, userId]);
@@ -549,12 +464,12 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
       setStage((current) => current === "ended" ? current : "ringing");
       return;
     }
-    if (callStatus === "active" && stage !== "connected") {
-      setStage((current) => current === "ended" || current === "connected" ? current : "connecting");
+    if (callStatus === "active") {
+      setStage((current) => current === "loading" || current === "ringing" ? "connecting" : current);
       return;
     }
     if (callStatus === "declined" || callStatus === "missed" || callStatus === "ended") {
-      wsRef.current?.close();
+      signalingRef.current?.stop();
       pcRef.current?.close();
       videoSenderRef.current = null;
       screenTrackRef.current?.stop();
@@ -573,10 +488,11 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
     sessionEpochRef.current += 1;
     const epoch = sessionEpochRef.current;
     releaseCallOwnership(callId);
+    void deletePendingCall(callId).catch(() => undefined);
     stopAcquiredTracks();
     useCallStore.getState().remoteStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
     connectingTimeoutCleanupRef.current?.();
-    wsRef.current?.close();
+    signalingRef.current?.stop();
     pcRef.current?.close();
     screenTrackRef.current?.stop();
     cameraTrackRef.current?.stop();
@@ -602,7 +518,7 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
       stopAcquiredTracks();
       connectingTimeoutCleanupRef.current?.();
       screenTrackRef.current?.stop();
-      wsRef.current?.close();
+      signalingRef.current?.stop();
       pcRef.current?.close();
       videoSenderRef.current = null;
     };
@@ -612,107 +528,239 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
     const epoch = sessionEpochRef.current;
     const videoSender = videoSenderRef.current;
     if (!isRunningSession(epoch)) return false;
-    if (!videoSender) return true;
-    await videoSender.replaceTrack(nextTrack);
-    if (!isRunningSession(epoch)) return false;
-    if (nextTrack && callKeyRef.current) {
+    if (!videoSender) return nextTrack === null;
+    // Establish the transform before handing any track to the sender. The helper
+    // is idempotent and the same transform remains attached after replaceTrack.
+    if (nextTrack) {
+      if (!callKeyRef.current) throw new E2EECallUnsupportedError();
       addSenderTransform(videoSender, callKeyRef.current);
     }
-    return true;
+    await videoSender.replaceTrack(nextTrack);
+    return isRunningSession(epoch);
   };
 
-  const toggleScreenShare = async () => {
-    const epoch = sessionEpochRef.current;
-    if (!isRunningSession(epoch) || callType !== "video" || !localStream || !canShareScreen) return;
+  function stopVideoTrack(track: MediaStreamTrack | null) {
+    if (!track) return;
+    track.onended = null;
+    if (track.readyState !== "ended") track.stop();
+    acquiredTracks.current.delete(track);
+  }
 
-    if (isSharingScreen) {
-      if (!await replaceOutgoingVideoTrack(cameraTrackRef.current) || !isRunningSession(epoch)) return;
-      if (cameraTrackRef.current) {
-        setLocalStream(new MediaStream([...localStream.getAudioTracks(), cameraTrackRef.current]));
+  function showVideo(track: MediaStreamTrack | null) {
+    const audio = useCallStore.getState().localStream?.getAudioTracks() ?? [];
+    setLocalStream(new MediaStream(track ? [...audio, track] : audio));
+  }
+
+  function selectCamera(camera: CallCamera | undefined) {
+    selectedCamera.current = camera;
+    setCameraId(camera?.id ?? "");
+  }
+
+  function runVideoAction(epoch: number, action: () => Promise<void>, onFailure: (error: unknown) => void, queue = false) {
+    if (!isRunningSession(epoch) || (!queue && mediaAction.current)) return Promise.resolve();
+    setVideoBusy(true);
+    const start = async () => {
+      if (isRunningSession(epoch)) await action();
+    };
+    const pending = (mediaAction.current ? mediaAction.current.then(start) : start()).catch((error) => {
+      if (isRunningSession(epoch)) onFailure(error);
+    }).finally(() => {
+      if (mediaAction.current === pending) {
+        mediaAction.current = null;
+        if (isRunningSession(epoch)) setVideoBusy(false);
       }
-      screenTrackRef.current?.stop();
-      screenTrackRef.current = null;
-      setIsSharingScreen(false);
-      return;
-    }
+    });
+    mediaAction.current = pending;
+    return pending;
+  }
 
-    try {
-      const displayStream = await captureDisplayMedia({ video: true, audio: false });
-      if (!isRunningSession(epoch)) { displayStream.getTracks().forEach((track) => track.stop()); return; }
-      rememberStream(displayStream);
-      const displayTrack = displayStream.getVideoTracks()[0];
-      if (!displayTrack) return;
+  const cameraError = (error: unknown) => toast.show({
+    message: t((error as { name?: string })?.name === "NotAllowedError" ? "callCameraPermissionDenied" : "callCameraSwitchFailed"),
+    tone: "warning",
+  });
 
-      displayTrack.onended = () => {
-        if (!isRunningSession(epoch)) return;
-        void (async () => {
-          const videoDisabled = useCallStore.getState().isVideoOff;
-          if (videoDisabled || !cameraTrackRef.current) {
-            if (!await replaceOutgoingVideoTrack(null) || !isRunningSession(epoch)) return;
-            if (localStream) {
-              setLocalStream(new MediaStream(localStream.getAudioTracks()));
-            }
-          } else {
-            if (!await replaceOutgoingVideoTrack(cameraTrackRef.current) || !isRunningSession(epoch)) return;
-            if (localStream) {
-              setLocalStream(new MediaStream([...localStream.getAudioTracks(), cameraTrackRef.current]));
-            }
-          }
-          screenTrackRef.current = null;
-          setIsSharingScreen(false);
-        })().catch((err) => { if (isRunningSession(epoch)) console.error("Screen share restore failed:", err); });
-      };
-
-      screenTrackRef.current = displayTrack;
-      if (!await replaceOutgoingVideoTrack(displayTrack) || !isRunningSession(epoch)) return;
-      setLocalStream(new MediaStream([...localStream.getAudioTracks(), displayTrack]));
-      setIsSharingScreen(true);
-    } catch (err) {
-      if (isRunningSession(epoch)) console.error("Screen share failed:", err);
-    }
-  };
-
-  const handleToggleVideo = async () => {
-    const epoch = sessionEpochRef.current;
-    if (!isRunningSession(epoch) || callType !== "video" || !localStream) return;
-
-    if (isVideoOff) {
-      try {
-        const cameraStream = await captureUserMedia({ video: true, audio: false });
-        if (!isRunningSession(epoch)) { cameraStream.getTracks().forEach((track) => track.stop()); return; }
-        rememberStream(cameraStream);
-        const nextCameraTrack = cameraStream.getVideoTracks()[0];
-        if (!nextCameraTrack) return;
-
-        cameraTrackRef.current?.stop();
-        cameraTrackRef.current = nextCameraTrack;
-
-        if (!isSharingScreen) {
-          if (!await replaceOutgoingVideoTrack(nextCameraTrack) || !isRunningSession(epoch)) return;
-          setLocalStream(new MediaStream([...localStream.getAudioTracks(), nextCameraTrack]));
-        }
-
-        toggleVideo();
-      } catch (err) {
-        if (isRunningSession(epoch)) console.error("Failed to turn camera back on:", err);
-      }
-      return;
-    }
-
-    if (!isSharingScreen) {
-      if (!await replaceOutgoingVideoTrack(null) || !isRunningSession(epoch)) return;
-    }
-
-    cameraTrackRef.current?.stop();
+  async function retireCamera(track: MediaStreamTrack, epoch: number) {
+    if (!isRunningSession(epoch) || cameraTrackRef.current !== track) return false;
+    stopVideoTrack(track);
     cameraTrackRef.current = null;
-
-    if (isSharingScreen && screenTrackRef.current) {
-      setLocalStream(new MediaStream([...localStream.getAudioTracks(), screenTrackRef.current]));
-    } else {
-      setLocalStream(new MediaStream(localStream.getAudioTracks()));
+    if (!useCallStore.getState().isVideoOff) toggleVideo();
+    if (!screenTrackRef.current) {
+      showVideo(null);
+      await replaceOutgoingVideoTrack(null);
     }
+    return isRunningSession(epoch);
+  }
 
-    toggleVideo();
+  function cameraUnavailable(track: MediaStreamTrack, epoch: number) {
+    return runVideoAction(epoch, async () => {
+      if (!await retireCamera(track, epoch)) return;
+      void refreshCameras(epoch);
+      toast.show({ message: t("callCameraDisconnected"), tone: "warning" });
+    }, cameraError, true);
+  }
+
+  function monitorCamera(track: MediaStreamTrack, epoch: number) {
+    track.onended = () => { void cameraUnavailable(track, epoch); };
+  }
+
+  async function refreshCameras(epoch: number, deviceChanged = false) {
+    const track = cameraTrackRef.current;
+    try {
+      const inputs = await listCallCameras(track);
+      if (!isRunningSession(epoch) || cameraTrackRef.current !== track) return;
+      setCameras(inputs);
+      const settings = track?.getSettings?.();
+      const activeCamera = inputs.find((input) => input.id === settings?.deviceId || (input.facingMode && input.facingMode === settings?.facingMode));
+      if (track && (track.readyState === "ended" || (deviceChanged && selectedCamera.current && !selectedCamera.current.facingMode
+        && selectedCamera.current.id === settings?.deviceId && !activeCamera))) {
+        selectCamera(inputs[0]);
+        void cameraUnavailable(track, epoch);
+      } else if (activeCamera) {
+        selectCamera(activeCamera);
+      } else if (!inputs.some((input) => input.id === selectedCamera.current?.id)) {
+        selectCamera(inputs[0]);
+      }
+    } catch {
+      // Enumeration is optional. The current track can still be used.
+    }
+  }
+
+  const wantsCamera = (epoch: number, intent: number) =>
+    isRunningSession(epoch) && cameraIntent.current === intent && !useCallStore.getState().isVideoOff;
+
+  async function installCamera(camera: CallCamera | undefined, epoch: number, intent: number) {
+    const cameraStream = await captureCallCamera(camera);
+    const next = cameraStream.getVideoTracks()[0];
+    if (!wantsCamera(epoch, intent) || !next || next.readyState === "ended") {
+      cameraStream.getTracks().forEach((track) => track.stop());
+      if (wantsCamera(epoch, intent)) throw new DOMException("No live camera track", "NotReadableError");
+      return;
+    }
+    rememberStream(cameraStream);
+    pendingCameraTrack.current = next;
+    try {
+      if (!screenTrackRef.current && !await replaceOutgoingVideoTrack(next) && wantsCamera(epoch, intent)) throw new Error("No video sender");
+      if (!wantsCamera(epoch, intent)) return;
+      stopVideoTrack(cameraTrackRef.current);
+      cameraTrackRef.current = next;
+      monitorCamera(next, epoch);
+      if (!screenTrackRef.current) showVideo(next);
+      selectCamera(camera);
+      void refreshCameras(epoch);
+    } finally {
+      if (pendingCameraTrack.current === next) pendingCameraTrack.current = null;
+      if (cameraTrackRef.current !== next) stopVideoTrack(next);
+    }
+  }
+
+  const handleSelectCamera = (id: string) => {
+    const camera = cameras.find((input) => input.id === id);
+    const epoch = sessionEpochRef.current;
+    if (!camera || id === selectedCamera.current?.id) return Promise.resolve();
+    return runVideoAction(epoch, async () => {
+      if (useCallStore.getState().isVideoOff) { selectCamera(camera); return; }
+      const intent = cameraIntent.current;
+      const previous = cameraTrackRef.current;
+      const previousCamera = selectedCamera.current;
+      try {
+        await installCamera(camera, epoch, intent);
+      } catch (error) {
+        if (!wantsCamera(epoch, intent)) return;
+        const name = (error as { name?: string })?.name;
+        // Some camera drivers only allow one active capture at a time.
+        if (!previous || (name !== "NotReadableError" && name !== "AbortError")) throw error;
+        stopVideoTrack(previous);
+        try {
+          await installCamera(camera, epoch, intent);
+        } catch (retryError) {
+          if (!wantsCamera(epoch, intent)) return;
+          try { await installCamera(previousCamera, epoch, intent); }
+          catch { await retireCamera(previous, epoch); }
+          if (wantsCamera(epoch, intent)) throw retryError;
+        }
+      }
+    }, cameraError);
+  };
+
+  const cycleCamera = () => {
+    if (cameras.length < 2) return;
+    const index = cameras.findIndex((camera) => camera.id === selectedCamera.current?.id);
+    void handleSelectCamera(cameras[(index + 1) % cameras.length]!.id);
+  };
+
+  const toggleScreenShare = () => {
+    const epoch = sessionEpochRef.current;
+    if (!isRunningSession(epoch) || callType !== "video" || !localStream || !canShareScreen) return Promise.resolve();
+    const shareError = (error: unknown) => console.error("Screen share failed:", error);
+    const stopSharing = (request: symbol) => {
+      if (!isRunningSession(epoch) || screenRequest.current !== request) return Promise.resolve();
+      screenRequest.current = null;
+      setIsSharingScreen(false);
+      const displayTrack = screenTrackRef.current;
+      if (!displayTrack) return Promise.resolve();
+      stopVideoTrack(displayTrack);
+      if (useCallStore.getState().localStream?.getVideoTracks().some((track) => track === displayTrack)) showVideo(null);
+      return runVideoAction(epoch, async () => {
+        // Keep the ended screen in the ref until the pending camera operation has parked its track.
+        screenTrackRef.current = null;
+        const camera = useCallStore.getState().isVideoOff ? null : cameraTrackRef.current;
+        const next = camera?.readyState === "live" ? camera : null;
+        if (await replaceOutgoingVideoTrack(next) && (!next || cameraTrackRef.current === next)) showVideo(next);
+      }, shareError, true);
+    };
+    if (screenRequest.current) return stopSharing(screenRequest.current);
+    return runVideoAction(epoch, async () => {
+      const request = Symbol();
+      screenRequest.current = request;
+      setIsSharingScreen(true);
+      const sharingRequested = () => isRunningSession(epoch) && screenRequest.current === request;
+      try {
+        const displayStream = await captureDisplayMedia({ video: true, audio: false });
+        const displayTrack = displayStream.getVideoTracks()[0];
+        if (!sharingRequested() || !displayTrack) {
+          displayStream.getTracks().forEach((track) => track.stop());
+          void stopSharing(request);
+          return;
+        }
+        rememberStream(displayStream);
+        screenTrackRef.current = displayTrack;
+        displayTrack.onended = () => { void stopSharing(request); };
+        if (displayTrack.readyState === "ended") { void stopSharing(request); return; }
+        if (!await replaceOutgoingVideoTrack(displayTrack)) { void stopSharing(request); return; }
+        if (sharingRequested()) showVideo(displayTrack);
+      } catch (error) {
+        if (sharingRequested()) { void stopSharing(request); throw error; }
+      }
+    }, shareError);
+  };
+
+  const handleToggleVideo = () => {
+    const epoch = sessionEpochRef.current;
+    if (!isRunningSession(epoch) || callType !== "video") return Promise.resolve();
+    if (!useCallStore.getState().isVideoOff) {
+      cameraIntent.current += 1;
+      const hadCamera = !!(cameraTrackRef.current || pendingCameraTrack.current);
+      stopVideoTrack(cameraTrackRef.current);
+      stopVideoTrack(pendingCameraTrack.current);
+      cameraTrackRef.current = null;
+      pendingCameraTrack.current = null;
+      toggleVideo();
+      if (useCallStore.getState().localStream?.getVideoTracks().some((track) => track !== screenTrackRef.current)) showVideo(null);
+      if (!hadCamera || screenTrackRef.current) return Promise.resolve();
+      return runVideoAction(epoch, async () => {
+        if (!screenTrackRef.current) await replaceOutgoingVideoTrack(null);
+      }, cameraError, true);
+    }
+    if (!localStream) return Promise.resolve();
+    return runVideoAction(epoch, async () => {
+      toggleVideo();
+      const intent = cameraIntent.current;
+      try {
+        await installCamera(selectedCamera.current, epoch, intent);
+      } catch (error) {
+        if (wantsCamera(epoch, intent)) { toggleVideo(); throw error; }
+      }
+    }, cameraError);
   };
 
   const handleEnd = () => {
@@ -728,7 +776,7 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
     cameraTrackRef.current?.stop();
     stopAcquiredTracks();
     useCallStore.getState().remoteStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
-    wsRef.current?.close();
+    signalingRef.current?.stop();
     pcRef.current?.close();
     disposeCallTransforms();
     videoSenderRef.current = null;
@@ -767,9 +815,15 @@ export function useCallSession(callId: string | undefined, pendingAcceptance: Pe
     isGroupCall,
     stage: callId ? stage : "ended" as Stage,
     isSharingScreen,
+    cameras,
+    cameraId,
+    videoBusy,
+    handleSelectCamera,
+    cycleCamera,
     error: error ? renderMessage(error) : error,
     callUnsupported,
     callDuration,
+    diagnostics: stateCallId === callId ? diagnostics : null,
     canShareScreen,
     conversationName,
     formatDuration,

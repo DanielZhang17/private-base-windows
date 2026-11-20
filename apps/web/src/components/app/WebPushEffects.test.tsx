@@ -3,6 +3,7 @@ import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { setupDom } from "../../ui/test-utils.js";
 vi.mock("../../services/web-push.js", () => ({ disableWebPush: vi.fn(async () => {}), storePushLocale: vi.fn(async () => {}) }));
+vi.mock("../../features/calls/group-call-store.js", () => ({ refreshGroupInvitations: vi.fn(async () => []) }));
 vi.mock("../../services/api.js", () => ({ api: { get: vi.fn() } }));
 vi.mock("../../lib/key-manager.js", () => ({ keysLoaded: vi.fn(() => true) }));
 vi.mock("../../stores/authStore.js", async () => {
@@ -15,6 +16,8 @@ import { clearUnlockedSessionState } from "../../platform/session-cleanup.js";
 import { useAuthStore } from "../../stores/authStore.js";
 import { api } from "../../services/api.js";
 import { keysLoaded } from "../../lib/key-manager.js";
+import { refreshGroupInvitations } from "../../features/calls/group-call-store.js";
+import type { GroupCallInvitation } from "@e2ee-chat/shared";
 const { render, container } = setupDom();
 let worker: EventTarget;
 function Probe({ unlocked }: { unlocked: boolean }) {
@@ -26,6 +29,7 @@ function Probe({ unlocked }: { unlocked: boolean }) {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(keysLoaded).mockReturnValue(true);
+  vi.mocked(refreshGroupInvitations).mockResolvedValue([]);
   worker = new EventTarget();
   Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: worker });
   useAuthStore.setState({ accessToken: "token", sessionId: "session", user: { id: "bob" }, device: { id: "device" } } as never);
@@ -116,4 +120,36 @@ it.each(["call", "user-route"])("a newer %s supersedes a pending message lookup"
   expect(container().querySelector("output")!.textContent).toBe(expected);
   await act(async () => finish({ conversationId: "stale-conversation" }));
   expect(container().querySelector("output")!.textContent).toBe(expected);
+});
+
+
+function groupInvite(conversationId: string, ringUntil = Date.now() + 30_000): GroupCallInvitation {
+  return { conversationId, callId: "call-" + conversationId, callType: "video", initiatorId: "ringer", ringUntil,
+    ringFrom: { userId: "ringer", deviceId: "ringer-device", sessionId: "ring-session" } };
+}
+
+it("resolves a generic group ring from the pending invitation even when another group has a newer active call", async () => {
+  vi.mocked(api.get).mockResolvedValue([{ conversationId: "newer-active" }]);
+  vi.mocked(refreshGroupInvitations).mockResolvedValue([groupInvite("invited")]);
+  await render(<MemoryRouter initialEntries={["/?push=group-call"]}><Probe unlocked /></MemoryRouter>);
+  expect(container().querySelector("output")!.textContent).toBe("/chat/invited");
+  expect(api.get).not.toHaveBeenCalled();
+});
+
+it.each(["expired", "multiple"] as const)("uses the neutral route when pending group rings are %s", async (reason) => {
+  vi.mocked(refreshGroupInvitations).mockResolvedValue(reason === "expired"
+    ? [groupInvite("expired", Date.now() - 1000)] : [groupInvite("first"), groupInvite("second")]);
+  await render(<MemoryRouter initialEntries={["/?push=group-call"]}><Probe unlocked /></MemoryRouter>);
+  expect(container().querySelector("output")!.textContent).toBe("/");
+});
+
+it("defers an existing window's group ring tap until the same session unlocks", async () => {
+  vi.mocked(refreshGroupInvitations).mockResolvedValue([groupInvite("invited")]);
+  await render(<MemoryRouter><Probe unlocked={false} /></MemoryRouter>);
+  await act(async () => { worker.dispatchEvent(new MessageEvent("message", {
+    data: { type: "push-open", destination: "/?push=group-call" },
+  })); });
+  expect(refreshGroupInvitations).not.toHaveBeenCalled();
+  await render(<MemoryRouter><Probe unlocked /></MemoryRouter>);
+  expect(container().querySelector("output")!.textContent).toBe("/chat/invited");
 });

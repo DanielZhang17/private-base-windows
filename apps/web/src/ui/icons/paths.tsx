@@ -95,6 +95,8 @@ export const ICON_PATHS = {
   sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4" /></>,
   moon: <path d="M20 14.5A8.5 8.5 0 019.5 4a8.5 8.5 0 1010.5 10.5z" />,
   monitor: <><rect x="3" y="4" width="18" height="12" rx="1.5" /><path d="M8 20h8" /></>,
+  pin: <><path d="M9 3.5h6l-1 5.5 3.5 3v2h-11v-2L10 9z" /><path d="M12 14v6.5" /></>,
+  "pin-off": <><path d="M9 3.5h6l-1 5.5 3.5 3v2h-6" /><path d="M7.5 12.4L10 9l-.3-1.6" /><path d="M12 14v6.5" /><path d="M4 4l16 16" /></>,
 } satisfies Record<string, ReactNode>;
 
 export type IconName = keyof typeof ICON_PATHS;

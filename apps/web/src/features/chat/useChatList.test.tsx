@@ -71,10 +71,24 @@ it("R2-unread: excludes a declined unread request while keeping remaining unread
 it("shows the neutral privacy failure when group creation is rejected", async () => {
   vi.mocked(api.post).mockRejectedValueOnce(new Error("One or more users are unavailable"));
   await render();
+  await act(async () => state.setGroupName("Named group"));
   await act(async () => state.setGroupMembers([{ id: "bob", username: "bob", displayName: "Bob", avatarUrl: null }]));
   await act(async () => { await state.startNewGroup(); });
   expect(state.newChatError).toBe("This person can't be added");
   expect(state.groupMembers).toHaveLength(1);
+});
+
+it("requires a trimmed group name and presents the conflict at the name field", async () => {
+  vi.mocked(api.post).mockRejectedValueOnce(Object.assign(new Error("Group name already exists"), { code: "GROUP_NAME_TAKEN" }));
+  await render();
+  await act(async () => state.setGroupMembers([{ id: "bob", username: "bob", displayName: "Bob", avatarUrl: null }]));
+  await act(async () => state.startNewGroup());
+  expect(api.post).not.toHaveBeenCalled();
+  await act(async () => state.setGroupName("  Café  "));
+  await act(async () => state.startNewGroup());
+  expect(api.post).toHaveBeenCalledExactlyOnceWith("/api/conversations", { type: "group", name: "Café", memberUserIds: ["bob"] });
+  expect(state.groupNameTaken).toBe(true);
+  expect(state.newChatError).toBe("This group name is already taken.");
 });
 
 it.each(["bobbie", "Bob"])("does not start a chat with %s when bob is hidden or missing", async username => {

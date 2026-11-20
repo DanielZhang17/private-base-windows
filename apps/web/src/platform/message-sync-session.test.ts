@@ -32,6 +32,8 @@ const signedIn = {
   user: { id: "old-user" } as never, device: { id: "old-device" } as never,
 };
 const plaintext = "old account private plaintext";
+const receiveProvenSocket = (frame: WSMessageFrame) =>
+  ingestMessageFrame(frame, undefined, { source: "socket", liveConfirmed: true });
 const frame = (): WSMessageFrame => ({
   type: WSFrameType.Message, id: "late-message", conversationId: "conv",
   senderId: "peer", senderDeviceId: "peer-device", msgType: "text",
@@ -90,7 +92,7 @@ describe("message work surviving session expiry", () => {
       return decrypted.promise.then((content) => completeDecrypt(content, args[2]));
     });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ messages: [frame()], hasMore: false }))));
-    const pending = source === "live" ? ingestMessageFrame(frame()) : syncMessages({ force: true });
+    const pending = source === "live" ? receiveProvenSocket(frame()) : syncMessages({ force: true });
     await started.promise;
     changeSession("expiry");
     decrypted.resolve(plaintext);
@@ -113,7 +115,7 @@ describe("message work surviving session expiry", () => {
       started.resolve();
       return decrypted.promise.then((content) => completeDecrypt(content, args[2]));
     });
-    const pending = ingestMessageFrame(frame());
+    const pending = receiveProvenSocket(frame());
     await started.promise;
     changeSession(change);
     decrypted.resolve(plaintext);
@@ -129,7 +131,7 @@ describe("message work surviving session expiry", () => {
       started.resolve();
       return decrypted.promise.then((content) => completeDecrypt(content, args[2]));
     });
-    const pending = ingestMessageFrame(frame());
+    const pending = receiveProvenSocket(frame());
     await started.promise;
     useAuthStore.getState().setTokens("rotated-access", "rotated-refresh");
     decrypted.resolve(plaintext);

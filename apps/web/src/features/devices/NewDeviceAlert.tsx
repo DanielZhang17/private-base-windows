@@ -15,6 +15,7 @@ import { usePrivacySettings } from "../settings/usePrivacySettings.js";
 import { deviceAlertTime, deviceIcon, linkMethodLabel } from "./devicePresentation.js";
 import { useDeviceAlerts } from "./useDeviceAlerts.js";
 import { removeLinkedDevice } from "./removeLinkedDevice.js";
+import { useHoldUnlockOffer } from "../auth/unlockOfferGate.js";
 
 function alertTitle(alert: DeviceAlert) {
   return t(alert.kind === "approval_disabled" ? "deviceAlert.titleApprovalOff"
@@ -42,6 +43,8 @@ export function NewDeviceAlerts({ placement = "banner", compact = false, filter,
   const [hidden, setHidden] = useState<string[]>([]);
   const [failures, setFailures] = useState<string[]>([]);
   const alerts = security.alerts.filter(alert => !hidden.includes(alert.alertId) && (!filter || filter(alert)));
+  // A security alert always wins over the optional unlock offer.
+  useHoldUnlockOffer(alerts.length > 0);
   const seen = useRef(new Set<string>());
   useEffect(() => { for (const alert of alerts) seen.current.add(alert.alertId); }, [alerts]);
   const [narrow, setNarrow] = useState(() => window.matchMedia?.("(max-width: 639px)").matches ?? false);

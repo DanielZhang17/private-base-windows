@@ -6,7 +6,7 @@ import { beforeEach, afterEach, expect, it, vi } from "vitest";
 import type { DecryptedMessage } from "@e2ee-chat/shared";
 import { createLocalMessageChannel, connectLocalMessageChannel } from "./local-message-changes.js";
 import { hideMessageWithUndo, reconcileLocalMessageChange, startLocalHiddenMessageSync, resetMessageSyncState, loadPersistedConversationMessages, loadOlderPersistedConversationMessages } from "./message-sync.js";
-import { getAppDB, messageHideKey, saveMessage as writeOwnedMessage, finishMessageHide } from "../db/index.js";
+import { getAppDB, messageHideKey, saveMessage as writeOwnedMessage, finishMessageHide, hideLocalMessages } from "../db/index.js";
 import { importHistoryTransferItem } from "../db/history-transfer.js";
 import { useChatStore } from "../stores/chatStore.js";
 import FilePreview from "../components/chat/FilePreview.js";
@@ -94,6 +94,32 @@ it("supports storage-event fallback without sending plaintext and isolates accou
     window.dispatchEvent(new StorageEvent("storage", { key: key2, newValue: value2 }));
     expect(received).toHaveBeenCalledTimes(1);
   } finally { a.close(); b.close(); c.close(); d.close(); }
+});
+
+it("publishes one local clear event and removes the loaded hidden rows together in another tab", async () => {
+  const row: DecryptedMessage = { id: "first", ownerId: "alice", conversationId: "conv", senderId: "peer", type: "text",
+    content: "Private message", timestamp: Date.now(), expiresAt: Date.now() + 60000, expiryKind: "retention", status: "delivered" };
+  const hidden = Array.from({ length: 130 }, (_, i) => ({ ...row, id: `hidden-${i}` }));
+  const concurrent = { ...row, id: "new-message" };
+  const other = { ...row, id: "other-message", conversationId: "other" };
+  const db = await getAppDB();
+  const tx = db.transaction("displayMessages", "readwrite");
+  await Promise.all(hidden.map((message) => tx.store.put(message)));
+  await tx.done;
+  useChatStore.getState().setMessages("conv", [hidden[0], hidden.at(-1)!, concurrent]);
+  useChatStore.getState().setMessages("other", [other]);
+  const remote = startLocalHiddenMessageSync();
+  const local = connectLocalMessageChannel(scope, () => {});
+  const write = vi.spyOn(Storage.prototype, "setItem");
+  const remove = vi.spyOn(useChatStore.getState(), "removeMessages");
+  try {
+    await hideLocalMessages("conv", { history: new Set(), direct: true }, "alice", "device", () => true);
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(write.mock.calls[0][1])).toEqual({ id: "conv", conversationId: "conv", kind: "clear-history", nonce: expect.any(String) });
+    await waitFor(() => expect(useChatStore.getState().messages.get("conv")).toEqual([concurrent]));
+    expect(remove).toHaveBeenCalledExactlyOnceWith([hidden[0].id, hidden.at(-1)!.id]);
+    expect(useChatStore.getState().messages.get("other")).toEqual([other]);
+  } finally { local(); remote(); }
 });
 
 it("refreshes another tab already showing a failed-decryption placeholder when import repairs it", async () => {

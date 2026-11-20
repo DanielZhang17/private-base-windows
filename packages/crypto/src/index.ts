@@ -9,11 +9,11 @@ export { x3dhInitiate, x3dhRespond } from "./x3dh.js";
 export type { X3DHResult } from "./x3dh.js";
 export {
   initSessionAsInitiator, initSessionAsResponder,
-  ratchetEncrypt, ratchetDecrypt,
+  ratchetEncrypt, ratchetDecrypt, ratchetAdvanceOnly,
   serializeSession, deserializeSession,
 } from "./double-ratchet.js";
 export type { RatchetSession, SerializedRatchetSession, EncryptResult } from "./double-ratchet.js";
-export { generateSenderKey, createDistribution, fromDistribution, senderKeyEncrypt, senderKeyDecrypt } from "./sender-keys.js";
+export { generateSenderKey, createDistribution, fromDistribution, senderKeyEncrypt, senderKeyDecrypt, senderKeyAdvanceOnly } from "./sender-keys.js";
 export type { SenderKeyState, SenderKeyDistribution, SenderKeyEncryptResult } from "./sender-keys.js";
 export { encryptMessageEdit, decryptMessageEdit, messageEditAAD } from "./message-edits.js";
 export type { SealedEditKey, EditKeyToSeal, EditKeyToOpen } from "./message-edits.js";

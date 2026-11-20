@@ -5,6 +5,7 @@ import type { ConversationWithMembers } from "@e2ee-chat/shared";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { encryptFile, encryptMessageEdit, fromBase64Url } from "@e2ee-chat/crypto";
 import { useSendMessage } from "./useSendMessage.js";
+import { observeGroupClock } from "./group-timeout.js";
 import { useChatStore } from "../../stores/chatStore.js";
 import { getAllOutgoing, getAppDB, getMessageById, saveMessage as writeOwnedMessage } from "../../db/index.js";
 import { api } from "../../services/api.js";
@@ -92,7 +93,9 @@ it.each([true, false])("publishes immediately, then trusts the accepted envelope
 
 it.each(["direct", "group"] as const)("sends a timed %s sticker without an edit key", async (type) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  const conversation = { id: "chat", type } as ConversationWithMembers;
+  const conversation: ConversationWithMembers = {
+    id: "chat", type, members: [], name: null, avatarUrl: null, invitePolicy: "any_member", createdBy: "alice", createdAt: 1, updatedAt: 1,
+  };
   let state!: ReturnType<typeof useSendMessage>;
   function Probe() { state = useSendMessage(conversation); return null; }
   vi.mocked(encryptGroupText).mockResolvedValue({ ciphertext: "opaque", iv: "iv", header: "header" });
@@ -115,6 +118,31 @@ it.each(["direct", "group"] as const)("sends a timed %s sticker without an edit 
       expect(encryptGroupText).toHaveBeenCalledExactlyOnceWith("chat", content);
       expect(api.post).toHaveBeenCalledWith("/api/messages/send", expect.objectContaining({ ttlSeconds: 60 }));
     }
+    expect(await getAllOutgoing()).toEqual([]);
+  } finally { await act(async () => root.unmount()); }
+});
+
+it("blocks text, files and revisions before queuing while the current group timeout is active", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const serverTime = Date.now() - 3_600_000;
+  const conversation = observeGroupClock({
+    id: "chat", type: "group", serverTime, name: null, avatarUrl: null, invitePolicy: "any_member",
+    createdAt: 1, updatedAt: 1, createdBy: "alice",
+    members: [{ conversationId: "chat", userId: "alice", role: "member", joinedAt: 1, acceptedAt: 1,
+      timedOutUntil: serverTime + 600_000, user: { username: "alice", displayName: "Alice", avatarUrl: null } }],
+  });
+  let state!: ReturnType<typeof useSendMessage>;
+  function Probe() { state = useSendMessage(conversation); return null; }
+  const root = createRoot(document.createElement("div"));
+  await act(async () => root.render(<Probe />));
+  try {
+    await act(async () => {
+      await state.handleSend("blocked", { ttlSeconds: null });
+      await state.handleSendFile(new File(["blocked"], "file.txt"), { ttlSeconds: null });
+      expect(await state.handleEdit("original", "blocked", 0)).toBe(false);
+    });
+    expect(state.sendError).toBe("You’re timed out in this group.");
+    expect(api.post).not.toHaveBeenCalled();
     expect(await getAllOutgoing()).toEqual([]);
   } finally { await act(async () => root.unmount()); }
 });

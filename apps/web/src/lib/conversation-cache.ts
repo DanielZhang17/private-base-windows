@@ -3,6 +3,7 @@ import { api, ApiError } from "../services/api.js";
 import { useAuthStore } from "../stores/authStore.js";
 import { useChatStore } from "../stores/chatStore.js";
 import { queryClient } from "./query-client.js";
+import { observeGroupClock } from "../features/chat/group-timeout.js";
 
 export const CONVERSATIONS_QUERY_KEY = ["conversations"] as const;
 export const CONVERSATION_QUERY_KEY = ["conversation"] as const;
@@ -43,7 +44,7 @@ async function fetchForSession<T>(path: string): Promise<T> {
 }
 
 export async function fetchConversationList(): Promise<ConversationWithMembers[]> {
-  return writeConversations(await fetchForSession<ConversationWithMembers[]>("/api/conversations"));
+  return writeConversations((await fetchForSession<ConversationWithMembers[]>("/api/conversations")).map(observeGroupClock));
 }
 
 export async function refreshConversationList(): Promise<ConversationWithMembers[]> {
@@ -84,7 +85,7 @@ export async function ensureConversationInCache(conversationId: string): Promise
   const cached = getCachedConversation(conversationId);
   if (cached) return cached;
 
-  const conversation = await fetchForSession<ConversationWithMembers>(`/api/conversations/${conversationId}`);
+  const conversation = observeGroupClock(await fetchForSession<ConversationWithMembers>(`/api/conversations/${conversationId}`));
   upsertConversationInCache(conversation);
   return conversation;
 }

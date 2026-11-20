@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { IDBFactory } from "fake-indexeddb";
+import { openDB } from "idb";
 import {
   createDistribution, generateIdentityKeyPair, generateSenderKey, initSessionAsInitiator,
-  concat, encryptMessageEdit, generateAESKey, ratchetEncrypt, ratchetDecrypt, senderKeyEncrypt, toBase64Url, x3dhInitiate,
+  concat, deserializeSession, encryptMessageEdit, fromBase64Url, generateAESKey, ratchetEncrypt, ratchetDecrypt, senderKeyEncrypt, toBase64Url, x3dhInitiate,
   type EditKeyToSeal, type IdentityKeyPair,
   type RatchetSession,
 } from "@e2ee-chat/crypto";
-import { WSFrameType, type InitialMessageHeader, type MessageEditFrame, type WSMessageFrame } from "@e2ee-chat/shared";
+import { MAX_DELIVERY_ACK_IDS, MAX_SKIPPED_KEYS, WSFrameType, type InitialMessageHeader, type MessageEditFrame, type WSMessageFrame } from "@e2ee-chat/shared";
 import { stickerToken } from "./stickers.js";
 
 const fixtures = vi.hoisted(() => ({ auth: { sessionId: "login" as string | null, user: { id: "bob" } as { id: string } | null, device: { id: "bob-device" } as { id: string } | null }, conversationType: "direct", metadataErrors: {} as Record<string, unknown>, get: vi.fn(), post: vi.fn(), markKeyReady: vi.fn() }));
@@ -25,6 +27,19 @@ let chat: typeof import("../stores/chatStore.js");
 let sender: RatchetSession;
 let author: IdentityKeyPair;
 let initial: InitialMessageHeader;
+const originals = new Map<string, WSMessageFrame>();
+const liveStatus = (frame: WSMessageFrame, deletedAt: number | null = null) => ({
+  id: frame.id, conversationId: frame.conversationId, senderId: frame.senderId, senderDeviceId: frame.senderDeviceId,
+  expiresAt: frame.expiresAt ?? Date.now() + 60_000, deletedAt, deletedByUserId: deletedAt === null ? null : "alice",
+});
+const confirmedLive = (ids: string[]) => ({ messages: ids.flatMap((id) => {
+  const frame = originals.get(id);
+  return frame ? [liveStatus(frame)] : [];
+}) });
+// Most crypto tests begin after the server has attested to the socket content.
+const receiveProvenSocket = (frame: WSMessageFrame, syncOriginals?: Parameters<typeof sync.ingestMessageFrame>[1]) =>
+  syncOriginals ? sync.ingestMessageFrame(frame, syncOriginals)
+    : sync.ingestMessageFrame(frame, undefined, { source: "socket", liveConfirmed: true });
 const saveOwnedMessage = (row: import("../db/index.js").LocalMessage) => database.saveMessage(row, undefined, row.ownerId ?? "bob");
 const encode = (value: string) => new TextEncoder().encode(value);
 
@@ -48,10 +63,12 @@ async function direct(id: string, text = id, bootstrap = false, msgType: WSMessa
   });
 }
 function frame(id: string, msgType: WSMessageFrame["msgType"], encrypted: Pick<WSMessageFrame, "ciphertext" | "iv" | "header">): WSMessageFrame {
-  return {
+  const original: WSMessageFrame = {
     type: WSFrameType.Message, id, conversationId: "conv", senderId: "alice", senderDeviceId: "alice-device",
     msgType, ...encrypted, timestamp: Date.now(), expiresAt: Date.now() + 60_000, expiryKind: "retention",
   };
+  originals.set(id, original);
+  return original;
 }
 /** Abort an actual IDB transaction after its output write was enqueued, after all crypto. */
 function crashOnOutput(storeName = "displayMessages") {
@@ -64,7 +81,9 @@ function crashOnOutput(storeName = "displayMessages") {
 }
 beforeEach(async () => {
   vi.clearAllMocks();
-  fixtures.post.mockReset().mockResolvedValue({ edits: [] });
+  originals.clear();
+  fixtures.post.mockReset().mockImplementation(async (path: string, { ids }: { ids: string[] }) =>
+    path === "/api/messages/delivery-status" ? confirmedLive(ids) : { edits: [] });
   fixtures.auth = { sessionId: "login", user: { id: "bob" }, device: { id: "bob-device" } };
   fixtures.conversationType = "direct";
   fixtures.metadataErrors = {};
@@ -91,35 +110,1031 @@ beforeEach(async () => {
 });
 afterEach(() => { sync.resetMessageSyncState(); vi.useRealTimers(); vi.restoreAllMocks(); keys.lockLocalCryptoState(); });
 
+it.each([["direct", MAX_SKIPPED_KEYS + 1], ["group", 2_001]] as const)(
+  "advances a %s chain through %s deleted envelopes and decrypts the next live message", async (kind, count) => {
+    fixtures.conversationType = kind;
+    const group = kind === "group" ? await generateSenderKey() : undefined;
+    if (group) {
+      await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv",
+        distribution: createDistribution(group) }), true, "sender_key_distribution"));
+    } else await receiveProvenSocket(await direct("earlier", "Earlier live message", true));
+    const secret = "deleted plaintext must never persist";
+    async function encrypt(id: string, plaintext: string) {
+      if (!group) return direct(id, plaintext);
+      const value = await senderKeyEncrypt(group, encode(plaintext));
+      return frame(id, "text", { ciphertext: toBase64Url(value.ciphertext), iv: toBase64Url(value.iv), header: JSON.stringify(value.header) });
+    }
+    const tombstones: WSMessageFrame[] = [];
+    for (let i = 0; i < count; i++) {
+      const deleted = await encrypt(`deleted-${i}`, secret);
+      tombstones.push({ ...deleted, deletedAt: Date.now(), deletedByUserId: "bob", advanceOnly: true, deliveryAck: true });
+    }
+    const live = { ...await encrypt("next-live", "Live after the gap"), deliveryAck: true as const };
+    const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+    // A realtime broadcast can overtake the ordinary sync that fills the gap.
+    await expect(receiveProvenSocket(live)).rejects.toThrow("Could not decrypt message");
+    expect(await database.getReceiveReceipt(live.id, "bob", "bob-device")).toBeUndefined();
+    const earlierMutation = { ...tombstones[0], ciphertext: "", iv: "", header: "", advanceOnly: undefined, deliveryAck: undefined, mutationSeq: 1 };
+    const messages = [...tombstones, live];
+    for (let offset = 0; offset < messages.length; offset += 250) {
+      fixtures.get.mockResolvedValueOnce({ messages: messages.slice(offset, offset + 250), hasMore: offset + 250 < messages.length,
+        mutations: offset === 0 ? [earlierMutation] : [], editStream: true, mutationCursor: 1 });
+    }
+    await sync.syncMessages({ force: true });
+    expect(decrypt).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ name: "AES-GCM" }), expect.anything(), fromBase64Url(live.ciphertext));
+    expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: "Live after the gap" });
+    const records = (await (await database.getAppDB()).getAll("displayMessages")) as { id: string; content: string; deletedAt?: number }[];
+    expect(records.filter((row) => row.deletedAt)).toHaveLength(count);
+    expect(records.filter((row) => row.deletedAt).every((row) => row.content === "")).toBe(true);
+    expect(JSON.stringify(chat.useChatStore.getState().messages.get("conv"))).not.toContain(secret);
+    expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+    expect(fixtures.post).toHaveBeenCalledExactlyOnceWith("/api/messages/ack-delivery", { ids: expect.any(Array) });
+    expect(fixtures.post.mock.calls[0][1].ids).toHaveLength(MAX_DELIVERY_ACK_IDS);
+    expect(await database.getDeliveryAcks("bob", "bob-device", MAX_DELIVERY_ACK_IDS)).toHaveLength(MAX_DELIVERY_ACK_IDS);
+  }, 45_000,
+);
+
+it("keeps a queued live group message replayable when distribution arrives before the deleted envelopes", async () => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution");
+  const messages = [distribution];
+  for (let i = 0; i < 2_001; i++) {
+    messages.push({ ...await groupEnvelope(`deleted-${i}`, group), deletedAt: Date.now(), advanceOnly: true, deliveryAck: true });
+  }
+  const live = { ...await groupEnvelope("next-live", group), deliveryAck: true as const };
+  await receiveProvenSocket(live);
+  expect(await database.getPendingReceives("bob", "bob-device")).toMatchObject([{ id: live.id }]);
+  messages.push(live);
+  for (let offset = 0; offset < messages.length; offset += 250) {
+    fixtures.get.mockResolvedValueOnce({ messages: messages.slice(offset, offset + 250), hasMore: offset + 250 < messages.length });
+  }
+  await sync.syncMessages({ force: true });
+  expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: "group plaintext" });
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+}, 45_000);
+
+it.each([0, 600])("catches a retained predecessor behind the final forward cursor (starting at %i)", async (start) => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  const deletedAt = Date.now();
+  const retained = { ...await groupEnvelope("late-commit", group), serverTimestamp: 700,
+    deletedAt, deliveryAck: true as const, advanceOnly: true as const };
+  for (let i = 0; i < 2_000; i++) await senderKeyEncrypt(group, encode("discarded"));
+  const live = { ...await groupEnvelope("successor", group), serverTimestamp: 900, deliveryAck: true as const };
+  const firstPage = { ...await direct("first-page"), conversationId: "other", serverTimestamp: 800 };
+  const mutation = { ...retained, ciphertext: "", iv: "", header: "", deliveryAck: undefined, advanceOnly: undefined, mutationSeq: 1 };
+  if (start) await database.saveSyncState("message-sync:bob:bob-device", start, "older");
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const commit = vi.spyOn(database, "commitReceivedMessage");
+  const boundaries: (string | null)[] = [];
+  fixtures.get.mockImplementation(async (path: string) => {
+    const query = new URL(path, "https://test.invalid").searchParams;
+    boundaries.push(query.get("retainedBefore"));
+    const since = Number(query.get("since"));
+    if (since === start) return { messages: [firstPage], hasMore: true, hasMoreRetained: false };
+    if (since === 800) return { messages: [live], hasMore: false, hasMoreRetained: false, mutations: [mutation], mutationCursor: 1 };
+    expect(since).toBe(900);
+    expect(await database.getReceiveReceipt(live.id, "bob", "bob-device")).toBeUndefined();
+    return { messages: [], hasMore: false, hasMoreRetained: false,
+      retainedMessages: Number(query.get("retainedBefore")) >= 700 ? [retained] : [] };
+  });
+  await sync.syncMessages({ force: true });
+  expect(boundaries).toEqual([start ? "600" : null, null, "900"]);
+  expect(commit.mock.calls.map(([id]) => id).filter((id) => id !== firstPage.id)).toEqual([retained.id, live.id]);
+  expect(await database.getMessageById(retained.id, "bob")).toMatchObject({ content: "", deletedAt });
+  expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: "group plaintext", status: "delivered" });
+  expect(decrypt).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(retained.ciphertext));
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+});
+
+it.each([false, true])("restarts for a grant inserted behind the retained cursor (scan already drained=%s)", async (drained) => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  const predecessor = { ...await groupEnvelope("a-predecessor", group), serverTimestamp: 500,
+    deletedAt: Date.now(), deliveryAck: true as const, advanceOnly: true as const };
+  for (let i = 0; i < 2_000; i++) await senderKeyEncrypt(group, encode("discarded"));
+  const successor = { ...await groupEnvelope("successor", group), serverTimestamp: 700, deliveryAck: true as const };
+  const tombstone = { ...predecessor, ciphertext: "", header: "", iv: "", deliveryAck: undefined, advanceOnly: undefined, mutationSeq: 2 };
+  await database.saveSyncState("message-sync:bob:bob-device", 700, successor.id);
+  await database.savePendingReceive(successor, "bob", "bob-device", true);
+
+  const cursors: (string | null)[] = [];
+  fixtures.get.mockImplementation(async (path: string) => {
+    const params = new URL(path, "https://test.invalid").searchParams;
+    expect(params.get("since")).toBe("700");
+    const after = params.get("retainedAfter");
+    cursors.push(after);
+    if (cursors.length === 1) return { messages: [], hasMore: false, retainedCursor: "m-first-page", hasMoreRetained: true };
+    if (drained && cursors.length === 2) return { messages: [], hasMore: false, hasMoreRetained: false,
+      hasMoreMutations: true, editStream: true, mutations: [{ ...tombstone, id: "unrelated", serverTimestamp: 800, mutationSeq: 1 }] };
+    if (cursors.length === (drained ? 3 : 2)) return { messages: [], hasMore: false, hasMoreRetained: false,
+      editStream: true, mutationCursor: 2, mutations: [tombstone] };
+    expect(after).toBe("");
+    expect(await database.getReceiveReceipt(successor.id, "bob", "bob-device")).toBeUndefined();
+    return { messages: [], hasMore: false, hasMoreRetained: false, editStream: true, mutationCursor: 2, retainedMessages: [predecessor] };
+  });
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const commit = vi.spyOn(database, "commitReceivedMessage");
+  await sync.syncMessages({ force: true });
+
+  expect(cursors).toEqual(["", "m-first-page", ...(drained ? [null] : []), ""]);
+  expect(commit.mock.calls.map(([id]) => id)).toEqual([predecessor.id, successor.id]);
+  expect(await database.getReceiveReceipt(predecessor.id, "bob", "bob-device")).toMatchObject({ deliveryAuthenticated: true });
+  expect(await database.getMessageById(predecessor.id, "bob")).toMatchObject({ content: "", deletedAt: predecessor.deletedAt });
+  expect(await database.getMessageById(successor.id, "bob")).toMatchObject({ content: "group plaintext", status: "delivered" });
+  expect(decrypt).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(predecessor.ciphertext));
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+});
+
+it.each(["same page", "later page"])("receives earlier group plaintext before a queued later deletion (%s)", async (paging) => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution");
+  const earlier = { ...await groupEnvelope("earlier-live", group), deliveryAck: true as const };
+  const later = { ...await groupEnvelope("later-deleted", group), deliveryAck: true as const };
+  await receiveProvenSocket(later);
+  const retained = { ...later, deletedAt: Date.now(), advanceOnly: true as const };
+  const mutation = { ...retained, ciphertext: "", header: "", iv: "", advanceOnly: undefined, deliveryAck: undefined, mutationSeq: 1 };
+  fixtures.get.mockResolvedValueOnce({ messages: [distribution, retained, ...(paging === "same page" ? [earlier] : [])],
+    mutations: [mutation], hasMore: paging === "later page", editStream: true });
+  if (paging === "later page") fixtures.get.mockResolvedValueOnce({ messages: [earlier], hasMore: false });
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  await sync.syncMessages({ force: true });
+  expect(await database.getMessageById(earlier.id, "bob")).toMatchObject({ content: "group plaintext" });
+  expect(await database.getMessageById(later.id, "bob")).toMatchObject({ content: "", deletedAt: retained.deletedAt });
+  expect(decrypt).toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(earlier.ciphertext));
+  expect(decrypt).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(retained.ciphertext));
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+});
+
+it.each([false, true])("processes a lower deleted direct number from a later page (established=%s)", async (established) => {
+  if (established) await receiveProvenSocket(await direct("bootstrap", "earlier live", true));
+  const initial = { ...await direct("deleted-lower", "private message", !established), advanceOnly: true as const,
+    deliveryAck: true as const, deletedAt: Date.now() };
+  const later = { ...await direct("later-live", "still live"), deliveryAck: true as const };
+  fixtures.get.mockResolvedValueOnce({ messages: [later], hasMore: true }).mockImplementationOnce(async () => {
+    expect(await database.getReceiveReceipt(later.id, "bob", "bob-device")).toBeUndefined();
+    expect(fixtures.post).not.toHaveBeenCalled();
+    return { messages: [initial], hasMore: false };
+  });
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  await sync.syncMessages({ force: true });
+  expect(await database.getMessageById(later.id, "bob")).toMatchObject({ content: "still live" });
+  expect(await database.getMessageById(initial.id, "bob")).toMatchObject({ content: "", deletedAt: initial.deletedAt });
+  expect(decrypt).toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(later.ciphertext));
+  expect(decrypt).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(initial.ciphertext));
+});
+
+it("keeps a known socket predecessor ahead of a retained group envelope across sync runs", async () => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution");
+  const live = { ...await groupEnvelope("queued-predecessor", group), deliveryAck: true as const };
+  const retained = { ...await groupEnvelope("retained-successor", group), deliveryAck: true as const,
+    advanceOnly: true as const, deletedAt: Date.now() };
+  await receiveProvenSocket(live);
+  fixtures.post.mockRejectedValueOnce(new TypeError("Delivery lookup failed"));
+  fixtures.get.mockResolvedValueOnce({ messages: [distribution, retained], hasMore: false });
+  await sync.syncMessages({ force: true });
+  expect(await database.getReceiveReceipt(retained.id, "bob", "bob-device")).toBeUndefined();
+  expect(fixtures.post.mock.calls).toEqual([["/api/messages/delivery-status", { ids: [live.id] }]]);
+  await reload();
+  fixtures.get.mockResolvedValueOnce({ messages: [live], hasMore: false });
+  await sync.syncMessages({ force: true });
+  expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: "group plaintext" });
+  expect(await database.getReceiveReceipt(retained.id, "bob", "bob-device")).toMatchObject({ deliveryAuthenticated: true });
+});
+
+it.each([500, 800])("defers a new DH chain when delivery status fails for a predecessor at timestamp %i", async (serverTimestamp) => {
+  await receiveProvenSocket(await direct("bootstrap", "bootstrap", true));
+  for (let i = 1; i < MAX_SKIPPED_KEYS; i++) await direct(`discarded-${i}`);
+  const previous = { ...await direct("previous-chain-deletion", "deleted plaintext"), deliveryAck: true as const, serverTimestamp };
+  await direct("discarded-last");
+  const stored = (await database.getSession("alice:alice-device"))!;
+  const reply = await ratchetEncrypt(deserializeSession(JSON.parse(stored.state)), encode("reply"));
+  await ratchetDecrypt(sender, reply.header, reply.ciphertext, reply.iv);
+  const next = { ...await direct("new-chain-live"), deliveryAck: true as const, serverTimestamp: 700 };
+  expect(JSON.parse(next.header)).toMatchObject({ pn: MAX_SKIPPED_KEYS + 2, n: 0 });
+  expect(JSON.parse(next.header).dhPublicKey).not.toBe(JSON.parse(previous.header).dhPublicKey);
+
+  await database.saveSyncState("message-sync:bob:bob-device", 600, "already-paged");
+  await expect(receiveProvenSocket(previous)).rejects.toThrow("earlier envelopes");
+  const deletedAt = Date.now();
+  const acked: string[] = [];
+  let statusFails = true;
+  fixtures.post.mockImplementation(async (path: string, { ids }: { ids: string[] }) => {
+    if (path === "/api/messages/delivery-status") {
+      if (statusFails) throw new Error("temporary lookup failure");
+      return { messages: ids.map((id) => id === previous.id ? liveStatus(previous, deletedAt) : liveStatus(next)) };
+    }
+    expect(path).toBe("/api/messages/ack-delivery");
+    for (const id of ids) expect(await database.getReceiveReceipt(id, "bob", "bob-device")).toMatchObject({ deliveryAuthenticated: true });
+    acked.push(...ids);
+  });
+  fixtures.get.mockResolvedValue({ messages: [], hasMore: false }).mockResolvedValueOnce({ messages: [next], hasMore: false });
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  await sync.syncMessages({ force: true });
+  expect(await database.getReceiveReceipt(next.id, "bob", "bob-device")).toBeUndefined();
+  expect(await database.getReceiveReceipt(previous.id, "bob", "bob-device")).toBeUndefined();
+  expect(fixtures.post.mock.calls).toHaveLength(1);
+  expect(acked).toEqual([]);
+
+  statusFails = false;
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  await sync.syncMessages({ force: true });
+  expect(await database.getMessageById(previous.id, "bob")).toMatchObject({ content: "", deletedAt });
+  expect(await database.getMessageById(next.id, "bob")).toMatchObject({ content: next.id, status: "delivered" });
+  expect(decrypt).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(previous.ciphertext));
+  await vi.advanceTimersByTimeAsync(5_000);
+  await vi.waitFor(() => expect(new Set(acked)).toEqual(new Set([previous.id, next.id])));
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+});
+
+it("keeps queued text and files hidden after a local clear while still advancing their chain", async () => {
+  const bootstrap = await direct("bootstrap", "previously missing", true);
+  const text = { ...await direct("queued-text:bob-device"), deliveryAck: true as const };
+  const file = { ...await direct("queued-file:bob-device", JSON.stringify({
+    fileId: "file-id", fileName: "hidden.txt", mimeType: "text/plain", fileKey: testCallKey, iv: toBase64Url(new Uint8Array(12)),
+  }), false, "file"), deliveryAck: true as const };
+  for (const frame of [text, file]) await expect(receiveProvenSocket(frame)).rejects.toThrow("earlier envelopes");
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual(expect.arrayContaining([text, file]));
+
+  await sync.deleteMessagesForLocalUserOnly("conv", { history: new Set(), direct: true }, () => true);
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual(expect.arrayContaining([text, file]));
+  const next = { ...await direct("new-after-clear"), deliveryAck: true as const };
+  fixtures.get.mockResolvedValueOnce({ messages: [bootstrap, text, file, next], hasMore: false });
+  await sync.syncMessages({ force: true });
+
+  for (const frame of [text, file]) {
+    expect(await database.getMessageById(frame.id.split(":")[0], "bob", true)).toBeUndefined();
+    expect(await database.getReceiveReceipt(frame.id, "bob", "bob-device")).toMatchObject({ hidden: true, deliveryAuthenticated: true });
+  }
+  expect(chat.useChatStore.getState().messages.get("conv")?.map(({ id }) => id)).toEqual([bootstrap.id, next.id]);
+  expect(await database.getMessageById(next.id, "bob")).toMatchObject({ content: next.id });
+  expect(fixtures.post).toHaveBeenCalledWith("/api/messages/ack-delivery", { ids: expect.arrayContaining([text.id, file.id, next.id]) });
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+});
+
+it("waits for the final page before skipping an unavailable sender-key iteration", async () => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution");
+  await groupEnvelope("never-sent", group);
+  const live = { ...await groupEnvelope("after-discard", group), deliveryAck: true as const };
+  fixtures.get.mockResolvedValueOnce({ messages: [distribution, live], hasMore: true }).mockImplementationOnce(async () => {
+    expect(await database.getReceiveReceipt(live.id, "bob", "bob-device")).toBeUndefined();
+    return { messages: [], hasMore: false };
+  });
+  await sync.syncMessages({ force: true });
+  expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: "group plaintext" });
+});
+
+it.each(["direct", "group"] as const)("crosses a permanently missing %s iteration after reconciling socket and forward envelopes", async (kind) => {
+  fixtures.conversationType = kind;
+  const group = kind === "group" ? await generateSenderKey() : undefined;
+  if (group) {
+    await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv",
+      distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  } else await receiveProvenSocket(await direct("bootstrap", "bootstrap", true));
+  const envelope = async (id: string, serverTimestamp: number) => ({
+    ...(group ? await groupEnvelope(id, group) : await direct(id)), serverTimestamp, deliveryAck: true as const,
+  });
+  await envelope("discarded-before-send", 499);
+  const socket = await envelope("socket-after-gap", 500);
+  const retained = { ...await envelope("retained-after-gap", 701), advanceOnly: true as const, deletedAt: Date.now() };
+  const live = await envelope("live-after-gap", 700);
+  await database.saveSyncState("message-sync:bob:bob-device", 600, "already-paged");
+  await expect(receiveProvenSocket(socket)).rejects.toThrow("earlier envelopes");
+  fixtures.get.mockResolvedValueOnce({ messages: [live], hasMore: true }).mockImplementationOnce(async () => {
+    expect(await database.getReceiveReceipt(live.id, "bob", "bob-device")).toBeUndefined();
+    expect(fixtures.post).not.toHaveBeenCalled();
+    return { messages: [retained], hasMore: false };
+  });
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const commit = vi.spyOn(database, "commitReceivedMessage");
+  await sync.syncMessages({ force: true });
+  expect(commit.mock.calls.map(([id]) => id)).toEqual([socket.id, retained.id, live.id]);
+  expect(fixtures.post).toHaveBeenCalledWith("/api/messages/delivery-status", { ids: [live.id, socket.id] });
+  expect(fixtures.post).toHaveBeenCalledWith("/api/messages/ack-delivery", { ids: expect.arrayContaining([socket.id, retained.id, live.id]) });
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+  expect(await database.getMessageById(retained.id, "bob")).toMatchObject({ content: "", deletedAt: retained.deletedAt });
+  expect(decrypt).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(retained.ciphertext));
+  expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: group ? "group plaintext" : live.id });
+});
+
+it("uses key-only chain ranges for repeated gap checks with an unrelated pending backlog", async () => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  const first = await groupEnvelope("unrelated", await generateSenderKey());
+  for (let i = 0; i < 32; i++) {
+    await database.savePendingReceive({ ...first, id: `unrelated-${i}`, senderDeviceId: "other-device" }, "bob", "bob-device", true);
+    originals.set(`unrelated-${i}`, { ...first, id: `unrelated-${i}`, senderDeviceId: "other-device" });
+  }
+  const messages: WSMessageFrame[] = [];
+  for (let i = 0; i < 8; i++) {
+    await groupEnvelope("discarded", group);
+    messages.push({ ...await groupEnvelope(`live-${i}`, group), deliveryAck: true });
+  }
+  const wholeQueue = vi.spyOn(database, "getPendingReceiveEntries");
+  const keyCursor = vi.spyOn(IDBIndex.prototype, "openKeyCursor");
+  fixtures.get.mockResolvedValueOnce({ messages, hasMore: false });
+  await sync.syncMessages({ force: true });
+
+  expect(wholeQueue).toHaveBeenCalledTimes(3);
+  expect(keyCursor).toHaveBeenCalledTimes(messages.length);
+  for (const frame of messages) {
+    expect(await database.getMessageById(frame.id, "bob")).toMatchObject({ content: "group plaintext" });
+  }
+  expect(await database.getPendingReceives("bob", "bob-device")).toHaveLength(32);
+});
+
+it("picks up a lower socket iteration queued during status reconciliation before crossing a gap", async () => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  await groupEnvelope("discarded", group);
+  const lower = { ...await groupEnvelope("lower", group), deliveryAck: true as const };
+  const higher = { ...await groupEnvelope("higher", group), deliveryAck: true as const };
+  const started = deferred(), release = deferred();
+  const asStatus = (frame: WSMessageFrame) => ({ id: frame.id, conversationId: frame.conversationId,
+    senderId: frame.senderId, senderDeviceId: frame.senderDeviceId, expiresAt: frame.expiresAt, deletedAt: null, deletedByUserId: null });
+  fixtures.get.mockResolvedValue({ messages: [], hasMore: false });
+  fixtures.post.mockImplementation(async (path: string, { ids }: { ids: string[] }) => {
+    if (path !== "/api/messages/delivery-status") return;
+    if (ids.length === 1) {
+      started.resolve();
+      await release.promise;
+      return { messages: [asStatus(higher)] };
+    }
+    expect(await database.getReceiveReceipt(higher.id, "bob", "bob-device")).toBeUndefined();
+    return { messages: [asStatus(higher), asStatus(lower)] };
+  });
+  await expect(receiveProvenSocket(higher)).rejects.toThrow("earlier envelopes");
+  const commit = vi.spyOn(database, "commitReceivedMessage");
+  const first = sync.syncMessages({ force: true });
+  await started.promise;
+  await expect(receiveProvenSocket(lower)).rejects.toThrow("earlier envelopes");
+  const followUp = sync.syncMessages({ force: true });
+  release.resolve();
+  await Promise.all([first, followUp]);
+  expect(commit.mock.calls.map(([id]) => id)).toEqual([lower.id, higher.id]);
+  expect(await database.getMessageById(higher.id, "bob")).toMatchObject({ content: "group plaintext" });
+});
+
+it("can cross a known socket iteration that the server reports unavailable", async () => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution");
+  const unavailable = { ...await groupEnvelope("unavailable", group), deliveryAck: true as const };
+  const live = { ...await groupEnvelope("next-live", group), deliveryAck: true as const };
+  await receiveProvenSocket(unavailable);
+  fixtures.get.mockResolvedValueOnce({ messages: [distribution, live], hasMore: false });
+  fixtures.post.mockResolvedValueOnce({ messages: [liveStatus(live)] });
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  await sync.syncMessages({ force: true });
+  expect(fixtures.post).toHaveBeenCalledWith("/api/messages/delivery-status", { ids: [live.id, unavailable.id] });
+  expect(fixtures.post).toHaveBeenCalledWith("/api/messages/ack-delivery", { ids: [live.id] });
+  expect(decrypt).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(unavailable.ciphertext));
+  expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: "group plaintext" });
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+  fixtures.get.mockResolvedValueOnce({ messages: [], hasMore: false });
+  await sync.syncMessages({ force: true });
+  expect(fixtures.post.mock.calls.filter(([path]) => path === "/api/messages/delivery-status")).toHaveLength(1);
+});
+
+it("uses a queued sender-key distribution behind the cursor after its predecessor was discarded", async () => {
+  fixtures.conversationType = "group";
+  await direct("discarded", "discarded", true);
+  const group = await generateSenderKey();
+  const distribution = { ...await direct("late-distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution"), serverTimestamp: 500 };
+  const live = { ...await groupEnvelope("group-live", group), serverTimestamp: 700, deliveryAck: true as const };
+  await database.saveSyncState("message-sync:bob:bob-device", 600, "already-paged");
+  await expect(receiveProvenSocket(distribution)).rejects.toThrow("earlier envelopes");
+  fixtures.get.mockResolvedValueOnce({ messages: [live], hasMore: false });
+  await sync.syncMessages({ force: true });
+  expect(await database.getReceiveReceipt(distribution.id, "bob", "bob-device")).toBeDefined();
+  expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: "group plaintext" });
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+});
+
+function shuffled<T>(values: T[], seed: number): T[] {
+  const result = [...values];
+  for (let i = result.length - 1; i > 0; i--) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    const j = Math.floor(seed / 0x1_0000_0000 * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+}
+
+const receiveSeeds = [1, 7, 19, 42, 81, 203, 512, 2027];
+
+it.each(receiveSeeds.slice(0, 4))("reconciles upgraded v8 queues across shuffled arrivals (seed %i)", async (seed) => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution");
+  const text = { ...await groupEnvelope("queued-text", group), serverTimestamp: 500 };
+  const file = { ...await groupEnvelope("queued-file", group), msgType: "file", serverTimestamp: 501 };
+  const socket = { ...await groupEnvelope("socket-deleted", group), serverTimestamp: 502 };
+  const live = { ...await groupEnvelope("queued-live", group), serverTimestamp: 503 };
+  const next = { ...await groupEnvelope("fresh-live", group), serverTimestamp: 700 };
+  const deletedAt = Date.now();
+  const current = await database.getAppDB();
+  const stores = Array.from(current.objectStoreNames);
+  const tx = current.transaction(stores);
+  const layout = stores.map((name) => {
+    const store = tx.objectStore(name);
+    return { name, keyPath: store.keyPath, indexes: Array.from(store.indexNames)
+      .filter((name) => name !== "byPendingReceiveOrder").map((name) => ({ name, keyPath: store.index(name).keyPath })) };
+  });
+  const deviceKeys = await tx.objectStore("deviceKeys").getAll();
+  vi.stubGlobal("indexedDB", new IDBFactory());
+  try {
+    const old = await openDB("e2ee-chat", 8, { upgrade(db) {
+      for (const { name, keyPath, indexes } of layout) {
+        const store = db.createObjectStore(name, { keyPath });
+        for (const index of indexes) store.createIndex(index.name, index.keyPath);
+      }
+    } });
+    for (const key of deviceKeys) await old.put("deviceKeys", key);
+    for (const frame of shuffled([text, file, live], seed)) {
+      await old.put("accountState", { id: database.receiveKey("pending-receive:", frame.id, "bob", "bob-device"),
+        userId: "bob", deviceId: "bob-device", frame, ...(frame === file && { fromSync: true }) });
+    }
+    old.close();
+    await reload();
+    await database.saveSyncState("message-sync:bob:bob-device", 600, "already-paged");
+    const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+    const commit = vi.spyOn(database, "commitReceivedMessage");
+    for (const frame of shuffled([socket, distribution], seed ^ 0x11)) await sync.ingestMessageFrame(frame);
+    for (const frame of [text, file, socket, live]) expect(await database.getReceiveReceipt(frame.id, "bob", "bob-device")).toBeUndefined();
+    const deleted = [text, file, socket];
+    const queues = [...deleted, live, next];
+    const statusRequests: string[][] = [];
+    fixtures.post.mockImplementation(async (path: string, { ids }: { ids: string[] }) => {
+      expect(path).toBe("/api/messages/delivery-status");
+      statusRequests.push(ids);
+      return { messages: shuffled(queues.filter(({ id }) => ids.includes(id)).map((frame) =>
+        liveStatus(frame, deleted.includes(frame) ? deletedAt : null)), seed ^ 0x37) };
+    });
+    fixtures.get.mockResolvedValueOnce({ messages: [{ ...distribution, serverTimestamp: 650 }], hasMore: true })
+      .mockResolvedValueOnce({ messages: [next], hasMore: false });
+    await sync.syncMessages({ force: true });
+    expect(statusRequests).toHaveLength(1);
+    expect(new Set(statusRequests[0])).toEqual(new Set(queues.map(({ id }) => id)));
+    expect(commit.mock.calls.map(([id]) => id).filter((id) => id !== distribution.id)).toEqual(queues.map(({ id }) => id));
+    const actualDecrypts = decrypt.mock.calls.map(([, , bytes]) => toBase64Url(new Uint8Array(bytes as Uint8Array)));
+    for (const frame of deleted) {
+      expect(actualDecrypts).not.toContain(frame.ciphertext);
+      expect(await database.getMessageById(frame.id, "bob")).toMatchObject({ content: "", deletedAt });
+      expect(await database.getReceiveReceipt(frame.id, "bob", "bob-device")).toMatchObject({ deliveryAuthenticated: true });
+    }
+    for (const frame of [live, next]) {
+      expect(actualDecrypts.filter((bytes) => bytes === frame.ciphertext)).toHaveLength(1);
+      expect(await database.getMessageById(frame.id, "bob")).toMatchObject({ content: "group plaintext" });
+    }
+    expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+    expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toEqual([]);
+  } finally {
+    sync.resetMessageSyncState();
+    (await database.getAppDB()).close();
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  }
+});
+
+it("positively verifies queued live wire IDs on a rollback Worker behind the forward cursor", async () => {
+  await receiveProvenSocket(await direct("bootstrap", "bootstrap", true));
+  const deleted = { ...await direct("deleted", "must not decrypt"), serverTimestamp: 500, deliveryAck: true as const };
+  const live = { ...await direct("live"), serverTimestamp: 501, deliveryAck: true as const };
+  const successor = { ...await direct("successor"), serverTimestamp: 502 };
+  for (const frame of [deleted, live, successor]) await sync.ingestMessageFrame(frame);
+  await database.saveSyncState("message-sync:bob:bob-device", 600, "paged");
+  const deletedAt = Date.now();
+  const tombstone = { ...deleted, ciphertext: "", header: "", iv: "", deletedAt, deletedByUserId: "alice", mutationSeq: 1 };
+  fixtures.get.mockResolvedValueOnce({ messages: [], mutations: [tombstone], hasMore: false, editStream: true });
+  fixtures.post.mockImplementation(async (path: string) => {
+    if (path === "/api/messages/delivery-status") throw Object.assign(new Error("Not Found"), { status: 404 });
+    if (path === "/api/messages/history-ownership?purpose=local") return { ids: [live.id, successor.id] };
+    return {};
+  });
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  await sync.syncMessages({ force: true });
+  expect(fixtures.post).toHaveBeenCalledWith("/api/messages/history-ownership?purpose=local", {
+    messages: [deleted, live, successor].map((frame) => ({ id: frame.id, conversationId: frame.conversationId,
+      senderId: frame.senderId, timestamp: frame.serverTimestamp, type: "text", deletedAt: null })),
+  });
+  expect(decrypt).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(deleted.ciphertext));
+  expect(await database.getMessageById(deleted.id, "bob")).toMatchObject({ content: "", deletedAt });
+  expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: live.id });
+  expect(await database.getMessageById(successor.id, "bob")).toMatchObject({ content: successor.id });
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+});
+
+it.each(receiveSeeds)("converges across randomized receive inputs (seed %i)", async (seed) => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  const now = Date.now();
+  const data = (frame: WSMessageFrame, serverTimestamp: number) => ({ ...frame, serverTimestamp, deliveryAck: true as const });
+  const retained = (frame: WSMessageFrame) => ({ ...frame, deletedAt: now, deletedByUserId: "alice", advanceOnly: true as const });
+  const mutation = (frame: WSMessageFrame, mutationSeq: number) => ({ ...frame, ciphertext: "", header: "", iv: "",
+    advanceOnly: undefined, deliveryAck: undefined, mutationSeq });
+  await direct("discarded-direct", "discarded", true);
+  const distribution = { ...await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution"), serverTimestamp: 500 };
+  const directDeleted = retained(data({ ...await direct("direct-deleted", "deleted direct plaintext", true), conversationId: "other" }, 701));
+  const control = { ...await direct("control", JSON.stringify({ kind: "call_offer", callId: "call", conversationId: "other",
+    initiatorId: "alice", callType: "audio", callKey: testCallKey, createdAt: now, expiresAt: now + 60_000 }), true, "system"),
+    conversationId: "other", serverTimestamp: 702 };
+  const directLive = data({ ...await direct("direct-live", "live direct plaintext", true), conversationId: "other" }, 703);
+  const firstGroup = data(await groupEnvelope("first-group", group), 704);
+  const groupDeleted = retained(data(await groupEnvelope("group-deleted", group), 705));
+  await groupEnvelope("discarded-group", group);
+  const socket = data(await groupEnvelope("socket-deleted", group), 501);
+  const lastGroup = data(await groupEnvelope("last-group", group), 706);
+
+  const pages = shuffled([directDeleted, control, directLive, firstGroup, groupDeleted, lastGroup], seed);
+  const requested = Array.from({ length: pages.length + 1 }, deferred);
+  const sendPage = Array.from({ length: pages.length + 1 }, deferred);
+  let page = 0;
+  fixtures.get.mockImplementation(async (path: string) => {
+    expect(path).toMatch(/^\/api\/messages\/sync\?/);
+    const index = page++;
+    if (index >= sendPage.length) return { messages: [], hasMore: false };
+    requested[index].resolve();
+    await sendPage[index].promise;
+    if (index === pages.length) return { messages: [], hasMore: false };
+    const mutations = index === 0 ? [mutation(directDeleted, 1), mutation(groupDeleted, 2)] : [];
+    return { messages: [pages[index]], mutations, hasMore: true, editStream: true, mutationCursor: 2 };
+  });
+  const acknowledgments = new Set<string>();
+  fixtures.post.mockImplementation(async (path: string, { ids }: { ids: string[] }) => {
+    if (path === "/api/messages/delivery-status") {
+      return { messages: [retained(socket), directLive, firstGroup, lastGroup].filter((frame) => ids.includes(frame.id)).map((frame) => ({
+        id: frame.id, conversationId: frame.conversationId, senderId: frame.senderId, senderDeviceId: frame.senderDeviceId,
+        expiresAt: frame.expiresAt, deletedAt: frame.deletedAt ?? null, deletedByUserId: frame.deletedByUserId ?? null,
+      })) };
+    }
+    expect(path).toBe("/api/messages/ack-delivery");
+    for (const id of ids) {
+      const receipt = await database.getReceiveReceipt(id, "bob", "bob-device");
+      expect(receipt).toMatchObject({ deliveryAuthenticated: true });
+      expect(receipt).not.toHaveProperty("failure");
+      acknowledgments.add(id);
+    }
+  });
+  await database.saveSyncState("message-sync:bob:bob-device", 600, "already-paged");
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const commit = vi.spyOn(database, "commitReceivedMessage");
+  const running = sync.syncMessages({ force: true });
+  try {
+    let nextPage = 0;
+    const socketInputs = [distribution, socket, socket, firstGroup, lastGroup, directLive];
+    for (const input of shuffled([...pages.map(() => null), ...socketInputs], seed ^ 0x51a8)) {
+      if (input) {
+        try { await receiveProvenSocket(input); }
+        catch (error) { expect(error).toHaveProperty("message", expect.stringMatching(/earlier envelopes|distribution has not arrived/)); }
+      } else {
+        sendPage[nextPage++].resolve();
+        await requested[nextPage].promise;
+      }
+    }
+  } finally { sendPage.forEach(({ resolve }) => resolve()); }
+  await running;
+
+  const decrypted = decrypt.mock.calls.map(([, , bytes]) => toBase64Url(new Uint8Array(bytes as Uint8Array)));
+  const live = [directLive, firstGroup, lastGroup];
+  const deleted = [directDeleted, groupDeleted, socket];
+  for (const frame of [...live, control, distribution]) expect(decrypted.filter((value) => value === frame.ciphertext)).toHaveLength(1);
+  for (const frame of deleted) {
+    expect(decrypted).not.toContain(frame.ciphertext);
+    expect(await database.getMessageById(frame.id, "bob")).toMatchObject({ content: "", deletedAt: now });
+  }
+  for (const frame of live) {
+    expect(await database.getMessageById(frame.id, "bob")).toMatchObject({
+      content: frame === directLive ? "live direct plaintext" : "group plaintext", status: "delivered",
+    });
+  }
+  const order = commit.mock.calls.map(([id]) => id);
+  for (const chain of [[distribution, directDeleted, control, directLive], [firstGroup, groupDeleted, socket, lastGroup]]) {
+    const ids = chain.map(({ id }) => id);
+    expect(order.filter((id) => ids.includes(id))).toEqual(ids);
+  }
+  expect(acknowledgments).toEqual(new Set([...live, ...deleted].map(({ id }) => id)));
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+});
+
+it.each(receiveSeeds)("converges with contended receive locks and an off-cursor deletion (seed %i)", async (seed) => {
+  const { withSessionLock } = await import("./receive.js");
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  await groupEnvelope("discarded", group);
+  const data = async (id: string) => ({ ...await groupEnvelope(id, group), deliveryAck: true as const, serverTimestamp: 500 });
+  const lower = await data("socket-lower");
+  const retained = { ...await data("retained-behind"), advanceOnly: true as const, deletedAt: Date.now() };
+  const live = [await data("live-1"), await data("live-2")];
+  const memoryOnly = { id: "failed-before-save", ownerId: "bob", senderId: "bob", conversationId: "other",
+    content: "Failed draft", timestamp: Date.now(), expiresAt: Date.now() + 60_000, expiryKind: "retention", type: "text", status: "failed" } as const;
+  chat.useChatStore.getState().setMessages("other", [memoryOnly]);
+  await database.saveSyncState("message-sync:bob:bob-device", 600, "already-paged");
+
+  const finalPage = deferred(), sendFinalPage = deferred();
+  let page = 0;
+  fixtures.get.mockImplementation(async (path: string) => {
+    const params = new URL(path, "https://test.invalid").searchParams;
+    expect(params.get("since")).toBe("600");
+    if (++page === 1) {
+      expect(params.get("retainedBefore")).toBe("600");
+      expect(params.get("retainedAfter")).toBe("");
+      return { messages: [], hasMore: false, retainedMessages: [retained], retainedCursor: retained.id, hasMoreRetained: true };
+    }
+    if (page === 2) {
+      expect(params.get("retainedAfter")).toBe(retained.id);
+      finalPage.resolve();
+      await sendFinalPage.promise;
+    }
+    return { messages: [], hasMore: false, retainedMessages: [], hasMoreRetained: false };
+  });
+  const ackBatches: string[][] = [];
+  fixtures.post.mockImplementation(async (path: string, { ids }: { ids: string[] }) => {
+    if (path === "/api/messages/delivery-status") {
+      expect(ids).toEqual([lower.id]);
+      return { messages: [{ id: lower.id, conversationId: lower.conversationId, senderId: lower.senderId,
+        senderDeviceId: lower.senderDeviceId, expiresAt: lower.expiresAt, deletedAt: null, deletedByUserId: null }] };
+    }
+    expect(path).toBe("/api/messages/ack-delivery");
+    for (const id of ids) {
+      const receipt = await database.getReceiveReceipt(id, "bob", "bob-device");
+      expect(receipt).toMatchObject({ deliveryAuthenticated: true });
+      expect(receipt).not.toHaveProperty("failure");
+    }
+    ackBatches.push(ids);
+  });
+  const savingLower = deferred(), saveLower = deferred(), tookSnapshot = deferred();
+  const save = database.savePendingReceive;
+  vi.spyOn(database, "savePendingReceive").mockImplementation(async (...args) => {
+    if (args[0].id === lower.id) { savingLower.resolve(); await saveLower.promise; }
+    return save(...args);
+  });
+  const read = database.getPendingReceiveEntries;
+  vi.spyOn(database, "getPendingReceiveEntries").mockImplementation(async (...args) => {
+    const entries = await read(...args);
+    if (page >= 2 && entries.some(({ frame }) => frame.id === retained.id) && !entries.some(({ frame }) => frame.id === lower.id)) {
+      tookSnapshot.resolve();
+    }
+    return entries;
+  });
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const commit = vi.spyOn(database, "commitReceivedMessage");
+  const running = sync.syncMessages({ force: true });
+  await finalPage.promise;
+  expect(await database.getReceiveReceipt(retained.id, "bob", "bob-device")).toBeUndefined();
+  const socketReceive = expect(receiveProvenSocket(lower)).rejects.toThrow("earlier envelopes");
+  await savingLower.promise; // The lower socket frame now owns the peer lock.
+  try {
+    for (const step of shuffled(["clear", "snapshot"], Math.imul(seed, 0x9e3779b1))) {
+      if (step === "clear") {
+        await sync.deleteMessagesForLocalUserOnly("other", { history: new Set([memoryOnly.id]), direct: true }, () => true);
+        expect(chat.useChatStore.getState().messages.get("other")).toEqual([]);
+      } else {
+        sendFinalPage.resolve();
+        await tookSnapshot.promise;
+      }
+    }
+  } finally { sendFinalPage.resolve(); saveLower.resolve(); }
+  await Promise.all([running, socketReceive]);
+  expect(commit.mock.calls.map(([id]) => id)).toEqual([lower.id, retained.id]);
+  expect(await database.getMessageById(retained.id, "bob")).toMatchObject({ content: "", deletedAt: retained.deletedAt });
+  expect(await database.isMessageHidden(memoryOnly.id, "bob")).toBe(true);
+  expect(await database.getSyncState("message-sync:bob:bob-device")).toMatchObject({ value: 600, cursorId: "already-paged" });
+
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const locked = deferred(), releaseLock = deferred();
+  const hold = withSessionLock("alice:alice-device", async () => { locked.resolve(); await releaseLock.promise; });
+  await locked.promise;
+  const requestCount = page;
+  ackBatches.length = 0;
+  const receives = live.map((frame) => receiveProvenSocket(frame));
+  for (const frame of shuffled(live, seed ^ 0x51a8)) receives.push(receiveProvenSocket(frame));
+  expect(await database.getReceiveReceipt(live[0].id, "bob", "bob-device")).toBeUndefined();
+  expect(ackBatches).toEqual([]);
+  releaseLock.resolve();
+  await Promise.all([hold, ...receives]);
+  await vi.advanceTimersByTimeAsync(5_000);
+  await vi.waitFor(() => expect(ackBatches).toEqual([live.map(({ id }) => id)]));
+  expect(page).toBe(requestCount);
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+  const decrypted = decrypt.mock.calls.map(([, , bytes]) => toBase64Url(new Uint8Array(bytes as Uint8Array)));
+  for (const frame of [lower, ...live]) expect(decrypted.filter((value) => value === frame.ciphertext)).toHaveLength(1);
+  expect(decrypted).not.toContain(retained.ciphertext);
+});
+
+it.each([["direct", false], ["group", false], ["direct", true], ["group", true]] as const)(
+  "drains an out-of-order %s socket envelope behind the sync cursor after its predecessor arrives (deleted=%s)", async (kind, deleted) => {
+    fixtures.conversationType = kind;
+    const group = kind === "group" ? await generateSenderKey() : undefined;
+    if (group) {
+      await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv",
+        distribution: createDistribution(group) }), true, "sender_key_distribution"));
+    } else await receiveProvenSocket(await direct("bootstrap", "bootstrap", true));
+    const envelope = async (id: string, serverTimestamp: number) => ({
+      ...(group ? await groupEnvelope(id, group) : await direct(id)), serverTimestamp, deliveryAck: true as const,
+    });
+    const earlier = await envelope("earlier-socket", 500);
+    const later = await envelope("late-commit", 501);
+    const third = await envelope("third-socket", 502);
+    const cursor = "message-sync:bob:bob-device";
+    await database.saveSyncState(cursor, 600, "already-paged");
+    fixtures.get.mockImplementation(async (path: string) => {
+      if (path.startsWith("/api/messages/sync?")) expect(new URL(path, "https://test.invalid").searchParams.get("since")).toBe("600");
+      return { messages: [], hasMore: false };
+    });
+    const deletedAt = deleted ? Date.now() : null;
+    const lookupStarted = deferred(), finishLookup = deferred();
+    fixtures.post.mockImplementation(async (path: string, { ids }: { ids: string[] }) => {
+      if (path !== "/api/messages/delivery-status") return;
+      expect(ids).toEqual([later.id]);
+      lookupStarted.resolve();
+      await finishLookup.promise;
+      return { messages: [{ id: later.id, conversationId: later.conversationId, senderId: later.senderId,
+        senderDeviceId: later.senderDeviceId, deletedAt, deletedByUserId: deleted ? "bob" : null, expiresAt: later.expiresAt }] };
+    });
+    const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+    await expect(receiveProvenSocket(later)).rejects.toThrow("earlier envelopes");
+    const draining = sync.syncMessages({ force: true });
+    try {
+      await lookupStarted.promise;
+      expect(await database.getReceiveReceipt(later.id, "bob", "bob-device")).toBeUndefined();
+      // Both commits are behind the cursor. The predecessor arrives while reconciliation is still draining.
+      await receiveProvenSocket(earlier);
+    } finally { finishLookup.resolve(); }
+    await draining;
+    await vi.waitFor(async () => expect(await database.getReceiveReceipt(later.id, "bob", "bob-device"))
+      .toMatchObject({ deliveryAuthenticated: true }));
+    // Wait for the receive and durable ack to finish before the next ordinary frame.
+    await vi.waitFor(() => expect(fixtures.post.mock.calls.some(([path, body]) =>
+      path === "/api/messages/ack-delivery" && body.ids.includes(later.id))).toBe(true));
+    await receiveProvenSocket(third);
+    const content = (frame: WSMessageFrame) => group ? "group plaintext" : frame.id;
+    expect(await database.getMessageById(earlier.id, "bob")).toMatchObject({ content: content(earlier) });
+    expect(await database.getMessageById(later.id, "bob")).toMatchObject(deleted
+      ? { content: "", deletedAt, deletedByUserId: "bob" } : { content: content(later) });
+    expect(await database.getMessageById(third.id, "bob")).toMatchObject({ content: content(third) });
+    const laterDecrypted = decrypt.mock.calls.some(([, , value]) => toBase64Url(new Uint8Array(value as Uint8Array)) === later.ciphertext);
+    expect(laterDecrypted).toBe(!deleted);
+    expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+  });
+
+it("does not acknowledge an unauthenticated live envelope on first receive or replay", async () => {
+  const broken = { ...await direct("bad-tag", "private text", true), deliveryAck: true as const };
+  const ciphertext = fromBase64Url(broken.ciphertext);
+  ciphertext[ciphertext.length - 1] ^= 1;
+  broken.ciphertext = toBase64Url(ciphertext);
+  fixtures.get.mockResolvedValueOnce({ messages: [broken], hasMore: false });
+  await sync.syncMessages({ force: true });
+  expect(await database.getReceiveReceipt(broken.id, "bob", "bob-device")).toMatchObject({ failure: "terminal_receive_error" });
+  await receiveProvenSocket(broken);
+  expect(await database.getSession("alice:alice-device")).toBeUndefined();
+  expect(fixtures.post).not.toHaveBeenCalled();
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toEqual([]);
+});
+
+it("coalesces forced sync hints and fetches the newer mutation boundary", async () => {
+  const original = await direct("clear-during-sync", "will be cleared", true);
+  await receiveProvenSocket(original);
+  const requested = deferred(), finish = deferred();
+  const deletedAt = Date.now();
+  fixtures.get.mockImplementationOnce(async () => {
+    requested.resolve();
+    await finish.promise;
+    return { messages: [], mutations: [], hasMore: false, editStream: true, mutationCursor: 1 };
+  }).mockResolvedValueOnce({ messages: [], hasMore: false, editStream: true, mutationCursor: 2,
+    mutations: [{ ...original, ciphertext: "", header: "", iv: "", deletedAt, mutationSeq: 2 }] });
+  const stale = sync.syncMessages({ force: true });
+  await requested.promise;
+  const hints = [sync.syncMessages({ force: true }), sync.syncMessages({ force: true })];
+  finish.resolve();
+  await Promise.all([stale, ...hints]);
+  expect(fixtures.get.mock.calls.filter(([path]) => path.startsWith("/api/messages/sync?"))).toHaveLength(2);
+  expect(await database.getMessageById(original.id, "bob")).toMatchObject({ content: "", deletedAt });
+});
+
+it("authenticates an advance-only initial frame and acknowledges it only after committing the ratchet", async () => {
+  const initialFile = await direct("deleted-init", "private bytes that are not an attachment descriptor", true, "file");
+  const tombstone = { ...initialFile, advanceOnly: true as const, deliveryAck: true as const, deletedAt: Date.now() };
+  const abort = crashOnOutput("receiveSessions");
+  await expect(receiveProvenSocket(tombstone, [])).rejects.toThrow();
+  abort.mockRestore();
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toEqual([]);
+  expect(keys.peekOneTimePreKey(1)).toBeDefined();
+  await receiveProvenSocket(tombstone, []);
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toMatchObject([{ messageId: tombstone.id }]);
+  expect(await database.getReceiveReceipt(tombstone.id, "bob", "bob-device")).not.toHaveProperty("failure");
+  expect(await database.getMessageById(tombstone.id, "bob")).toMatchObject({ content: "", deletedAt: tombstone.deletedAt });
+  expect(keys.peekOneTimePreKey(1)).toBeUndefined();
+  await receiveProvenSocket(await direct("later", "Success after deleted bootstrap"));
+  expect(await database.getMessageById("later", "bob")).toMatchObject({ content: "Success after deleted bootstrap" });
+});
+
+it("keeps ratchet state and the pre-key intact when an advance-only bootstrap has a forged tag", async () => {
+  const initialFrame = await direct("forged", "Deleted content", true);
+  const body = fromBase64Url(initialFrame.ciphertext);
+  body[body.length - 1] ^= 1;
+  await receiveProvenSocket({ ...initialFrame, ciphertext: toBase64Url(body),
+    deletedAt: Date.now(), advanceOnly: true, deliveryAck: true }, []);
+  expect(await database.getSession("alice:alice-device")).toBeUndefined();
+  expect(keys.peekOneTimePreKey(1)).toBeDefined();
+  expect(await database.getReceiveReceipt(initialFrame.id, "bob", "bob-device")).toMatchObject({ failure: "terminal_receive_error" });
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toEqual([]);
+});
+
+it("replays a durable delivery acknowledgement after a lost API reply", async () => {
+  const first = await direct("retained", "Deleted", true);
+  fixtures.get.mockResolvedValueOnce({ messages: [{ ...first, deletedAt: Date.now(), advanceOnly: true, deliveryAck: true }], hasMore: false });
+  fixtures.post.mockRejectedValueOnce(new TypeError("Response lost"));
+  await sync.syncMessages({ force: true });
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toMatchObject([{ messageId: first.id }]);
+  await reload();
+  fixtures.get.mockResolvedValueOnce({ messages: [], hasMore: false });
+  await sync.syncMessages({ force: true });
+  expect(fixtures.post.mock.calls).toEqual([
+    ["/api/messages/ack-delivery", { ids: [first.id] }],
+    ["/api/messages/ack-delivery", { ids: [first.id] }],
+  ]);
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toEqual([]);
+});
+
+it("acks a replay of an authenticated receive that did not originally request an ack", async () => {
+  const original = await direct("original-from-old-worker", "already received", true);
+  await receiveProvenSocket(original, []);
+  expect(await database.getReceiveReceipt(original.id, "bob", "bob-device")).toMatchObject({ deliveryAuthenticated: true });
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toEqual([]);
+  const db = await database.getAppDB();
+  for (const id of ["legacy-ambiguous", "failed"]) {
+    await db.put("accountState", { id: database.receiveKey(database.RECEIVED_PREFIX, id, "bob", "bob-device"),
+      ownerId: "bob", deviceId: "bob-device", expiresAt: original.expiresAt,
+      ...(id === "failed" && { failure: "terminal_receive_error" }) });
+  }
+  const deletedAt = Date.now();
+  const replay = { ...original, deletedAt, deliveryAck: true as const, advanceOnly: true as const };
+  fixtures.get.mockResolvedValueOnce({ messages: [replay, { ...replay, id: "legacy-ambiguous" }, { ...replay, id: "failed" }], hasMore: false });
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  await sync.syncMessages({ force: true });
+  expect(fixtures.post).toHaveBeenCalledExactlyOnceWith("/api/messages/ack-delivery", { ids: [original.id] });
+  expect(decrypt).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), fromBase64Url(replay.ciphertext));
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toEqual([]);
+});
+
+it("debounces socket acks, limits each sync batch, and defers retries after a 429", async () => {
+  fixtures.conversationType = "group";
+  const group = await generateSenderKey();
+  await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv",
+    distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  for (let i = 0; i < 3; i++) {
+    await receiveProvenSocket({ ...await groupEnvelope(`socket-${i}`, group), deliveryAck: true });
+    await vi.advanceTimersByTimeAsync(500);
+  }
+  expect(fixtures.post).not.toHaveBeenCalled();
+  const messages: WSMessageFrame[] = [];
+  for (let i = 0; i < MAX_DELIVERY_ACK_IDS; i++) messages.push({ ...await groupEnvelope(`page-${i}`, group), deliveryAck: true });
+  fixtures.get.mockResolvedValue({ messages: [], hasMore: false })
+    .mockResolvedValueOnce({ messages: messages.slice(0, 125), hasMore: true })
+    .mockResolvedValueOnce({ messages: messages.slice(125), hasMore: false });
+  fixtures.post.mockRejectedValueOnce({ status: 429, body: { retryAfterSeconds: 11 } });
+
+  await sync.syncMessages({ force: true });
+  expect(fixtures.post).toHaveBeenCalledTimes(1);
+  const firstBatch = fixtures.post.mock.calls[0][1].ids;
+  expect(firstBatch).toHaveLength(MAX_DELIVERY_ACK_IDS);
+  expect(await database.getDeliveryAcks("bob", "bob-device", 300)).toHaveLength(MAX_DELIVERY_ACK_IDS + 3);
+  await sync.syncMessages({ force: true });
+  await vi.advanceTimersByTimeAsync(10_999);
+  expect(fixtures.post).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  await vi.waitFor(async () => expect(await database.getDeliveryAcks("bob", "bob-device", 300)).toHaveLength(3));
+  expect(fixtures.post.mock.calls).toEqual([
+    ["/api/messages/ack-delivery", { ids: firstBatch }],
+    ["/api/messages/ack-delivery", { ids: firstBatch }],
+  ]);
+  await vi.advanceTimersByTimeAsync(5_000);
+  await vi.waitFor(async () => expect(await database.getDeliveryAcks("bob", "bob-device", 300)).toEqual([]));
+  expect(fixtures.post).toHaveBeenCalledTimes(3);
+  expect(fixtures.post.mock.calls[2]).toEqual(["/api/messages/ack-delivery", { ids: ["socket-0", "socket-1", "socket-2"] }]);
+});
+
+it("flushes a later socket ack when the earlier batch took longer than the batching window", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const first = { ...await direct("first", "first", true), deliveryAck: true as const };
+  const next = { ...await direct("next"), deliveryAck: true as const };
+  const posted = deferred(), finish = deferred();
+  fixtures.post.mockImplementationOnce(async () => {
+    posted.resolve();
+    await finish.promise;
+  });
+  fixtures.get.mockResolvedValue({ messages: [], hasMore: false });
+  await receiveProvenSocket(first);
+  const pass = sync.syncMessages({ force: true });
+  await posted.promise;
+  try {
+    await receiveProvenSocket(next);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fixtures.post).toHaveBeenCalledExactlyOnceWith("/api/messages/ack-delivery", { ids: [first.id] });
+  } finally { finish.resolve(); }
+  await pass;
+  await vi.advanceTimersByTimeAsync(5_000);
+  await vi.waitFor(async () => expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toEqual([]));
+  expect(fixtures.post.mock.calls[1]).toEqual(["/api/messages/ack-delivery", { ids: [next.id] }]);
+});
+
+it("keeps a pending group envelope encrypted across a mutation and consumes it after distribution", async () => {
+  fixtures.conversationType = "group";
+  const senderKey = await generateSenderKey();
+  const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(senderKey) }), true, "sender_key_distribution");
+  const value = await senderKeyEncrypt(senderKey, encode("Pending deleted plaintext"));
+  const live = { ...frame("pending", "text", { ciphertext: toBase64Url(value.ciphertext), iv: toBase64Url(value.iv), header: JSON.stringify(value.header) }), deliveryAck: true as const };
+  await receiveProvenSocket(live, []);
+  const mutation = { ...live, ciphertext: "", iv: "", header: "", deliveryAck: undefined, deletedAt: Date.now() };
+  await receiveProvenSocket(mutation);
+  expect(await database.getPendingReceives("bob", "bob-device")).toMatchObject([{ id: live.id, ciphertext: live.ciphertext }]);
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toEqual([]);
+  await receiveProvenSocket(distribution);
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toMatchObject([{ messageId: live.id }]);
+  expect(await database.getMessageById(live.id, "bob")).toMatchObject({ content: "", deletedAt: mutation.deletedAt });
+});
+
+it("retires an unknown group dispatch when its deletion arrives through mutation sync", async () => {
+  fixtures.conversationType = "group";
+  const id = "unknown-dispatch";
+  const original = { ...frame(id, "text", { ciphertext: "opaque", iv: "iv", header: "{}" }), senderId: "bob", senderDeviceId: "bob-device" };
+  await database.saveMessage({ id, conversationId: "conv", senderId: "bob", type: "text", content: "Old outgoing content",
+    timestamp: original.timestamp, expiresAt: original.expiresAt, status: "failed" }, undefined, "bob");
+  await database.saveOutgoing({ id, conversationId: "conv", conversationType: "group", userId: "bob", deviceId: "bob-device",
+    queuedAt: Date.now(), ttlSeconds: null, status: "failed", retryable: true, nextAttemptAt: null, error: null, attempts: 1,
+    sendDispatched: true, steps: [{ path: "/api/messages/send", body: { ...original, type: "text" } }],
+  });
+  fixtures.get.mockResolvedValueOnce({ messages: [], hasMore: false, editStream: true, mutationCursor: 1,
+    mutations: [{ ...original, ciphertext: "", iv: "", header: "", mutationSeq: 1, deletedAt: Date.now(), deletedByUserId: "alice" }] });
+  const refresh = vi.fn().mockResolvedValue(undefined);
+  const stop = sync.startLocalHiddenMessageSync(refresh);
+  try {
+    await sync.syncMessages({ force: true });
+    expect(await database.getOutgoing(id, "bob")).toBeUndefined();
+    expect(await database.getMessageById(id, "bob")).toMatchObject({ content: "", deletedByUserId: "alice" });
+    expect(refresh.mock.calls).toEqual([[]]);
+  } finally { stop(); }
+});
+
 describe("atomic receive crash recovery", () => {
   it.each(["initial", "normal", "skipped", "group"])("replays a %s message after abort and fresh modules using the same IDB", async (kind) => {
     let envelope: WSMessageFrame;
     if (kind === "group") {
       fixtures.conversationType = "group";
       const group = await generateSenderKey();
-      await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
+      await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
       const encrypted = await senderKeyEncrypt(group, encode("recoverable"));
       envelope = frame("target", "text", { ciphertext: toBase64Url(encrypted.ciphertext), iv: toBase64Url(encrypted.iv), header: JSON.stringify(encrypted.header) });
     } else {
       if (kind !== "initial") {
-        await sync.ingestMessageFrame(await direct("first", "first", true));
+        await receiveProvenSocket(await direct("first", "first", true));
         const { encryptForDevice } = await import("./session-manager.js");
         const reply = await encryptForDevice("alice", "alice-device", encode("reply"));
         await ratchetDecrypt(sender, reply.result.header, reply.result.ciphertext, reply.result.iv);
       }
       envelope = await direct("target", "recoverable", kind === "initial");
-      if (kind === "skipped") await sync.ingestMessageFrame(await direct("later"));
+      if (kind === "skipped") {
+        fixtures.get.mockResolvedValueOnce({ messages: [await direct("later")], hasMore: false });
+        await sync.syncMessages({ force: true });
+      }
     }
     const db = await database.getAppDB();
     const before = { sessions: await db.getAll("receiveSessions"), senderKeys: await db.getAll("receiveSenderKeys") };
     const crash = crashOnOutput();
-    await expect(sync.ingestMessageFrame(envelope)).rejects.toThrow();
+    await expect(receiveProvenSocket(envelope)).rejects.toThrow();
     crash.mockRestore();
     expect(await database.getMessageById("target")).toBeUndefined();
     expect({ sessions: await db.getAll("receiveSessions"), senderKeys: await db.getAll("receiveSenderKeys") }).toEqual(before);
     if (kind === "initial") expect(keys.peekOneTimePreKey(1)).toBeDefined();
     await reload();
-    await sync.ingestMessageFrame(envelope);
+    await receiveProvenSocket(envelope);
     expect(await database.getMessageById("target")).toMatchObject({ content: "recoverable", status: "delivered" });
     const reloaded = await database.getAppDB();
     for (const record of await reloaded.getAll("receiveSessions")) {
@@ -145,16 +1160,16 @@ it.each(["direct", "group"])("skips stored %s messages before crypto and leaves 
   } else {
     fixtures.conversationType = "group";
     const group = await generateSenderKey();
-    await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
+    await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
     const encrypted = await senderKeyEncrypt(group, encode("stored plaintext"));
     envelope = frame("stored", "text", { ciphertext: toBase64Url(encrypted.ciphertext), iv: toBase64Url(encrypted.iv), header: JSON.stringify(encrypted.header) });
   }
-  await sync.ingestMessageFrame(envelope);
+  await receiveProvenSocket(envelope);
   await reload();
   const db = await database.getAppDB();
   const before = { sessions: await db.getAll("receiveSessions"), senderKeys: await db.getAll("receiveSenderKeys") };
   const decrypt = vi.spyOn(crypto.subtle, "decrypt");
-  await sync.ingestMessageFrame(envelope);
+  await receiveProvenSocket(envelope);
   expect(decrypt).not.toHaveBeenCalled();
   expect({ sessions: await db.getAll("receiveSessions"), senderKeys: await db.getAll("receiveSenderKeys") }).toEqual(before);
   expect(await database.getMessageById("stored")).toMatchObject({ content: "stored plaintext" });
@@ -170,7 +1185,7 @@ it.each(["sender_key_distribution", "system", "key_exchange"] as const)("commits
   const envelope = await direct("control", JSON.stringify(payload), true, kind);
   const db = await database.getAppDB();
   const crash = crashOnOutput(kind === "sender_key_distribution" ? "receiveSenderKeys" : kind === "system" ? "receivePendingCalls" : "accountState");
-  await expect(sync.ingestMessageFrame(envelope)).rejects.toThrow();
+  await expect(receiveProvenSocket(envelope)).rejects.toThrow();
   crash.mockRestore();
   expect(await db.getAll("receiveSessions")).toEqual([]);
   expect(await db.getAll("receiveSenderKeys")).toEqual([]);
@@ -178,9 +1193,13 @@ it.each(["sender_key_distribution", "system", "key_exchange"] as const)("commits
   expect(await db.get("accountState", database.receiveKey("received:", "control", "bob", "bob-device"))).toBeUndefined();
   expect(fixtures.markKeyReady).not.toHaveBeenCalled();
   await reload();
-  await sync.ingestMessageFrame(envelope);
+  await receiveProvenSocket(envelope);
   const reopened = await database.getAppDB();
-  expect(await reopened.get("accountState", database.receiveKey("received:", "control", "bob", "bob-device"))).toEqual({ id: database.receiveKey("received:", "control", "bob", "bob-device"), ownerId: "bob", deviceId: "bob-device", expiresAt: envelope.expiresAt, ...(kind === "system" ? { pendingCallId: "call" } : kind === "key_exchange" ? { failure: "terminal_receive_error" } : {}) });
+  expect(await reopened.get("accountState", database.receiveKey("received:", "control", "bob", "bob-device"))).toEqual({
+    id: database.receiveKey("received:", "control", "bob", "bob-device"), ownerId: "bob", deviceId: "bob-device", expiresAt: envelope.expiresAt,
+    ...(kind === "key_exchange" ? { failure: "terminal_receive_error" } : { deliveryAuthenticated: true }),
+    ...(kind === "system" && { pendingCallId: "call" }),
+  });
   expect(await database.getMessageById("control")).toBeUndefined();
   if (kind === "system") {
     expect(await database.getPendingCall("call")).toMatchObject({ callKey: testCallKey });
@@ -189,14 +1208,14 @@ it.each(["sender_key_distribution", "system", "key_exchange"] as const)("commits
   if (kind === "sender_key_distribution") expect(await reopened.getAll("receiveSenderKeys")).toHaveLength(1);
   const before = await reopened.getAll("receiveSessions");
   const decrypt = vi.spyOn(crypto.subtle, "decrypt");
-  await sync.ingestMessageFrame(envelope);
+  await receiveProvenSocket(envelope);
   expect(decrypt).not.toHaveBeenCalled();
   expect(await reopened.getAll("receiveSessions")).toEqual(before);
   expect(chat.useChatStore.getState().messages.size).toBe(0);
 });
 
 it("serializes distinct messages through the commit, with no advanced state visible before it", async () => {
-  await sync.ingestMessageFrame(await direct("initial", "initial", true));
+  await receiveProvenSocket(await direct("initial", "initial", true));
   const first = await direct("first");
   const second = await direct("second");
   const commit = database.commitReceivedMessage;
@@ -209,9 +1228,9 @@ it("serializes distinct messages through the commit, with no advanced state visi
     await gate;
     return commit(...args);
   });
-  const pendingFirst = sync.ingestMessageFrame(first);
+  const pendingFirst = receiveProvenSocket(first);
   await ready;
-  const pendingSecond = sync.ingestMessageFrame(second);
+  const pendingSecond = receiveProvenSocket(second);
   await new Promise((resolve) => setTimeout(resolve, 0));
   expect(committed).toHaveBeenCalledTimes(1);
   expect(await database.getMessageById("first")).toBeUndefined();
@@ -225,7 +1244,7 @@ it("serializes distinct messages through the commit, with no advanced state visi
 
 it.each([true, false])("shows a failed message for an already advanced legacy initial (bootstrap metadata: %s), without rebuilding or rolling back", async (metadata) => {
   const envelope = await direct("lost", "lost plaintext", true);
-  await sync.ingestMessageFrame(envelope);
+  await receiveProvenSocket(envelope);
   const db = await database.getAppDB();
   // Recreate the previous build's split-write crash, retaining its advanced ratchet.
   const session = (await database.getSession("alice:alice-device"))!;
@@ -237,7 +1256,7 @@ it.each([true, false])("shows a failed message for an already advanced legacy in
   const reopened = await database.getAppDB();
   const before = await reopened.getAll("receiveSessions");
   const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  await sync.ingestMessageFrame(envelope);
+  await receiveProvenSocket(envelope);
   expect(await database.getMessageById("lost")).toMatchObject({ status: "failed", content: "" });
   expect(chat.useChatStore.getState().messages.get("conv")).toMatchObject([{ id: "lost", status: "failed" }]);
   expect(await reopened.getAll("receiveSessions")).toEqual(before);
@@ -248,12 +1267,12 @@ it("never resets a sender chain when another distribution for the same key arriv
   fixtures.conversationType = "group";
   const group = await generateSenderKey();
   const payload = JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) });
-  await sync.ingestMessageFrame(await direct("distribution", payload, true, "sender_key_distribution"));
+  await receiveProvenSocket(await direct("distribution", payload, true, "sender_key_distribution"));
   const encrypted = await senderKeyEncrypt(group, encode("group text"));
-  await sync.ingestMessageFrame(frame("group", "text", { ciphertext: toBase64Url(encrypted.ciphertext), iv: toBase64Url(encrypted.iv), header: JSON.stringify(encrypted.header) }));
+  await receiveProvenSocket(frame("group", "text", { ciphertext: toBase64Url(encrypted.ciphertext), iv: toBase64Url(encrypted.iv), header: JSON.stringify(encrypted.header) }));
   const db = await database.getAppDB();
   const before = await db.getAll("receiveSenderKeys");
-  await sync.ingestMessageFrame(await direct("distribution-again", payload, false, "sender_key_distribution"));
+  await receiveProvenSocket(await direct("distribution-again", payload, false, "sender_key_distribution"));
   expect(await db.getAll("receiveSenderKeys")).toEqual(before);
 });
 
@@ -294,7 +1313,7 @@ it.each(["direct", "group"] as const)("pulls a %s edit when the original arrives
   if (kind === "group") {
     fixtures.conversationType = "group";
     const group = await generateSenderKey();
-    await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
+    await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
     original = await groupEnvelope("original", group, editCompanion(key));
   } else {
     original = await direct("original:bob-device", "original", true, "text", editCompanion(key));
@@ -309,7 +1328,7 @@ it.each(["direct", "group"] as const)("pulls a %s edit when the original arrives
   expect(fixtures.post).not.toHaveBeenCalled();
   expect(JSON.stringify(await db.getAll("accountState"))).not.toContain("pending-message-edit:");
   fixtures.post.mockResolvedValueOnce({ edits: [latest] });
-  await sync.ingestMessageFrame({ ...original, latestEditSeq: 2 });
+  await receiveProvenSocket({ ...original, latestEditSeq: 2 });
   await waitForRevision(original.id, "revised 2");
   expect(fixtures.post).toHaveBeenCalledExactlyOnceWith("/api/messages/edits/latest", { ids: ["original"], after: { original: 0 } });
   expect(await database.getMessageById(original.id, "bob", undefined, true)).toMatchObject({
@@ -320,7 +1339,7 @@ it.each(["direct", "group"] as const)("pulls a %s edit when the original arrives
   const ratchet = await database.getSession("alice:alice-device");
   await sync.ingestMessageEdit(await revision(key, 3));
   expect(await database.getSession("alice:alice-device")).toEqual(ratchet);
-  await sync.ingestMessageFrame({ ...await direct("ordinary", "ordinary"), conversationId: "other" });
+  await receiveProvenSocket({ ...await direct("ordinary", "ordinary"), conversationId: "other" });
   expect(await database.getMessageById("ordinary")).toMatchObject({ content: "ordinary" });
 });
 
@@ -329,23 +1348,25 @@ it("pulls a revision queued after a deferred original even when its frame advert
   const group = await generateSenderKey(), key = generateAESKey();
   const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution");
   const original = { ...await groupEnvelope("original", group, editCompanion(key)), latestEditSeq: null };
-  await sync.ingestMessageFrame(original);
+  await receiveProvenSocket(original);
   expect(await database.getMessageById("original")).toBeUndefined();
   const edit = await revision(key, 1);
   fixtures.get.mockResolvedValue({ messages: [], hasMore: false, editStream: true, mutations: [{ edit, mutationSeq: 11 }], mutationCursor: 11 });
   await sync.syncMessages({ force: true });
   expect(await database.getSyncState("message-mutations-edits:bob:bob-device")).toMatchObject({ value: 11 });
-  expect(fixtures.post).not.toHaveBeenCalled();
-  fixtures.post.mockResolvedValueOnce({ edits: [edit] });
-  await sync.ingestMessageFrame(distribution);
+  expect(fixtures.post).toHaveBeenCalledExactlyOnceWith("/api/messages/delivery-status", { ids: [original.id] });
+  fixtures.post.mockClear().mockImplementation(async (path: string) => path === "/api/messages/delivery-status"
+    ? { messages: [liveStatus(original)] } : { edits: [edit] });
+  await receiveProvenSocket(distribution);
+  await sync.syncMessages({ force: true });
   await waitForRevision("original", "revised 1");
-  expect(fixtures.post).toHaveBeenCalledExactlyOnceWith("/api/messages/edits/latest", { ids: ["original"], after: { original: 0 } });
+  expect(fixtures.post).toHaveBeenCalledWith("/api/messages/edits/latest", { ids: ["original"], after: { original: 0 } });
   expect(await database.getMessageById("original")).toMatchObject({ content: "revised 1", editSequence: 1 });
 });
 
 it("ignores an edit on a device with only a legacy original and no edit key", async () => {
   const original = await direct("original", "legacy text", true);
-  await sync.ingestMessageFrame(original);
+  await receiveProvenSocket(original);
   await sync.ingestMessageEdit(await revision(generateAESKey(), 1));
   expect(await database.getMessageById("original")).toMatchObject({ content: "legacy text" });
   expect((await database.getMessageById("original", "bob", undefined, true))?.editKey).toBeUndefined();
@@ -357,7 +1378,7 @@ it("consumes a revision cleanly when a legacy tab committed the keyed original f
   // The legacy client decrypts the same body with the same ratchet and ignores
   // the unknown header field. Replaying that field cannot rewind the ratchet.
   const { editKey, ...legacyHeader } = JSON.parse(original.header);
-  await sync.ingestMessageFrame({ ...original, header: JSON.stringify(legacyHeader) });
+  await receiveProvenSocket({ ...original, header: JSON.stringify(legacyHeader) });
   const before = await database.getSession("alice:alice-device");
   const edit = await revision(key, 1);
   fixtures.get.mockResolvedValue({ messages: [{ ...original, latestEditSeq: 1 }], hasMore: false, editStream: true, mutations: [{ edit, mutationSeq: 11 }], mutationCursor: 11 });
@@ -372,11 +1393,11 @@ it("consumes a revision cleanly when a legacy tab committed the keyed original f
 it.each([false, undefined])("honors a negative key receipt separately from an omitted legacy field (%s)", async (editKeyAccepted) => {
   const key = generateAESKey();
   const original = await direct("original", "rollback text", true, "text", editCompanion(key));
-  await sync.ingestMessageFrame({ ...original, editKeyAccepted });
+  await receiveProvenSocket({ ...original, editKeyAccepted });
   expect((await database.getMessageById(original.id, "bob", undefined, true))?.editKey).toBe(editKeyAccepted === false ? undefined : toBase64Url(key));
 
   // A negative authoritative receipt also supersedes an earlier legacy echo.
-  await sync.ingestMessageFrame({ ...original, editKeyAccepted: false, latestEditSeq: 1 });
+  await receiveProvenSocket({ ...original, editKeyAccepted: false, latestEditSeq: 1 });
   await sync.ingestMessageEdit(await revision(key, 1));
   await sync.reconcileConversationEdits("conv");
   expect(await database.getMessageById(original.id)).toMatchObject({ content: "rollback text" });
@@ -388,7 +1409,7 @@ it.each([false, undefined])("honors a negative key receipt separately from an om
 
 it("forgets cached and in-flight edit credentials while keeping committed text", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original text", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original text", true, "text", editCompanion(key)));
   await sync.ingestMessageEdit(await revision(key, 1, "committed revision"));
   const db = await database.getAppDB();
   const message = (await database.getMessageById("original", "bob", undefined, true))!;
@@ -417,7 +1438,7 @@ it("forgets cached and in-flight edit credentials while keeping committed text",
 
 it("wraps edit keys on receipt and queues only ciphertext while locked across a reload", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   const db = await database.getAppDB();
   const edit = await revision(key, 2, "second encrypted revision");
   const stored = await db.get("accountState", 'message-edit-state:["bob","original"]');
@@ -443,7 +1464,7 @@ it("wraps edit keys on receipt and queues only ciphertext while locked across a 
 
 it("discards an authenticated sticker replacement from the locked edit queue after unlock", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   keys.lockLocalCryptoState();
   const edit = await revision(key, 1, stickerToken("genshin_hoyolab_21"));
   await sync.ingestMessageEdit(edit);
@@ -458,7 +1479,7 @@ it("discards an authenticated sticker replacement from the locked edit queue aft
 
 it.each([true, false])("applies a locked fallback after rejecting a newer unauthentic revision (legacy queue=%s)", async (legacyQueue) => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   keys.lockLocalCryptoState();
   const valid = await revision(key, 1, "valid fallback");
   if (legacyQueue) {
@@ -481,7 +1502,7 @@ it.each([true, false])("preserves a locked edit through offline unlock of its de
   const { prepareRemoteSenderKey } = await import("./group-session.js");
   const senderKey = await prepareRemoteSenderKey("conv", "alice", "alice-device", JSON.stringify(createDistribution(group)));
   const original = await groupEnvelope("original", group, editCompanion(key));
-  await sync.ingestMessageFrame(original);
+  await receiveProvenSocket(original);
   expect(await database.getMessageById(original.id)).toBeUndefined();
 
   // Another tab saves the distribution to the shared database without draining this receive.
@@ -498,6 +1519,11 @@ it.each([true, false])("preserves a locked edit through offline unlock of its de
     await database.saveSenderKey(senderKey);
     await expect(sync.runUnlockSync()).rejects.toThrow("Offline");
   }
+  expect(await database.getMessageById(original.id)).toBeUndefined();
+  expect(await database.lockedEditIds("bob:bob-device")).toHaveLength(1);
+  fixtures.get.mockResolvedValue({ messages: [], hasMore: false });
+  fixtures.post.mockResolvedValue({ messages: [liveStatus(original)], edits: [] });
+  await sync.runUnlockSync();
   expect(await database.getMessageById(original.id)).toMatchObject({ content: "revision available offline", editSequence: 1 });
   expect(await database.lockedEditIds("bob:bob-device")).toEqual([]);
 });
@@ -589,7 +1615,7 @@ it.each([true, false])("reconciles a provisional sender key after a legacy drain
 
 it("migrates plaintext inline and side-record edit keys using the verified password", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   const db = await database.getAppDB();
   const { wrappedKey, ...old } = await db.get("accountState", 'message-edit-state:["bob","original"]');
   await db.put("accountState", { ...old, editKey: toBase64Url(key) });
@@ -612,7 +1638,7 @@ it("migrates plaintext inline and side-record edit keys using the verified passw
 
 it("updates stale in-memory content from newer cached history after unlock", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   const stale = chat.useChatStore.getState().messages;
   const edit = await revision(key, 1);
   await sync.ingestMessageEdit(edit);
@@ -669,7 +1695,7 @@ it.each([true, false])("publishes the committed key eligibility change to an ope
 
 it("clears a discarded pending edit from the same committed revision after unlock", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   await sync.ingestMessageEdit(await revision(key, 1, "committed revision"));
   const original = (await database.getMessageById("original", "bob", undefined, true))!;
   fixtures.auth = { ...fixtures.auth, user: { id: "alice" }, device: { id: "alice-device" } };
@@ -700,7 +1726,7 @@ it("clears a discarded pending edit from the same committed revision after unloc
 it.each(["failed publication", "missed peer hint"])("refreshes a stale visible revision on replay after a %s", async (cause) => {
   const key = generateAESKey();
   const original = await direct("original:bob-device", "original", true, "text", editCompanion(key));
-  await sync.ingestMessageFrame(original);
+  await receiveProvenSocket(original);
   const store = chat.useChatStore;
   const stale = store.getState().messages;
   const edit = await revision(key, 1);
@@ -729,7 +1755,7 @@ it.each(["failed publication", "missed peer hint"])("refreshes a stale visible r
 
 it("refreshes the visible revision if a peer wins the commit after the initial read", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   const apply = database.applyReceivedEdit;
   vi.spyOn(database, "applyReceivedEdit").mockImplementationOnce(async (...args) => {
     expect(await apply(...args)).toMatchObject({ editSequence: 1 });
@@ -739,11 +1765,44 @@ it("refreshes the visible revision if a peer wins the commit after the initial r
   expect(chat.useChatStore.getState().messages.get("conv")?.[0]).toMatchObject({ content: "revised 1", editSequence: 1 });
 });
 
+it.each(["visible", "hidden", "deleted"] as const)("restores only guarded committed output on raw WebSocket replay (%s)", async (state) => {
+  const original = await direct("other-tab:bob-device", "received in another tab", true);
+  const cursor = "message-sync:bob:bob-device";
+  await sync.ingestMessageFrame(original, []);
+  await database.saveSyncState(cursor, original.timestamp, original.id);
+  expect(await database.getReceiveReceipt(original.id, "bob", "bob-device")).toMatchObject({ deliveryAuthenticated: true });
+
+  const store = chat.useChatStore;
+  const stale = store.getState().messages;
+  const deletedAt = Date.now();
+  if (state === "hidden") {
+    await database.hideLocalMessages("conv", ["other-tab"], "bob", "bob-device", () => true);
+  } else if (state === "deleted") {
+    await sync.applyClearHistoryPage("conv", [{ senderId: "alice",
+      event: { ids: [original.id], deletedAt, deletedByUserId: "alice" } }], true);
+  }
+  store.setState({ messages: state === "hidden" ? stale : new Map() });
+
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const commit = vi.spyOn(database, "commitReceivedMessage");
+  await sync.ingestMessageFrame({ ...original, deliveryAck: true });
+  const messages = store.getState().messages.get("conv") ?? [];
+  if (state === "hidden") expect(messages).toEqual([]);
+  else expect(messages).toMatchObject([{ id: "other-tab", content: state === "deleted" ? "" : "received in another tab",
+    ...(state === "deleted" && { deletedAt }) }]);
+  expect(await database.getSyncState(cursor)).toMatchObject({ value: original.timestamp, cursorId: original.id });
+  expect(await database.getDeliveryAcks("bob", "bob-device", 250)).toMatchObject([{ messageId: original.id }]);
+  expect(await database.getPendingReceives("bob", "bob-device")).toEqual([]);
+  expect(decrypt).not.toHaveBeenCalled();
+  expect(commit).not.toHaveBeenCalled();
+  expect(fixtures.get).not.toHaveBeenCalled();
+});
+
 it("chooses the newest visible cached message as preview after an older edit on cold sync", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   const newer = { ...await direct("newest", "newest visible"), timestamp: Date.now() + 100, serverTimestamp: Date.now() + 100 };
-  await sync.ingestMessageFrame(newer);
+  await receiveProvenSocket(newer);
   await saveOwnedMessage({ ...(await database.getMessageById(newer.id))!, id: "expired", timestamp: newer.timestamp + 1, expiresAt: 1, expiryKind: "timed" });
   chat.useChatStore.setState({ messages: new Map() });
   const edit = await revision(key, 1, "revised older");
@@ -757,7 +1816,7 @@ it("chooses the newest visible cached message as preview after an older edit on 
 
 it("keeps an overdue queued timed message as the newest preview after an older edit", async () => {
   const key = generateAESKey(), now = Date.now();
-  await sync.ingestMessageFrame({ ...await direct("original", "original", true, "text", editCompanion(key)), timestamp: now - 120_000 });
+  await receiveProvenSocket({ ...await direct("original", "original", true, "text", editCompanion(key)), timestamp: now - 120_000 });
   await database.saveQueuedMessage({ id: "queued", conversationId: "conv", senderId: "bob", type: "text", content: "timed draft",
     timestamp: now - 90_000, expiresAt: now - 30_000, expiryKind: "timed", status: "failed" }, {
     id: "queued", queuedAt: now - 90_000, conversationId: "conv", conversationType: "direct", userId: "bob", deviceId: "bob-device",
@@ -911,7 +1970,7 @@ it.each([[503, 2_000], [429, 60_000]])("advances ordinary sync while latest-edit
 
 it("ignores an edit grafted onto a different original message family", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   await sync.ingestMessageEdit({ ...await revision(key, 1), senderDeviceId: "other-device" });
   expect(await database.getMessageById("original", "bob", undefined, true)).toMatchObject({ content: "original", editKey: toBase64Url(key) });
 });
@@ -922,10 +1981,10 @@ it.each(["direct", "group"] as const)("checks a %s edit key's signing identity a
   if (kind === "group") {
     fixtures.conversationType = "group";
     const group = await generateSenderKey();
-    await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
-    await sync.ingestMessageFrame(await groupEnvelope("original", group, companion));
+    await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
+    await receiveProvenSocket(await groupEnvelope("original", group, companion));
   } else {
-    await sync.ingestMessageFrame(await direct("original", "original", true, "text", companion));
+    await receiveProvenSocket(await direct("original", "original", true, "text", companion));
   }
   expect(await database.getSession("alice:alice-device")).toMatchObject({ peerIdentityKey: toBase64Url(author.publicEd25519) });
   expect(await database.getMessageById("original")).toMatchObject({ content: kind === "group" ? "group plaintext" : "original" });
@@ -934,7 +1993,7 @@ it.each(["direct", "group"] as const)("checks a %s edit key's signing identity a
 
 it.each(["decryption", "write"] as const)("leaves a per-message edit replayable when keys lock during %s", async (phase) => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   const edit = await revision(key, 1, "revised after unlock");
   fixtures.get.mockResolvedValue({ messages: [], hasMore: false, editStream: true, mutations: [{ edit, mutationSeq: 11 }], mutationCursor: 11 });
   const before = await database.getSession("alice:alice-device");
@@ -990,7 +2049,7 @@ it("pulls again on open if locking interrupted a live pull after the edit cursor
   });
   fixtures.post.mockResolvedValue({ edits: [edit] });
   try {
-    await sync.ingestMessageFrame({ ...original, latestEditSeq: 1 });
+    await receiveProvenSocket({ ...original, latestEditSeq: 1 });
     await locked.promise;
     await vi.waitFor(async () => expect((await editLookupRate())?.lease).toBeUndefined());
   }
@@ -1006,8 +2065,8 @@ it("pulls again on open if locking interrupted a live pull after the edit cursor
 it("reconciles cached group originals on rejoin without rewinding the edit cursor", async () => {
   fixtures.conversationType = "group";
   const group = await generateSenderKey(), key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
-  await sync.ingestMessageFrame(await groupEnvelope("original", group, editCompanion(key)));
+  await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  await receiveProvenSocket(await groupEnvelope("original", group, editCompanion(key)));
   await sync.ingestMessageEdit(await revision(key, 1));
   fixtures.get.mockResolvedValue({ messages: [], hasMore: false, editStream: true, mutations: [], mutationCursor: 12 });
   await sync.syncMessages({ force: true });
@@ -1025,9 +2084,9 @@ it("reconciles cached group originals on rejoin without rewinding the edit curso
 it("queues the newest page on rejoin even when a foreground scan advances the bookmark first", async () => {
   fixtures.conversationType = "group";
   const group = await generateSenderKey(), key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
   const original = { ...await groupEnvelope("original", group, editCompanion(key)), serverTimestamp: 103 };
-  await sync.ingestMessageFrame(original);
+  await receiveProvenSocket(original);
   const tx = (await database.getAppDB()).transaction("displayMessages", "readwrite");
   for (let timestamp = 1; timestamp <= 102; timestamp++) {
     await tx.store.put({ id: `cached-${timestamp}`, ownerId: "bob", conversationId: "conv", senderId: "alice", type: "text", content: "cached text",
@@ -1054,7 +2113,7 @@ it("queues the newest page on rejoin even when a foreground scan advances the bo
 
 it("keeps cached history readable when the rollback Worker has no latest-edit endpoint", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   fixtures.get.mockResolvedValue({ messages: [], hasMore: false });
   fixtures.post.mockRejectedValueOnce(Object.assign(new Error("Not found"), { status: 404 }));
   await sync.syncConversationMessages("conv");
@@ -1071,7 +2130,7 @@ async function rewriteOriginalFromLegacyTab(id: string) {
 
 it("materializes a recovered committed revision when forgetting unlocked edit keys", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   await sync.ingestMessageEdit(await revision(key, 2, "committed revision"));
   await rewriteOriginalFromLegacyTab("original");
   const db = await database.getAppDB();
@@ -1094,8 +2153,8 @@ it("materializes a recovered committed revision when forgetting unlocked edit ke
 it("rechecks a previously current revision after a legacy rewrite during forget recovery", async () => {
   const key = generateAESKey(), otherKey = generateAESKey();
   const otherScope = { ...editScope, messageId: "other" };
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
-  await sync.ingestMessageFrame(await direct("other", "other", false, "text", editCompanion(otherKey, otherScope)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("other", "other", false, "text", editCompanion(otherKey, otherScope)));
   await sync.ingestMessageEdit(await revision(key, 1, "first committed revision"));
   await sync.ingestMessageEdit(await revision(otherKey, 1, "other committed revision", otherScope));
   // Yield to the legacy writer while the reset decrypts another stale row.
@@ -1118,7 +2177,7 @@ it("rechecks a previously current revision after a legacy rewrite during forget 
 
 it("restores the committed revision and key after a legacy tab rewrites a row past the edit cursor", async () => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   const edit = await revision(key, 2);
   fixtures.get.mockResolvedValue({ messages: [], hasMore: false, editStream: true, mutations: [{ edit, mutationSeq: 12 }], mutationCursor: 12 });
   await sync.syncMessages({ force: true });
@@ -1143,7 +2202,7 @@ it("restores the committed revision and key after a legacy tab rewrites a row pa
 
 it.each(["expiry", "permanent hide", "tombstone"])("reconciles orphaned edit state after legacy %s", async (mode) => {
   const key = generateAESKey();
-  await sync.ingestMessageFrame(await direct("original", "original", true, "text", editCompanion(key)));
+  await receiveProvenSocket(await direct("original", "original", true, "text", editCompanion(key)));
   await sync.ingestMessageEdit(await revision(key, 1));
   const db = await database.getAppDB();
   if (mode === "tombstone") {
@@ -1160,7 +2219,7 @@ it.each(["expiry", "permanent hide", "tombstone"])("reconciles orphaned edit sta
 it("applies an accepted edit behind the hide barrier and reveals it on Undo without replay", async () => {
   const key = generateAESKey();
   const original = await direct("original:bob-device", "original", true, "text", editCompanion(key));
-  await sync.ingestMessageFrame(original);
+  await receiveProvenSocket(original);
   await sync.ingestMessageEdit(await revision(key, 1));
   const undo = await sync.hideMessageWithUndo("conv", original.id);
   const edit = await revision(key, 2);
@@ -1177,7 +2236,7 @@ it("applies an accepted edit behind the hide barrier and reveals it on Undo with
 it.each(["hide", "delete", "expire"])("clears the edit key on permanent %s", async (mode) => {
   const key = generateAESKey();
   const original = await direct("original:bob-device", "original", true, "text", editCompanion(key));
-  await sync.ingestMessageFrame(original);
+  await receiveProvenSocket(original);
   await sync.ingestMessageEdit(await revision(key, 1));
   if (mode === "hide") {
     const hide = await database.beginMessageHide(original.id);
@@ -1215,18 +2274,22 @@ describe("receive review regressions", () => {
     let receiveDistribution: Promise<void>;
     let receiveMessage: Promise<void>;
     if (order === "distribution-first") {
-      receiveDistribution = sync.ingestMessageFrame(distribution);
+      receiveDistribution = receiveProvenSocket(distribution);
       await beforeCommit.promise;
-      receiveMessage = sync.ingestMessageFrame(message);
+      receiveMessage = receiveProvenSocket(message);
       await new Promise((resolve) => setTimeout(resolve, 0));
     } else {
-      receiveMessage = sync.ingestMessageFrame(message);
+      receiveMessage = receiveProvenSocket(message);
       await receiveMessage;
-      receiveDistribution = sync.ingestMessageFrame(distribution);
+      receiveDistribution = receiveProvenSocket(distribution);
       await beforeCommit.promise;
     }
     releaseCommit.resolve();
     await Promise.all([receiveDistribution, receiveMessage]);
+    if (order === "message-first") {
+      fixtures.get.mockResolvedValueOnce({ messages: [], hasMore: false });
+      await sync.syncMessages({ force: true });
+    }
     expect(await database.getMessageById("concurrent")).toMatchObject({ content: "group plaintext", status: "delivered" });
     expect(chat.useChatStore.getState().messages.get("conv")).toMatchObject([{ id: "concurrent", status: "delivered" }]);
   });
@@ -1248,7 +2311,7 @@ describe("receive review regressions", () => {
     expect(await database.getSyncState("message-sync:bob:bob-device")).toMatchObject({ cursorId: "later" });
     const before = await db.getAll("receiveSessions");
     const decrypt = vi.spyOn(crypto.subtle, "decrypt");
-    await sync.ingestMessageFrame(malformed);
+    await receiveProvenSocket(malformed);
     expect(decrypt).not.toHaveBeenCalled();
     expect(await db.getAll("receiveSessions")).toEqual(before);
   });
@@ -1258,10 +2321,10 @@ describe("receive review regressions", () => {
     if (kind === "group") {
       fixtures.conversationType = "group";
       const group = await generateSenderKey();
-      await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
+      await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
       envelope = await groupEnvelope("shared", group);
     } else {
-      if (kind === "normal") await sync.ingestMessageFrame(await direct("first", "first", true));
+      if (kind === "normal") await receiveProvenSocket(await direct("first", "first", true));
       const content = kind === "system"
         ? JSON.stringify({ kind: "call_offer", callId: "shared-call", conversationId: "conv", initiatorId: "alice", callType: "audio", callKey: testCallKey, createdAt: Date.now(), expiresAt: Date.now() + 60_000 })
         : "shared plaintext";
@@ -1286,7 +2349,7 @@ describe("receive review regressions", () => {
         started.resolve(); await release.promise; return decrypt(...args);
       });
     }
-    const pendingTab1 = tab1.sync.ingestMessageFrame(envelope);
+    const pendingTab1 = tab1.sync.ingestMessageFrame(envelope, undefined, { source: "socket", liveConfirmed: true });
     await started.promise;
     // A second JS realm/module graph sharing only the same IndexedDB database.
     vi.resetModules();
@@ -1296,7 +2359,7 @@ describe("receive review regressions", () => {
     sync = await import("./message-sync.js");
     chat = await import("../stores/chatStore.js");
     chat.useChatStore.setState({ messages: new Map(), activeConversationId: "conv" });
-    await sync.ingestMessageFrame(envelope);
+    await receiveProvenSocket(envelope);
     const db = await database.getAppDB();
     const before = { sessions: await db.getAll("receiveSessions"), senderKeys: await db.getAll("receiveSenderKeys") };
     const decrypt = vi.spyOn(crypto.subtle, "decrypt");
@@ -1333,7 +2396,9 @@ it("keeps only the encrypted missing-key envelope across reload and drains it wh
   expect(queued.frame).toEqual(message);
   expect(JSON.stringify(queued)).not.toContain("group plaintext");
   await reload();
-  await sync.ingestMessageFrame(distribution);
+  await receiveProvenSocket(distribution);
+  fixtures.get.mockResolvedValue({ messages: [], hasMore: false });
+  await sync.syncMessages({ force: true });
   expect(await database.getMessageById("waiting")).toMatchObject({ content: "group plaintext", status: "delivered" });
   expect(await (await database.getAppDB()).get("accountState", database.receiveKey("pending-receive:", "waiting", "bob", "bob-device"))).toBeUndefined();
 });
@@ -1349,18 +2414,21 @@ it("closes the race where another tab distributes a key between lookup and queui
     await database.saveSenderKey(await prepareRemoteSenderKey("conv", "alice", "alice-device", JSON.stringify(distributed)));
     return queue(...args);
   });
-  await sync.ingestMessageFrame(message);
+  await receiveProvenSocket(message);
   expect(await database.getMessageById("racing")).toMatchObject({ content: "group plaintext", status: "delivered" });
 });
 
-it("drains deferred group envelopes in sender-chain order even if their IDs sort backwards", async () => {
+it("drains deferred legacy group envelopes in sender-chain order even if their IDs sort backwards", async () => {
   fixtures.conversationType = "group";
   const group = await generateSenderKey();
   const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution");
-  const first = await groupEnvelope("z-first", group);
-  const second = await groupEnvelope("a-second", group);
-  await Promise.all([sync.ingestMessageFrame(first), sync.ingestMessageFrame(second)]);
-  await sync.ingestMessageFrame(distribution);
+  const now = Date.now();
+  const first = { ...await groupEnvelope("z-first", group), serverTimestamp: now };
+  const second = { ...await groupEnvelope("a-second", group), serverTimestamp: now };
+  await Promise.all([receiveProvenSocket(first), receiveProvenSocket(second)]);
+  await receiveProvenSocket(distribution);
+  fixtures.get.mockResolvedValueOnce({ messages: [], hasMore: false });
+  await sync.syncMessages({ force: true });
   for (const id of [first.id, second.id]) expect(await database.getMessageById(id)).toMatchObject({ status: "delivered", content: "group plaintext" });
 });
 
@@ -1369,16 +2437,16 @@ it("rolls back a malformed distribution's terminal receipt and ratchet together 
   const malformed = await direct("malformed", "{", true, "sender_key_distribution");
   const db = await database.getAppDB();
   const crash = crashOnOutput("accountState");
-  await expect(sync.ingestMessageFrame(malformed)).rejects.toThrow();
+  await expect(receiveProvenSocket(malformed)).rejects.toThrow();
   crash.mockRestore();
   expect(await db.getAll("receiveSessions")).toEqual([]);
   expect(await db.get("accountState", database.receiveKey("received:", "malformed", "bob", "bob-device"))).toBeUndefined();
   expect(keys.peekOneTimePreKey(1)).toBeDefined();
   await reload();
-  await sync.ingestMessageFrame(malformed);
+  await receiveProvenSocket(malformed);
   expect(await (await database.getAppDB()).get("accountState", database.receiveKey("received:", "malformed", "bob", "bob-device"))).toMatchObject({ failure: "invalid_sender_key_distribution" });
   const later = { ...await direct("after-malformed", "after malformed"), conversationId: "other" };
-  await sync.ingestMessageFrame(later);
+  await receiveProvenSocket(later);
   expect(await database.getMessageById(later.id)).toMatchObject({ status: "delivered", content: "after malformed" });
 });
 
@@ -1388,11 +2456,11 @@ it("does not classify output-preparation errors as malformed input or consume th
   const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution");
   const groupSession = await import("./group-session.js");
   vi.spyOn(groupSession, "prepareRemoteSenderKey").mockRejectedValueOnce(new DOMException("Storage unavailable", "AbortError"));
-  await expect(sync.ingestMessageFrame(distribution)).rejects.toThrow("Storage unavailable");
+  await expect(receiveProvenSocket(distribution)).rejects.toThrow("Storage unavailable");
   const db = await database.getAppDB();
   expect(await db.getAll("receiveSessions")).toEqual([]);
   expect(await db.get("accountState", database.receiveKey("received:", "distribution", "bob", "bob-device"))).toBeUndefined();
-  await sync.ingestMessageFrame(distribution);
+  await receiveProvenSocket(distribution);
   expect(await db.getAll("receiveSenderKeys")).toHaveLength(1);
 });
 
@@ -1403,12 +2471,12 @@ describe("structural receive classification", () => {
     "call-missing-id", "call-bad-key", "call-bad-time", "unknown-control", "unknown-message", "unknown-key-exchange",
     "conversation-403", "conversation-404", "bad-distribution", "authentication", "data-error", "bad-file",
   ])("retires %s and delivers other conversations and the peer's next message", async (kind) => {
-    await sync.ingestMessageFrame(await direct("bootstrap", "bootstrap", true));
+    await receiveProvenSocket(await direct("bootstrap", "bootstrap", true));
     let poison: WSMessageFrame;
     if (kind.startsWith("group-")) {
       fixtures.conversationType = "group";
       const group = await generateSenderKey();
-      await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), false, "sender_key_distribution"));
+      await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), false, "sender_key_distribution"));
       poison = await groupEnvelope("poison", group);
       const header = JSON.parse(poison.header);
       if (kind === "group-missing-id") delete header.senderKeyId;
@@ -1448,6 +2516,7 @@ describe("structural receive classification", () => {
       }
     }
     const valid = { ...await direct("valid", "other conversation"), conversationId: "other" };
+    originals.set(valid.id, valid);
     fixtures.get.mockImplementation(async (path: string) => {
       if (path.startsWith("/api/conversations/")) throw fixtures.metadataErrors.conv;
       return { messages: [poison, valid], hasMore: false };
@@ -1461,7 +2530,7 @@ describe("structural receive classification", () => {
     expect(receipt?.failure || failed?.status === "failed").toBeTruthy();
     expect(await (await database.getAppDB()).getAll("receivePendingCalls")).toEqual([]);
     const next = { ...await direct("next-peer", "peer still decrypts"), conversationId: "other" };
-    await sync.ingestMessageFrame(next);
+    await receiveProvenSocket(next);
     expect(await database.getMessageById(next.id)).toMatchObject({ content: "peer still decrypts", status: "delivered" });
     log.mockRestore();
   });
@@ -1470,7 +2539,7 @@ describe("structural receive classification", () => {
     fixtures.conversationType = "group";
     const group = await generateSenderKey();
     const waiting = await groupEnvelope("waiting", group);
-    await sync.ingestMessageFrame(waiting);
+    await receiveProvenSocket(waiting);
     fixtures.metadataErrors.conv = status ? Object.assign(new Error("Metadata unavailable"), { status }) : new TypeError("Failed to fetch");
     sync.resetMessageSyncState();
     const valid = { ...await direct("valid", "fresh message", true), conversationId: "other" };
@@ -1492,19 +2561,21 @@ describe("structural receive classification", () => {
     const distribution = await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution");
     const first = await groupEnvelope("index-0", group);
     const newer = await groupEnvelope("index-1", group);
-    await sync.ingestMessageFrame(first);
+    await receiveProvenSocket(first);
     const started = deferred();
     const release = deferred();
     const getPending = database.getPendingReceives;
     vi.spyOn(database, "getPendingReceives").mockImplementationOnce(async (...args) => {
       const records = await getPending(...args); started.resolve(); await release.promise; return records;
     });
-    const distributing = sync.ingestMessageFrame(distribution);
+    const distributing = receiveProvenSocket(distribution);
     await started.promise;
     const live = sync.ingestMessageFrame(newer);
     await new Promise((resolve) => setTimeout(resolve, 0));
     release.resolve();
     await Promise.all([distributing, live]);
+    fixtures.get.mockResolvedValueOnce({ messages: [], hasMore: false });
+    await sync.syncMessages({ force: true });
     for (const id of [first.id, newer.id]) expect(await database.getMessageById(id)).toMatchObject({ content: "group plaintext", status: "delivered" });
   });
 });
@@ -1525,23 +2596,23 @@ it("retries locked keys without recording a terminal frame or advancing the curs
 it("retries a pre-key IndexedDB read abort without retiring the authenticated initial envelope", async () => {
   const message = await direct("read-abort", "retry the read", true);
   vi.spyOn(keys, "findOneTimePreKey").mockRejectedValueOnce(new DOMException("Pre-key read aborted", "AbortError"));
-  await expect(sync.ingestMessageFrame(message)).rejects.toMatchObject({ name: "AbortError" });
+  await expect(receiveProvenSocket(message)).rejects.toMatchObject({ name: "AbortError" });
   expect(await database.getMessageById(message.id)).toBeUndefined();
   expect(await database.getReceiveReceipt(message.id, "bob", "bob-device")).toBeUndefined();
   expect(await database.getSession("alice:alice-device")).toBeUndefined();
-  await sync.ingestMessageFrame(message);
+  await receiveProvenSocket(message);
   expect(await database.getMessageById(message.id)).toMatchObject({ content: "retry the read", status: "delivered" });
 });
 
 it("atomically retires an authenticated malformed initial call offer and consumes its pre-key", async () => {
   const poison = await direct("bad-call", JSON.stringify({ kind: "call_offer" }), true, "system");
-  await sync.ingestMessageFrame(poison);
+  await receiveProvenSocket(poison);
   expect(await database.getReceiveReceipt(poison.id, "bob", "bob-device")).toMatchObject({ failure: "terminal_receive_error" });
   expect(await (await database.getAppDB()).getAll("receivePendingCalls")).toEqual([]);
   expect(keys.peekOneTimePreKey(1)).toBeUndefined();
   await reload();
   const next = await direct("after-call", "after malformed call");
-  await sync.ingestMessageFrame(next);
+  await receiveProvenSocket(next);
   expect(await database.getMessageById(next.id)).toMatchObject({ content: "after malformed call", status: "delivered" });
 });
 
@@ -1598,7 +2669,7 @@ describe("receive expiry and HTTP retries", () => {
     const started = deferred(), release = deferred();
     fixtures.get.mockImplementation(async () => { started.resolve(); await release.promise; throw fixtures.metadataErrors.conv; });
     const before = await storedRows();
-    const pending = sync.ingestMessageFrame(message);
+    const pending = receiveProvenSocket(message);
     await started.promise;
     if (change === "sign-out") fixtures.auth = { ...fixtures.auth, user: null, sessionId: null };
     if (change === "other-user") fixtures.auth = { ...fixtures.auth, user: { id: "another-user" } };
@@ -1610,7 +2681,7 @@ describe("receive expiry and HTTP retries", () => {
     expect(await storedRows()).toEqual(before);
     await signInAgain();
     fixtures.get.mockResolvedValue({ id: "conv", type: "direct" });
-    await sync.ingestMessageFrame(message);
+    await receiveProvenSocket(message);
     expect(await database.getMessageById(message.id)).toMatchObject({ content: "still recoverable", status: "delivered" });
   });
 
@@ -1623,7 +2694,7 @@ describe("receive expiry and HTTP retries", () => {
     const started = deferred(), release = deferred();
     fixtures.get.mockImplementation(async () => { started.resolve(); await release.promise; throw fixtures.metadataErrors.conv; });
     const before = await storedRows();
-    const pending = sync.ingestMessageFrame(message);
+    const pending = receiveProvenSocket(message);
     await started.promise;
     fixtures.auth = { ...fixtures.auth, user: null, sessionId: null };
     keys.lockLocalCryptoState();
@@ -1632,7 +2703,7 @@ describe("receive expiry and HTTP retries", () => {
     expect(await storedRows()).toEqual(before);
     await signInAgain();
     fixtures.get.mockResolvedValue({ id: "conv", type: "direct" });
-    await sync.ingestMessageFrame(message);
+    await receiveProvenSocket(message);
     expect(await database.getReceiveReceipt(message.id, "bob", "bob-device")).not.toHaveProperty("failure");
     expect(await database.getSession("alice:alice-device")).toBeDefined();
     const db = await database.getAppDB();
@@ -1647,7 +2718,7 @@ describe("receive expiry and HTTP retries", () => {
     } else {
       fixtures.conversationType = "group";
       const group = await generateSenderKey();
-      await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
+      await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
       const encrypted = await senderKeyEncrypt(group, encode("{"));
       message = frame("authenticated-control", "system", { ciphertext: toBase64Url(encrypted.ciphertext), iv: toBase64Url(encrypted.iv), header: JSON.stringify(encrypted.header) });
     }
@@ -1658,7 +2729,7 @@ describe("receive expiry and HTTP retries", () => {
       // Successful authentication/decryption has already produced plaintext and advanced state.
       started.resolve(); await release.promise; return finish(...args);
     });
-    const pending = sync.ingestMessageFrame(message);
+    const pending = receiveProvenSocket(message);
     await started.promise;
     fixtures.auth = { ...fixtures.auth, user: null, sessionId: null };
     keys.lockLocalCryptoState();
@@ -1679,7 +2750,7 @@ it("queues 80 missing-key frames with linear writes and no backlog scans", async
   const save = vi.spyOn(database, "savePendingReceive");
   const backlog = vi.spyOn(database, "getPendingReceives");
   for (let index = 0; index < count; index++) {
-    await sync.ingestMessageFrame(await groupEnvelope(`queued-${index}`, group));
+    await receiveProvenSocket(await groupEnvelope(`queued-${index}`, group));
   }
   expect(save).toHaveBeenCalledTimes(count);
   expect(backlog).not.toHaveBeenCalled();
@@ -1693,7 +2764,7 @@ it("queues 80 missing-key frames with linear writes and no backlog scans", async
 it.each([false, true])("authenticates a live group receive despite a foreign cached row (imported=%s)", async (imported) => {
   fixtures.conversationType = "group";
   const group = await generateSenderKey();
-  await sync.ingestMessageFrame(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
+  await receiveProvenSocket(await direct("distribution", JSON.stringify({ conversationId: "conv", distribution: createDistribution(group) }), true, "sender_key_distribution"));
   const incoming = await groupEnvelope("shared-wire", group);
   await (await database.getAppDB()).put("displayMessages", {
     id: incoming.id, ownerId: "carol", conversationId: incoming.conversationId, senderId: incoming.senderId,
@@ -1701,7 +2772,7 @@ it.each([false, true])("authenticates a live group receive despite a foreign cac
     ...(imported ? { importedAt: Date.now() } : {}),
   });
   expect(await database.hasReceivedMessage(incoming.id, "bob", "bob-device")).toBe(false);
-  await sync.ingestMessageFrame(incoming);
+  await receiveProvenSocket(incoming);
   const bob = await database.getMessageById(incoming.id, "bob");
   expect(bob).toMatchObject({ ownerId: "bob", content: "group plaintext", wireId: incoming.id });
   expect(bob?.id).toBe(incoming.id);

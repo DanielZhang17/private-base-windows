@@ -1,6 +1,7 @@
 import { api } from "./api.js";
 import { resolveApiUrl } from "./api-url.js";
 import { useAuthStore } from "../stores/authStore.js";
+import { supportsE2EECalling } from "../platform/calls.js";
 import { isNative } from "../platform/environment.js";
 import { pushSessionIdentity as sessionIdentity } from "./push-session.js";
 
@@ -63,6 +64,18 @@ export async function webPushEnabled(): Promise<boolean> {
   const subscription = await registration?.pushManager.getSubscription();
   return matchesOwner(await readOwner(), currentPushSession(), subscription?.endpoint);
 }
+export function advertiseGroupCallPush(): Promise<void> {
+  if (!supportsWebPush() || !supportsE2EECalling()) return Promise.resolve();
+  const session = currentPushSession();
+  return serialize(async () => {
+    const registration = await navigator.serviceWorker.getRegistration("/");
+    const subscription = await registration?.pushManager.getSubscription();
+    if (!subscription || !matchesOwner(await readOwner(), currentPushSession(), subscription.endpoint)
+      || currentPushSession()?.loginIdentity !== session?.loginIdentity) return;
+    await registration?.update().catch(() => undefined);
+    await api.post("/api/push/group-call-capability", { endpoint: subscription.endpoint });
+  });
+}
 export function enableWebPush(): Promise<void> {
   if (!supportsWebPush()) return Promise.reject(new Error("Push unavailable"));
   const auth = useAuthStore.getState();
@@ -102,6 +115,7 @@ export function enableWebPush(): Promise<void> {
         if (!current()) return;
         await api.post("/api/push/subscribe", subscription.toJSON());
         if (current()) await setDeliveryEnabled(true);
+        if (current() && supportsE2EECalling()) void advertiseGroupCallPush().catch(() => undefined);
       } catch (error) {
         // A different tab may have replaced the subscription while the API request was pending.
         const live = await registration.pushManager.getSubscription();

@@ -1,18 +1,18 @@
-import { UnlockOffer } from "../auth/UnlockOffer.js";
 import { NewDeviceAlerts } from "../devices/NewDeviceAlert.js";
 import { t, useLocale } from "../../i18n/index.js";
-import { useEffect, type ReactNode } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useEffect, useMemo, type ReactNode } from "react";
+import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { useAuthStore } from "../../stores/authStore.js";
 import { api } from "../../services/api.js";
 import { showWebPushSettings } from "../../services/web-push.js";
 import { capabilities } from "../../platform/capabilities.js";
-import { TRANSFER_PATH, TRANSFER_SETUP_PATH, useTransferBanner } from "../transfer/HistoryTransferScreens.js";
+import { useTransferBanner } from "../transfer/HistoryTransferScreens.js";
 import { resolveAvatarImageUrl } from "./avatar.js";
-import { AppShell, Avatar, BottomBar, EmptyState, Icon, ListItem, NavItem, NavRail, TopBar, ToastProvider, Button } from "../../ui/index.js";
+import { AppShell, Avatar, BottomBar, EmptyState, Icon, ListItem, NavItem, NavRail, TopBar, ToastProvider, Button, useToast } from "../../ui/index.js";
 
 import { SETTINGS_SECTIONS, type SettingsSection } from "./sections.js";
+import { captureToggleGated, createSecretTapCounter, unlockCaptureToggle, useCaptureToggleUnlocked } from "./hiddenOptions.js";
 export { SETTINGS_SECTIONS } from "./sections.js";
 
 export function SettingsFrame({ section, detail, detailActive = true, title, onSignOut, detailOwnsHeading = false }: {
@@ -20,8 +20,6 @@ export function SettingsFrame({ section, detail, detailActive = true, title, onS
 }) {
   const { locale } = useLocale();
   const navigate = useNavigate();
-  const { pathname } = useLocation();
-  const onTransferScreen = pathname === TRANSFER_PATH || pathname === TRANSFER_SETUP_PATH;
   const transferBanner = useTransferBanner();
   const user = useAuthStore((state) => state.user);
   const { data: devices } = useQuery({ queryKey: ["myDevices"], queryFn: () => api.get<unknown[]>("/api/devices") });
@@ -43,10 +41,7 @@ export function SettingsFrame({ section, detail, detailActive = true, title, onS
     <AppShell
       banner={<>
         {transferBanner}
-        {user && <>
-          {section !== "devices" && <NewDeviceAlerts filter={section === "privacy" ? alert => alert.kind !== "approval_disabled" : undefined} />}
-          {!onTransferScreen && <UnlockOffer />}
-        </>}
+        {user && section !== "devices" && <NewDeviceAlerts filter={section === "privacy" ? alert => alert.kind !== "approval_disabled" : undefined} />}
       </>}
 
       rail={<NavRail footer={<Avatar
@@ -99,7 +94,7 @@ export function SettingsFrame({ section, detail, detailActive = true, title, onS
             onClick={onSignOut}
           >{t("signOut")}</Button>}
 
-          <p className="px-3 pt-8 text-xs text-ink-subtle">Private Base</p>
+          <SettingsBrandFooter />
 
         </div>
       </>}
@@ -115,4 +110,23 @@ export function SettingsFrame({ section, detail, detailActive = true, title, onS
 
     />
   </ToastProvider>;
+}
+
+/** "Private Base" footer. On Android, seven quick taps reveal the hidden screenshot switch in Privacy. */
+function SettingsBrandFooter() {
+  const toast = useToast();
+  const unlocked = useCaptureToggleUnlocked();
+  const tap = useMemo(() => createSecretTapCounter(() => {
+    unlockCaptureToggle();
+    toast.show({ tone: "success", message: t("captureToggleUnlocked") });
+  }), [toast]);
+  if (!captureToggleGated() || unlocked) return <p className="px-3 pt-8 text-xs text-ink-subtle">Private Base</p>;
+  // Looks and reads like the plain label (no button role: an easter-egg gesture, not a feature), but it is focusable
+  // so keyboard users can reveal the switch too: Enter or Space counts as a tap.
+  return <p className="px-3 pt-8 text-xs text-ink-subtle"><span tabIndex={0} className="select-none rounded-sm" onClick={tap}
+    onKeyDown={(event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      if (!event.repeat) tap();
+    }}>Private Base</span></p>;
 }

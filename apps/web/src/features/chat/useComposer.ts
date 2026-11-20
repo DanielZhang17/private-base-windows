@@ -103,6 +103,13 @@ export function useComposer({ onSend, onSendFile, disabled, dropTarget, editing,
   useEffect(() => () => activeCompression.current?.abort(), []);
 
   useLayoutEffect(() => {
+    if (!disabled || !activeCompression.current) return;
+    activeCompression.current.abort();
+    activeCompression.current = null;
+    setCompressing(false);
+  }, [disabled]);
+
+  useLayoutEffect(() => {
     setPickerEditingId(null);
     if (!editing) return;
     setEditDraft(editDraftFromWire(editing.content));

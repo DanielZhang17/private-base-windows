@@ -12,11 +12,14 @@ let container: HTMLDivElement;
 const restore = vi.fn();
 const end = vi.fn();
 const mute = vi.fn();
+const cameraOff = vi.fn();
+const stopSharing = vi.fn();
 const remote = new EventTarget() as MediaStream;
 let play: ReturnType<typeof vi.spyOn>;
 const state = () => ({ callType: "audio", conversationName: "Chat alias", callerAvatarUrl: "/caller.png", peerName: "Mara", peerAvatarUrl: null, isGroupCall: false, callDuration: 192,
   formatDuration: () => "03:12", remoteEntries: [["remote", remote]], isMuted: false,
-  restoreCall: restore, handleEnd: end, toggleMute: mute });
+  isVideoOff: false, isSharingScreen: false, restoreCall: restore, handleEnd: end, toggleMute: mute,
+  handleToggleVideo: cameraOff, toggleScreenShare: stopSharing });
 const render = () => act(async () => root.render(<CallPlaybackProvider><CallBubble /></CallPlaybackProvider>));
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -59,7 +62,6 @@ it("offers independent mute and end controls with accessible state", async () =>
   expect(end).toHaveBeenCalledOnce();
   expect(restore).not.toHaveBeenCalled();
 });
-
 
 it("attaches and plays a remote stream that arrives after the video bubble mounts", async () => {
   vi.mocked(useCall).mockReturnValue({ ...state(), callType: "video", remoteEntries: [] } as never);
@@ -107,17 +109,19 @@ it("wraps 44px actions in a zoomed bubble with End call before recovery and mute
   // jsdom does not calculate layout. These bounds represent the 4× visual viewport minus the 16px gutters.
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(new DOMRect(16, 16, 58, 128));
   play.mockRejectedValueOnce(new DOMException("Gesture required", "NotAllowedError"));
-  vi.mocked(useCall).mockReturnValue({ ...state(), callType: "video" } as never);
+  vi.mocked(useCall).mockReturnValue({ ...state(), callType: "video", isSharingScreen: true, videoBusy: true } as never);
   await render();
 
   const actions = container.querySelector<HTMLElement>(".call-bubble-actions")!;
   const endCall = getByRole(actions, "button", { name: "End call" });
   const recovery = getByRole(actions, "button", { name: "Tap to play" });
   const microphone = getByRole(actions, "button", { name: "Mute microphone" });
+  const turnOffCamera = getByRole(actions, "button", { name: "Turn off camera" });
+  const stopDisplay = getByRole(actions, "button", { name: "Stop sharing screen" });
   expect(actions.closest(".call-bubble")?.parentElement?.style.width).toBe("58px");
-  expect([...actions.children]).toEqual([endCall, recovery, microphone]);
+  expect([...actions.children]).toEqual([endCall, recovery, microphone, turnOffCamera, stopDisplay]);
   expect([...actions.classList]).toEqual(expect.arrayContaining(["flex-wrap", "content-start", "overflow-y-auto", "gap-2", "p-1"]));
-  for (const button of [endCall, recovery, microphone]) {
+  for (const button of [endCall, recovery, microphone, turnOffCamera, stopDisplay]) {
     expect(button.tabIndex).toBe(0);
     expect(button.classList.contains("size-11")).toBe(true);
   }
@@ -125,5 +129,9 @@ it("wraps 44px actions in a zoomed bubble with End call before recovery and mute
   expect(end).toHaveBeenCalledOnce();
   await act(async () => recovery.click());
   expect(play).toHaveBeenCalledTimes(2);
+  await act(async () => turnOffCamera.click());
+  await act(async () => stopDisplay.click());
+  expect(cameraOff).toHaveBeenCalledOnce();
+  expect(stopSharing).toHaveBeenCalledOnce();
   expect(restore).not.toHaveBeenCalled();
 });

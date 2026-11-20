@@ -8,12 +8,14 @@ import { decryptData, encryptData, localEncryptionKey, openAttachmentBytes, seal
 import { isSticker } from "../lib/stickers.js";
 import { normalizeExpiryMetadata } from "../lib/message-retention.js";
 import { messageVisibleToAccount } from "../lib/message-account.js";
+import type { ReceiveGap } from "../lib/receive.js";
 
 import { getConversationHideGeneration, publishLocalMessageChange } from "../lib/local-message-changes.js";
 
 const DB_NAME = "e2ee-chat";
-const DB_VERSION = 8;
+const DB_VERSION = 9;
 const OUTGOING_REVISION_INDEX = "byOutgoingRevision";
+const PENDING_RECEIVE_ORDER_INDEX = "byPendingReceiveOrder";
 const RENAMED_STORES = {
   sessions: "receiveSessions", localKeys: "deviceKeys", conversations: "accountConversations",
   senderKeys: "receiveSenderKeys", fileCache: "accountFiles", pendingCalls: "receivePendingCalls",
@@ -66,6 +68,7 @@ function outgoingId(outgoing: Pick<LocalOutgoing, "id" | "userId" | "editTargetI
 }
 
 type OutgoingStore = IDBPObjectStore<unknown, string[], "accountState", "readwrite" | "versionchange">;
+type OutgoingReader = IDBPObjectStore<unknown, string[], "accountState", "readonly" | "readwrite" | "versionchange">;
 type OutgoingSendState = "queued" | "failed" | "uploading" | "dispatching" | "delivery-unknown" | "discarded";
 type OutgoingLifecycle = { state: OutgoingSendState; conversationId: string; deviceId: string; revision?: string };
 const outgoingLifecycleKey = (key: string) => `outgoing-state:${key}`;
@@ -91,7 +94,7 @@ async function readOutgoingLifecycle(store: OutgoingStore, key: string, row?: Lo
   return reAdopt && !mayHaveBeenDelivered(persisted.state) ? persisted : { ...persisted, state: "delivery-unknown" };
 }
 
-async function readQueuedDiscardLifecycle(store: OutgoingStore, key: string): Promise<OutgoingLifecycle | "unverified" | undefined> {
+async function readQueuedDiscardLifecycle(store: OutgoingReader, key: string): Promise<OutgoingLifecycle | "unverified" | undefined> {
   if (await store.getKey(key) === undefined) return;
   const saved = await store.get(outgoingLifecycleKey(key)) as OutgoingLifecycle | undefined;
   if (!saved) {
@@ -105,6 +108,10 @@ async function readQueuedDiscardLifecycle(store: OutgoingStore, key: string): Pr
 
 async function deleteOutgoingRecord(store: OutgoingStore, key: string) {
   await Promise.all([store.delete(key), store.delete(outgoingLifecycleKey(key))]);
+}
+
+async function discardOutgoingRecord(store: OutgoingStore, key: string, lifecycle: OutgoingLifecycle) {
+  await Promise.all([store.put({ id: outgoingLifecycleKey(key), ...lifecycle, state: "discarded" }), store.delete(key)]);
 }
 type SyncStateReader = { get(key: string): Promise<unknown> };
 type OutgoingEditTarget = Pick<LocalOutgoing, "id" | "conversationId" | "userId">;
@@ -562,10 +569,11 @@ export function getAppDB() {
       upgrade(db, oldVersion, _newVersion, tx) {
         void tx.done.catch(() => undefined);
         const names = Array.from(db.objectStoreNames);
-        const canonical = (oldVersion === 6 || oldVersion === 7) && CANONICAL_STORES.every((name) => names.includes(name))
+        const canonical = oldVersion >= 6 && CANONICAL_STORES.every((name) => names.includes(name))
           && names.length === CANONICAL_STORES.length
           && hasCanonicalDisplaySchema(tx.objectStore("displayMessages"))
-          && (oldVersion !== 7 || tx.objectStore("legacyMessages").indexNames.contains("byExpiry"));
+          && (oldVersion < 7 || tx.objectStore("legacyMessages").indexNames.contains("byExpiry"))
+          && (oldVersion < 8 || tx.objectStore("accountState").indexNames.contains(OUTGOING_REVISION_INDEX));
         const legacy = oldVersion < 7 && names.every((name) => LEGACY_STORES.includes(name))
           && (oldVersion < 6 || (names.includes("syncState") && (names.includes("outgoingQueue")
             || ["messages", "localKeys"].every((name) => names.includes(name)))));
@@ -589,17 +597,28 @@ export function getAppDB() {
           display.createIndex("byAccountConversation", ["ownerId", "conversationId", "timestamp", "id"]);
           display.createIndex("byTimestamp", "timestamp");
         }
+        const state = tx.objectStore("accountState");
+        state.createIndex(PENDING_RECEIVE_ORDER_INDEX, "pendingReceiveOrder", { multiEntry: true });
         // Index the envelope's own revision, including writes that omit the sidecar.
-        tx.objectStore("accountState").createIndex(OUTGOING_REVISION_INDEX, ["id", "outgoing.revision"]);
-        if (oldVersion === 7) return;
-        const quarantine = tx.objectStore("legacyMessages");
-        if (!quarantine.indexNames.contains("byConversation")) quarantine.createIndex("byConversation", ["conversationId", "timestamp"]);
-        quarantine.createIndex("byExpiry", "quarantineExpiresAt");
+        if (oldVersion < 8) state.createIndex(OUTGOING_REVISION_INDEX, ["id", "outgoing.revision"]);
+        if (oldVersion < 7) {
+          const quarantine = tx.objectStore("legacyMessages");
+          if (!quarantine.indexNames.contains("byConversation")) quarantine.createIndex("byConversation", ["conversationId", "timestamp"]);
+          quarantine.createIndex("byExpiry", "quarantineExpiresAt");
+        }
         if (!oldVersion) return;
         void (async () => {
-          await finishLegacyUpgradeHides(tx, canonical);
-          if (!canonical) await migrateDisplayRows(tx, display!);
-          await indexQuarantineExpiry(tx);
+          if (oldVersion < 7) {
+            await finishLegacyUpgradeHides(tx, canonical);
+            if (!canonical) await migrateDisplayRows(tx, display!);
+            await indexQuarantineExpiry(tx);
+          }
+          let cursor = await state.openCursor(IDBKeyRange.bound(PENDING_RECEIVE_PREFIX, PENDING_RECEIVE_PREFIX + "\uffff"));
+          while (cursor) {
+            const { frame, userId, deviceId } = cursor.value;
+            if (frame?.id) await cursor.update({ ...cursor.value, pendingReceiveOrder: pendingReceiveOrder(frame, userId, deviceId) });
+            cursor = await cursor.continue();
+          }
         })().catch((error) => {
           migrationError = error;
           try { tx.abort(); } catch { /* A failed request can already have aborted the upgrade. */ }
@@ -615,6 +634,7 @@ export function getAppDB() {
       if (db.objectStoreNames.length !== CANONICAL_STORES.length || !CANONICAL_STORES.every((name) => db.objectStoreNames.contains(name))
         || !db.transaction("legacyMessages").store.indexNames.contains("byExpiry")
         || !db.transaction("accountState").store.indexNames.contains(OUTGOING_REVISION_INDEX)
+        || !db.transaction("accountState").store.indexNames.contains(PENDING_RECEIVE_ORDER_INDEX)
         || !hasCanonicalDisplaySchema(db.transaction("displayMessages").store)) {
         db.close();
         throw new Error("Unsupported pre-release local database layout");
@@ -1141,11 +1161,13 @@ export async function getSession(id: string): Promise<LocalSession | undefined> 
 
 export interface LocalSenderKey {
   id: string;
+  groupEpoch?: number;
   senderKeyId: number;
   chainKey: string;
   signingPublicKey: string;
   signingPrivateKey: string;
   chainIndex: number;
+  joinAdmissionId?: string;
 }
 
 export async function getSenderKey(id: string): Promise<LocalSenderKey | undefined> {
@@ -1169,6 +1191,8 @@ export interface ReceiveEffects {
   message?: LocalMessage;
   senderKey?: LocalSenderKey;
   pendingCall?: LocalPendingCall;
+  groupCallGrant?: EncryptedLocalData;
+  deliveryAck?: true;
 }
 
 function editMessage(message: LocalMessage, edit: { content: string; editedAt: number; editSeq: number }): LocalMessage {
@@ -1315,12 +1339,61 @@ export interface LocalReceiveReceipt {
   ownerId?: string;
   expiresAt: number | null;
   failure?: ReceiveEffects["failure"];
+  deliveryAuthenticated?: true;
   hidden?: true;
   pendingCallId?: string;
+  groupCallGrant?: EncryptedLocalData;
 }
 
 export const RECEIVED_PREFIX = "received:";
 const PENDING_RECEIVE_PREFIX = "pending-receive:";
+const DELIVERY_ACK_PREFIX = "delivery-ack:";
+
+/** Header fields are scheduling hints. Receive still validates and authenticates the envelope. */
+export function envelopeOrder(frame: WSMessageFrame) {
+  try {
+    const header = JSON.parse(frame.header);
+    return {
+      senderKeyId: Number.isSafeInteger(header?.senderKeyId) ? header.senderKeyId : -1,
+      chainIndex: Number.isSafeInteger(header?.chainIndex) ? header.chainIndex : -1,
+      dhPublicKey: typeof header?.dhPublicKey === "string" ? header.dhPublicKey : "",
+      n: Number.isSafeInteger(header?.n) ? header.n : -1,
+    };
+  } catch { return { senderKeyId: -1, chainIndex: -1, dhPublicKey: "", n: -1 }; }
+}
+
+export function receiveChainKey(frame: WSMessageFrame, chain: string | number) {
+  const peer = [frame.senderId, frame.senderDeviceId];
+  return JSON.stringify(typeof chain === "number" ? [...peer, frame.conversationId, chain] : [...peer, chain]);
+}
+
+function pendingReceiveOrder(frame: WSMessageFrame, userId?: string, deviceId?: string) {
+  const order = envelopeOrder(frame);
+  const keys: IDBValidKey[] = [];
+  const key = (chain: string | number, number: number) =>
+    [userId ?? "", deviceId ?? "", receiveChainKey(frame, chain), number, frame.expiresAt ?? Number.MAX_SAFE_INTEGER, frame.id];
+  if (order.dhPublicKey && order.n >= 0) keys.push(key(order.dhPublicKey, order.n));
+  if (order.senderKeyId >= 0 && order.chainIndex >= 0 && frame.msgType !== "sender_key_distribution") keys.push(key(order.senderKeyId, order.chainIndex));
+  return keys;
+}
+
+/** Use key cursors so a gap check never reads a queued ciphertext. */
+export async function getQueuedPredecessorIds(frame: WSMessageFrame, userId: string | undefined, deviceId: string | undefined, gaps: ReceiveGap[]) {
+  const tx = (await getAppDB()).transaction("accountState");
+  const index = tx.store.index(PENDING_RECEIVE_ORDER_INDEX);
+  const ids = new Set<string>();
+  const now = Date.now();
+  for (const { chain, from, until } of gaps) {
+    const prefix = [userId ?? "", deviceId ?? "", receiveChainKey(frame, chain)];
+    let cursor = await index.openKeyCursor(IDBKeyRange.bound([...prefix, from], [...prefix, until], false, true));
+    while (cursor) {
+      const [, , , , expiresAt, id] = cursor.key as [string, string, string, number, number, string];
+      if (id !== frame.id && expiresAt > now) ids.add(id);
+      cursor = await cursor.continue();
+    }
+  }
+  return [...ids];
+}
 
 export function receiveKey(prefix: string, id: string, ownerId?: string, deviceId?: string): string {
   return prefix + JSON.stringify([ownerId, deviceId, id]);
@@ -1345,37 +1418,91 @@ async function deletePendingReceive(
   id: string,
   ownerId?: string,
   deviceId?: string,
+  preserveEnvelope = false,
 ): Promise<void> {
   if (deviceId) {
     await store.delete(receiveKey(PENDING_RECEIVE_PREFIX, id, ownerId, deviceId));
   } else {
     const prefix = PENDING_RECEIVE_PREFIX + JSON.stringify([ownerId ?? null]).slice(0, -1) + ",";
     const pending = await store.getAll(IDBKeyRange.bound(prefix, prefix + "\uffff"));
-    for (const row of pending) if (row.userId === ownerId && row.frame.id === id) await store.delete(row.id);
+    for (const row of pending) if (row.userId === ownerId && row.frame.id === id
+      && !(preserveEnvelope && isMessageContent(row.frame) && row.frame.ciphertext)) await store.delete(row.id);
   }
 }
 
-/** Missing group keys defer encrypted envelopes while their ratchet is pending. */
-export async function savePendingReceive(frame: WSMessageFrame, userId: string | undefined, deviceId: string | undefined): Promise<void> {
+export function isMessageContent(frame: WSMessageFrame) {
+  return frame.msgType === "text" || frame.msgType === "file";
+}
+
+interface PendingReceiveEntry {
+  frame: WSMessageFrame;
+  fromSync?: true;
+  revision?: string;
+}
+
+/** Keep encrypted envelopes while their receive chain is waiting for predecessors. */
+export async function savePendingReceive(frame: WSMessageFrame, userId: string | undefined, deviceId: string | undefined, fromSync = false): Promise<void> {
   const tx = (await getAppDB()).transaction("accountState", "readwrite");
   if (!await readReceiveReceipt(tx.store, frame.id, userId, deviceId)) {
-    await tx.store.put({ id: receiveKey(PENDING_RECEIVE_PREFIX, frame.id, userId, deviceId), userId, deviceId, frame });
+    const id = receiveKey(PENDING_RECEIVE_PREFIX, frame.id, userId, deviceId);
+    const queued = await tx.store.get(id);
+    if ((!queued?.fromSync || fromSync) && (!queued?.frame.advanceOnly || frame.advanceOnly)) {
+      await tx.store.put({ id, userId, deviceId, frame, revision: crypto.randomUUID(),
+        pendingReceiveOrder: pendingReceiveOrder(frame, userId, deviceId), ...(fromSync && { fromSync }) });
+    }
   }
   await tx.done;
 }
 
+/** Retire only the copy checked by this lookup. A known deletion can still advance without plaintext. */
+export async function retireUnavailableReceives(entries: PendingReceiveEntry[], userId: string | undefined, deviceId: string | undefined): Promise<void> {
+  if (!entries.length) return;
+  const tx = (await getAppDB()).transaction("accountState", "readwrite");
+  await Promise.all([tx.done, ...entries.map(async ({ frame, revision }) => {
+    const key = receiveKey(PENDING_RECEIVE_PREFIX, frame.id, userId, deviceId);
+    const queued = await tx.store.get(key);
+    if (!queued || queued.revision !== revision || queued.frame.advanceOnly) return;
+    const deletion = await readMessageDeletion(tx.store, frame.id, userId, frame, frame.id.includes(":"));
+    if (!deletion || deletion.importedAt !== undefined) await tx.store.delete(key);
+  })]);
+}
+
+function pendingReceiveRange(userId: string | undefined, deviceId: string | undefined): IDBKeyRange {
+  const prefix = PENDING_RECEIVE_PREFIX + JSON.stringify([userId, deviceId]).slice(0, -1) + ",";
+  return IDBKeyRange.bound(prefix, `${prefix}\uffff`);
+}
+
+export async function hasPendingReceives(userId: string | undefined, deviceId: string | undefined): Promise<boolean> {
+  return (await (await getAppDB()).getKey("accountState", pendingReceiveRange(userId, deviceId))) !== undefined;
+}
+
+export async function getPendingReceiveEntries(userId: string | undefined, deviceId: string | undefined): Promise<PendingReceiveEntry[]> {
+  const records = await (await getAppDB()).getAll("accountState", pendingReceiveRange(userId, deviceId));
+  return records.filter((record) => record.userId === userId && record.deviceId === deviceId);
+}
+
 export async function getPendingReceives(userId: string | undefined, deviceId: string | undefined): Promise<WSMessageFrame[]> {
-  const db = await getAppDB();
-  const records = await db.getAll("accountState", IDBKeyRange.bound(PENDING_RECEIVE_PREFIX, `${PENDING_RECEIVE_PREFIX}\uffff`));
-  const frames = new Map<string, WSMessageFrame>();
-  for (const record of records) {
-    if (record.userId === userId && record.deviceId === deviceId) frames.set(record.frame.id, record.frame);
-  }
-  return [...frames.values()];
+  return (await getPendingReceiveEntries(userId, deviceId)).map(({ frame }) => frame);
 }
 
 export async function hasReceivedMessage(id: string, ownerId?: string, deviceId?: string): Promise<boolean> {
   return !!await getReceiveReceipt(id, ownerId, deviceId);
+}
+
+export async function queueCommittedDeliveryAck(frame: WSMessageFrame, ownerId: string, deviceId: string) {
+  const tx = (await getAppDB()).transaction("accountState", "readwrite");
+  const receipt = await readReceiveReceipt(tx.store, frame.id, ownerId, deviceId);
+  const authenticated = !!receipt?.deliveryAuthenticated && !receipt.failure;
+  if (authenticated) {
+    await tx.store.put({ id: receiveKey(DELIVERY_ACK_PREFIX, frame.id, ownerId, deviceId), messageId: frame.id, expiresAt: frame.expiresAt });
+  }
+  await tx.done;
+  return authenticated;
+}
+
+export async function getDeliveryAcks(ownerId: string, deviceId: string, limit: number): Promise<{ id: string; messageId: string }[]> {
+  const prefix = DELIVERY_ACK_PREFIX + JSON.stringify([ownerId, deviceId]).slice(0, -1) + ",";
+  return (await getAppDB()).getAll("accountState", IDBKeyRange.bound(prefix, prefix + "￿"), limit);
 }
 
 /** All crypto must finish before entering this transaction: only IDB awaits belong here. */
@@ -1393,7 +1520,13 @@ export async function commitReceivedMessage(
   try {
     const { ownerId, deviceId, message } = effects;
     const store = tx.objectStore("accountState");
-    if (await readReceiveReceipt(store, id, ownerId, deviceId)) {
+    const receipt = await readReceiveReceipt(store, id, ownerId, deviceId);
+    const deliveryAuthenticated = !effects.failure && (receipt
+      ? receipt.deliveryAuthenticated && !receipt.failure : !!(state.session || state.senderKey));
+    if (effects.deliveryAck && deliveryAuthenticated && ownerId && deviceId) {
+      await store.put({ id: receiveKey(DELIVERY_ACK_PREFIX, id, ownerId, deviceId), messageId: id, expiresAt: effects.expiresAt });
+    }
+    if (receipt) {
       await deletePendingReceive(store, id, ownerId, deviceId);
       await done;
       return false;
@@ -1402,8 +1535,18 @@ export async function commitReceivedMessage(
     await deletePendingReceive(store, id, ownerId, deviceId);
     if (state.session) await tx.objectStore("receiveSessions").put(state.session);
     if (state.senderKey) await tx.objectStore("receiveSenderKeys").put(state.senderKey);
-    if (effects.senderKey && !await tx.objectStore("receiveSenderKeys").get(effects.senderKey.id)) {
-      await tx.objectStore("receiveSenderKeys").put(effects.senderKey);
+    if (effects.senderKey) {
+      const keys = tx.objectStore("receiveSenderKeys");
+      const checkpoint = effects.senderKey;
+      const existing = await keys.get(checkpoint.id) as LocalSenderKey | undefined;
+      // A new admission may have skipped more than the ratchet's gap limit.
+      // Install its authenticated forward checkpoint once for this signing key.
+      if (!existing || (checkpoint.joinAdmissionId && checkpoint.joinAdmissionId !== existing.joinAdmissionId
+        && checkpoint.signingPublicKey === existing.signingPublicKey
+        && (checkpoint.chainIndex > existing.chainIndex
+          || (checkpoint.chainIndex === existing.chainIndex && checkpoint.chainKey === existing.chainKey)))) {
+        await keys.put(checkpoint);
+      }
     }
     if (effects.pendingCall) await tx.objectStore("receivePendingCalls").put(effects.pendingCall);
     const result = message && await mergeDisplayMessage(tx, {
@@ -1424,8 +1567,10 @@ export async function commitReceivedMessage(
     await store.put({
       id: receiveKey(RECEIVED_PREFIX, id, ownerId, deviceId), expiresAt: effects.expiresAt, ownerId, deviceId,
       ...(effects.failure ? { failure: effects.failure } : {}),
+      ...(deliveryAuthenticated && { deliveryAuthenticated: true }),
       ...(result?.hidden ? { hidden: true } : {}),
       ...(effects.pendingCall ? { pendingCallId: effects.pendingCall.id } : {}),
+      ...(effects.groupCallGrant ? { groupCallGrant: effects.groupCallGrant } : {}),
     } satisfies LocalReceiveReceipt);
     await done;
     return true;
@@ -2033,6 +2178,9 @@ export async function cleanupExpiredMessages(now = Date.now(), ownerId?: string)
   for (const receipt of receipts) {
     if (receipt.expiresAt !== null && receipt.expiresAt <= now) await syncStore.delete(receipt.id);
   }
+  for (const ack of await syncStore.getAll(IDBKeyRange.bound(DELIVERY_ACK_PREFIX, DELIVERY_ACK_PREFIX + "\uffff"))) {
+    if (ack.expiresAt !== null && ack.expiresAt <= now) await syncStore.delete(ack.id);
+  }
 
   for (const prefix of [LOCKED_EDIT_PREFIX, EDIT_REPAIR_PREFIX]) {
     for (const record of await syncStore.getAll(IDBKeyRange.bound(prefix, prefix + "\uffff"))) {
@@ -2095,7 +2243,7 @@ export type OutgoingStep = ({
   path: "/api/messages/edit";
   body: MessageEditRequest;
 }) & {
-  distributed?: { senderDeviceId: string; senderKeyId: number; recipientDeviceIds: string[] };
+  distributed?: { senderDeviceId: string; senderKeyId: number; recipientDeviceIds: string[]; joinAdmissionIds?: Record<string, string> };
   completed?: boolean;
   /** Persisted before this step's POST, independently of other envelopes in the row. */
   sendDispatched?: boolean;
@@ -2321,7 +2469,7 @@ export async function updateOutgoingIfPresent(outgoing: LocalOutgoing, message?:
 }
 
 /** The committed lifecycle write is the boundary between discard and a message POST. */
-export async function claimOutgoingDispatch(outgoing: LocalOutgoing, stepIndex: number, active: () => boolean): Promise<boolean> {
+export async function claimOutgoingDispatch(outgoing: LocalOutgoing, stepIndex: number, active: () => boolean): Promise<false | "first" | "replay"> {
   const tx = (await getAppDB()).transaction("accountState", "readwrite");
   const key = outgoingId(outgoing);
   const stored = (await tx.store.get(key))?.outgoing as LocalOutgoing | undefined;
@@ -2334,7 +2482,7 @@ export async function claimOutgoingDispatch(outgoing: LocalOutgoing, stepIndex: 
   await putOutgoing(tx.store, outgoing, replay ? "delivery-unknown" : "dispatching");
   if (!active()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
   await tx.done;
-  return true;
+  return replay ? "replay" : "first";
 }
 export async function completeOutgoingIfPresent(outgoing: LocalOutgoing, message?: LocalMessage, options: { ifUnchanged?: boolean; editKeyAccepted?: boolean } = {}): Promise<boolean> {
   const db = await getAppDB();
@@ -2398,6 +2546,15 @@ export async function isMessageHidden(id: string, ownerId?: string, direct?: boo
     || ((direct ?? row?.direct ?? false) && await hasMessageFamilyHide(state, id, ownerId));
 }
 
+/** A local history clear finalizes hides under canonical display IDs. */
+export async function getHiddenMessageIds(ids: string[], ownerId: string): Promise<string[]> {
+  if (!ids.length) return [];
+  const tx = (await getAppDB()).transaction("accountState", "readonly");
+  const markers = await Promise.all(ids.map((id) => readMessageHide(tx.store, id, ownerId)));
+  await tx.done;
+  return ids.filter((_, index) => markers[index]);
+}
+
 async function hideDisplayMessage(tx: DisplayTransaction, id: string, ownerId: string, row?: LocalMessage, conversationId = row?.conversationId) {
   const state = tx.objectStore("accountState");
   const edits = row && await readEditState(state, row);
@@ -2407,30 +2564,75 @@ async function hideDisplayMessage(tx: DisplayTransaction, id: string, ownerId: s
   await noteHistoryRemoval(state, conversationId, ownerId);
 }
 
-export async function hideLocalMessages(conversationId: string | undefined, ids: string[], ownerId: string, deviceId: string, current: () => boolean,
+async function readConversationOutboxIds(state: OutgoingReader, conversationId: string, ownerId: string, deviceId: string) {
+  const ids: string[] = [];
+  for (const key of await state.getAllKeys(outgoingKeyRange(ownerId)) as string[]) {
+    const queued = await readQueuedDiscardLifecycle(state, key);
+    const scope = queued === "unverified" ? (await state.get(key))?.outgoing : queued;
+    if (scope?.conversationId === conversationId && scope.deviceId === deviceId) {
+      const [, id] = JSON.parse(key.slice(OUTGOING_PREFIX.length)) as [string, string];
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
+export async function getConversationOutboxIds(conversationId: string, ownerId: string, deviceId: string) {
+  const tx = (await getAppDB()).transaction("accountState", "readonly");
+  return readConversationOutboxIds(tx.store, conversationId, ownerId, deviceId);
+}
+
+export type LocalHideTarget = string[] | { history: ReadonlySet<string>; direct: boolean };
+
+export async function hideLocalMessages(conversationId: string | undefined, target: LocalHideTarget, ownerId: string, deviceId: string, current: () => boolean,
   expectedQueued?: ReadonlySet<string>) {
   const tx = (await getAppDB()).transaction(["displayMessages", "legacyMessages", "accountState", "accountFiles"], "readwrite");
   const state = tx.objectStore("accountState");
+  const display = tx.objectStore("displayMessages");
   const hidden = new Map<string, string | undefined>();
   const alreadySending: string[] = [];
   let discarded = false;
+  const history = !Array.isArray(target);
+  const direct = history ? target.direct : undefined;
   try {
+    const ids = new Set(history ? target.history : target);
+    if (conversationId && history) {
+      const keys = await display.index("byAccountConversation").getAllKeys(
+        IDBKeyRange.bound([ownerId, conversationId], [ownerId, conversationId, []]));
+      for (const key of keys as [string, string][]) ids.add(key[1]);
+      // Quarantine can later promote an envelope to this account. Add the
+      // same account-scoped hide without removing an unverified legacy row.
+      const legacy = tx.objectStore("legacyMessages").index("byConversation");
+      let cursor = await legacy.openCursor(IDBKeyRange.bound([conversationId, 0], [conversationId, Number.MAX_SAFE_INTEGER]));
+      while (cursor && current()) {
+        const row = cursor.value as LocalMessage;
+        if (!row.ownerId || row.ownerId === ownerId) ids.add(wireMessageId(row.wireId ?? row.id, ownerId));
+        cursor = await cursor.continue();
+      }
+      // Hide their eventual display rows and leave the encrypted queue intact.
+      let pending = await state.openCursor(pendingReceiveRange(ownerId, deviceId));
+      while (pending && current()) {
+        const { frame } = pending.value;
+        if (frame?.conversationId === conversationId && (frame.msgType === "text" || frame.msgType === "file")) ids.add(frame.id);
+        pending = await pending.continue();
+      }
+      for (const id of await readConversationOutboxIds(state, conversationId, ownerId, deviceId)) ids.add(id);
+    }
     for (const id of ids) {
       if (!current()) break;
-      const row = await readDisplayMessage(tx.objectStore("displayMessages"), id, ownerId);
+      const row = await readDisplayMessage(display, id, ownerId, direct);
       if (row && conversationId && row.conversationId !== conversationId) continue;
-      const displayId = row?.id ?? logicalMessageId(id, id.includes(":"));
+      const displayId = row?.id ?? logicalMessageId(id, direct ?? id.includes(":"));
       if (hidden.has(displayId)) continue;
       const key = outgoingKey(displayId, ownerId);
       const queued = !row || row.senderId === ownerId ? await readQueuedDiscardLifecycle(state, key) : undefined;
-      if (!conversationId && !queued) continue; // Standalone Discard targets outbox entries only.
+      if (!conversationId && !queued) continue;
       if (queued === "unverified" || (!queued && expectedQueued?.has(id) && row?.senderId === ownerId
         && (row.status === "sent" || row.status === "delivered" || row.status === "read"))) { alreadySending.push(id); continue; }
       if (queued && (queued.deviceId !== deviceId || (conversationId && queued.conversationId !== conversationId))) continue;
       if (mayHaveBeenDelivered(queued?.state)) { alreadySending.push(id); continue; }
       if (queued && queued.state !== "discarded") {
-        await state.put({ id: outgoingLifecycleKey(key), ...queued, state: "discarded" });
-        await state.delete(key);
+        await discardOutgoingRecord(state, key, queued);
         discarded = true;
       }
       const chat = conversationId ?? queued?.conversationId ?? row?.conversationId;
@@ -2445,8 +2647,14 @@ export async function hideLocalMessages(conversationId: string | undefined, ids:
   }
   if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return { hidden: [], discarded: false, alreadySending: [] }; }
   await tx.done;
-  for (const [id, chat] of hidden) publishLocalMessageChange(id, "hide", chat);
-  if (discarded) publishLocalMessageChange(ids[0], "outbox-batch", conversationId ?? hidden.values().next().value, false, ownerId);
+  if (current()) {
+    if (history && conversationId) {
+      publishLocalMessageChange(conversationId, "clear-history", conversationId);
+    } else {
+      for (const [id, chat] of hidden) publishLocalMessageChange(id, "hide", chat);
+    }
+    if (discarded) publishLocalMessageChange(hidden.keys().next().value!, "outbox-batch", conversationId ?? hidden.values().next().value, false, ownerId);
+  }
   return { hidden: [...hidden.keys()], discarded, alreadySending };
 }
 
@@ -2516,8 +2724,19 @@ export async function mergeDisplayDeletion(
   const merged = base && await mergeDisplayMessage(tx, { ...base, ...deletion, id, ownerId,
     wireId: base.wireId ?? wireId, direct: directFamily });
   if (!merged?.changed && markerChanged) await noteHistoryRemoval(state, deletion.conversationId, ownerId);
-  if (clearPending) await deletePendingReceive(state, wireId, ownerId);
+  if (clearPending) await deletePendingReceive(state, wireId, ownerId, undefined, deletion.importedAt === undefined);
   return { accepted: true, changed: markerChanged || !!merged?.changed, row: merged?.row };
+}
+
+async function retireConfirmedOutgoing(state: OutgoingStore, id: string, ownerId: string, deletion: MessageDeletion) {
+  if (deletion.importedAt !== undefined || (deletion.senderId ?? deletion.deletedByUserId) !== ownerId) return;
+  const key = outgoingKey(id, ownerId);
+  const queued = await readQueuedDiscardLifecycle(state, key);
+  const stored = queued === "unverified" ? (await state.get(key))?.outgoing as LocalOutgoing | undefined : undefined;
+  const lifecycle = queued === "unverified" ? (stored && Array.isArray(stored.steps) ? outboxLifecycle(stored) : undefined) : queued;
+  if (lifecycle?.conversationId !== deletion.conversationId) return;
+  await discardOutgoingRecord(state, key, lifecycle);
+  return true;
 }
 
 export async function rememberMessageDeletions(targets: { id: string; wireIds: Set<string>; direct?: boolean; deletion: MessageDeletion }[],
@@ -2525,15 +2744,19 @@ export async function rememberMessageDeletions(targets: { id: string; wireIds: S
   const tx = (await getAppDB()).transaction(["displayMessages", "legacyMessages", "accountState", "accountFiles"], "readwrite");
   const state = tx.objectStore("accountState");
   const accepted: { id: string; row?: LocalMessage; changed: boolean }[] = [];
+  let retired: { id: string; conversationId: string } | undefined;
   const exact = new Map<string, MessageDeletion>(), families = new Map<string, MessageDeletion>();
   try {
     for (const target of targets) {
       if (!current()) break;
       const result = await mergeDisplayDeletion(tx, target.id, ownerId, target.deletion, target.direct, undefined, false);
       if (!result.accepted) continue;
+      const { deletion } = target;
+      const displayId = result.row?.id ?? target.id;
+      if (await retireConfirmedOutgoing(state, displayId, ownerId, deletion)) retired = { id: displayId, conversationId: deletion.conversationId };
       for (const id of target.wireIds) exact.set(id, target.deletion);
       if (target.direct || result.row?.direct) families.set(result.row?.id ?? target.id, target.deletion);
-      accepted.push({ id: result.row?.id ?? target.id, row: result.row, changed: result.changed });
+      accepted.push({ id: displayId, row: result.row, changed: result.changed });
     }
     if (current() && exact.size) {
       const prefix = PENDING_RECEIVE_PREFIX + JSON.stringify([ownerId]).slice(0, -1) + ",";
@@ -2543,7 +2766,8 @@ export async function rememberMessageDeletions(targets: { id: string; wireIds: S
         const wire = exact.get(id), family = families.get(logicalMessageId(id, true));
         if (!wire && !family) continue;
         const frame = (await state.get(key))?.frame as WSMessageFrame | undefined;
-        if (frame?.id === id && ((wire && deletionMatches(frame, wire)) || (family && deletionMatches(frame, family)))) await state.delete(key);
+        if (frame?.id === id && !(isMessageContent(frame) && frame.ciphertext)
+          && ((wire && deletionMatches(frame, wire)) || (family && deletionMatches(frame, family)))) await state.delete(key);
       }
     }
   } catch (error) {
@@ -2553,6 +2777,7 @@ export async function rememberMessageDeletions(targets: { id: string; wireIds: S
   }
   if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return []; }
   await tx.done;
+  if (retired) publishLocalMessageChange(retired.id, "outbox-batch", retired.conversationId, true, ownerId);
   for (const { row, changed } of accepted) {
     if (row && changed) publishLocalMessageChange(row.id, "commit", row.conversationId, false, ownerId);
   }
@@ -2560,7 +2785,7 @@ export async function rememberMessageDeletions(targets: { id: string; wireIds: S
 }
 
 export async function rememberMessageDeletion(id: string, conversationId: string, deletedAt: number, deletedByUserId: string, senderId = deletedByUserId,
-  current: () => boolean = () => true, ownerId?: string, direct?: boolean): Promise<boolean> {
+  current: () => boolean = () => true, ownerId?: string, direct?: boolean, retireOutgoing = false): Promise<boolean> {
   const tx = (await getAppDB()).transaction(["displayMessages", "legacyMessages", "accountState", "accountFiles"], "readwrite");
   const row = await readDisplayMessage(tx.objectStore("displayMessages"), id, ownerId, direct);
   const owner = ownerId ?? row?.ownerId;
@@ -2579,8 +2804,11 @@ export async function rememberMessageDeletion(id: string, conversationId: string
     return true;
   }
   const result = await mergeDisplayDeletion(tx, id, owner, deletion, direct);
+  const displayId = result.row?.id ?? logicalMessageId(id, direct === true);
+  const retired = result.accepted && retireOutgoing && await retireConfirmedOutgoing(tx.objectStore("accountState"), displayId, owner, deletion);
   if (!current()) { tx.abort(); await tx.done.catch(() => undefined); return false; }
   await tx.done;
+  if (retired) publishLocalMessageChange(displayId, "outbox-batch", conversationId, true, owner);
   if (result.changed && result.row) publishLocalMessageChange(result.row.id, "commit", conversationId);
   return result.accepted;
 }

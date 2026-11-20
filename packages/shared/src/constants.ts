@@ -21,6 +21,7 @@ export const FILE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 export const HEARTBEAT_INTERVAL = 30_000; // 30 seconds
 export const IDLE_TIMEOUT = 60_000; // 60 seconds
 export const MAX_SKIPPED_KEYS = 1000; // Max skipped message keys to store
+export const MAX_DELIVERY_ACK_IDS = 250;
 export const PROTOCOL_VERSION = 1;
 export const CALL_RING_TIMEOUT_MS = 30_000;
 export const CALL_KEY_RECOVERY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours

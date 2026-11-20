@@ -1487,7 +1487,7 @@ it("keeps an interrupted dispatch protected when the next attempt is rejected", 
   const original = (await getOutgoing("message"))!;
   original.steps[0].sendDispatched = true;
   original.sendDispatched = true;
-  expect(await claimOutgoingDispatch(original, 0, () => true)).toBe(true);
+  expect(await claimOutgoingDispatch(original, 0, () => true)).toBe("first");
 
   vi.resetModules();
   const otherTab = await import("./outgoingQueue.js");

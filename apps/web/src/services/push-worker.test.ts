@@ -111,3 +111,15 @@ it("routes a generic approval-disabled push to Privacy", async () => {
     data: { url: "/settings?section=privacy" },
   }));
 });
+
+it("keeps group rings and quiet group notices generic and routes only rings to the invitation lookup", async () => {
+  await dispatch("push", { data: { json: () => ({ type: "group_ring", v: 1, conversationId: "private-group", callId: "private-call" }) } });
+  expect(worker.registration.showNotification).toHaveBeenLastCalledWith("Eingehender Anruf", expect.objectContaining({
+    tag: "group-call", data: { url: "/?push=group-call" },
+  }));
+  await dispatch("push", { data: { json: () => ({ type: "group_quiet", v: 1, conversationId: "private-group" }) } });
+  expect(worker.registration.showNotification).toHaveBeenLastCalledWith("Private Base", expect.objectContaining({
+    silent: true, tag: "group-call-notice", data: { url: "/" },
+  }));
+  expect(JSON.stringify(worker.registration.showNotification.mock.calls)).not.toMatch(/private-group|private-call/);
+});

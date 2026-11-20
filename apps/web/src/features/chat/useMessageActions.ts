@@ -1,9 +1,9 @@
 import { useEffect, useState, type MouseEvent } from "react";
-import type { DecryptedMessage } from "@e2ee-chat/shared";
+import type { DecryptedMessage, MessageDeletionEvent } from "@e2ee-chat/shared";
 import { captureMessageActionSession, isMessageActionSessionCurrent } from "./message-action-session.js";
 import { api } from "../../services/api.js";
 import { getOutgoing, saveMessage } from "../../db/index.js";
-import { deleteMessageForLocalUserOnly, handleMessageDeletion, hideMessageWithUndo } from "../../lib/message-sync.js";
+import { deleteMessageForLocalUserOnly, handleBatchMessageDeletion, handleMessageDeletion, hideMessageWithUndo } from "../../lib/message-sync.js";
 import { discardOutgoing } from "./outgoingQueue.js";
 import { capabilities } from "../../platform/capabilities.js";
 import { parseFilePayload } from "./presentation.js";
@@ -105,9 +105,10 @@ export function useMessageActions(message: DecryptedMessage, isOwn: boolean, sel
       }
       const fileId = message.type === "file" ? parseFilePayload(message.content)?.fileId : undefined;
       const path = `/api/messages/${encodeURIComponent(message.transferSourceId ?? message.id)}${fileId ? `?fileId=${encodeURIComponent(fileId)}` : ""}`;
-      const result = await api.delete<{ deletedAt: number; deletedIds: string[] }>(path);
+      const result = await api.delete<{ deletedAt: number; deletedIds: string[]; deletions?: MessageDeletionEvent[] }>(path);
       if (!current()) return;
-      await handleMessageDeletion({ conversationId: message.conversationId, deletion: { ids: result.deletedIds, deletedAt: result.deletedAt, deletedByUserId: message.senderId } });
+      if (result.deletions) await handleBatchMessageDeletion(message.conversationId, result.deletions, message.senderId);
+      else await handleMessageDeletion({ conversationId: message.conversationId, deletion: { ids: result.deletedIds, deletedAt: result.deletedAt, deletedByUserId: message.senderId } });
       if (current()) setConfirmDelete(false);
     } catch { if (current()) setError(t("messageDeleteFailed")); }
     finally { if (current()) setBusy(false); }

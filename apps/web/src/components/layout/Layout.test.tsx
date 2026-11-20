@@ -9,8 +9,11 @@ import { HistoryTransferScreen } from "../../features/transfer/HistoryTransferSc
 import * as transfer from "../../features/transfer/useHistoryTransfer.js";
 import { ToastProvider } from "../../ui/index.js";
 import Layout from "./Layout.js";
+import { useUnlockOfferHeld } from "../../features/auth/unlockOfferGate.js";
 vi.mock("../../features/chat/useOutgoingQueue.js", () => ({ useOutgoingQueue: vi.fn() }));
 vi.mock("../../features/chat/useShell.js", () => ({ useShell: () => ({ user: null, isOnline: false, unread: 2 }) }));
+// These layout tests cover the shell, not history transfer (on by default since 2026-11-19).
+vi.mock("../../features/transfer/flag.js", () => ({ historyTransferEnabled: false }));
 vi.mock("../../pages/ChatListPage.js", () => ({ default: () => <h1>Chats</h1> }));
 vi.mock("../calls/IncomingCallModal.js", () => ({ default: () => null }));
 let root: Root; let container: HTMLDivElement;
@@ -39,6 +42,17 @@ it("emphasizes the setup receipt's device name and keeps Dismiss usable on narro
   expect(dismiss.parentElement?.className).toContain("flex-wrap");
   await act(async () => dismiss.click());
   expect(queryByRole(container, "button", { name: "Dismiss" })).toBeNull();
+});
+
+it("holds the unlock offer while the setup receipt is shown", async () => {
+  let held: boolean | undefined;
+  function Probe() { held = useUnlockOfferHeld(); return null; }
+  await act(async () => root.render(<MemoryRouter initialEntries={[{ pathname: "/", state: {
+    passkeySetup: { id: "new", deviceName: "Chrome on macOS", activatedAt: Date.now() },
+  } }]}><Layout /><Probe /></MemoryRouter>));
+  expect(held).toBe(true);
+  await act(async () => getByRole(container, "button", { name: "Dismiss" }).click());
+  expect(held).toBe(false);
 });
 
 it("opens the receive entry from setup step 2 and returns to the setup receipt", async () => {

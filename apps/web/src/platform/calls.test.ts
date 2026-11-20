@@ -28,6 +28,7 @@ function framePipeline(data?: ArrayBuffer) {
 }
 
 class LegacySender {
+  static getCapabilities = vi.fn<() => RTCRtpCapabilities | null>();
   track: MediaStreamTrack | null = null;
   pipeline = framePipeline();
   createEncodedStreams = vi.fn(() => this.pipeline);
@@ -46,7 +47,7 @@ class Peer {
   senders: (LegacySender | ScriptSender)[] = [];
   ontrack?: (event: RTCTrackEvent) => void;
   close = vi.fn();
-  getTransceivers = () => [];
+  getTransceivers = vi.fn((): RTCRtpTransceiver[] => []);
   getSenders = () => this.senders;
   createOffer = vi.fn(async () => ({ type: "offer", sdp: "encrypted-offer" }));
   createAnswer = vi.fn(async () => ({ type: "answer", sdp: "encrypted-answer" }));
@@ -57,6 +58,11 @@ class Peer {
     sender.track = track;
     this.senders.push(sender);
     return sender;
+  });
+  addTransceiver = vi.fn((_kind: string, _init: RTCRtpTransceiverInit) => {
+    const sender = new Sender();
+    this.senders.push(sender);
+    return { sender };
   });
   constructor(public config: RTCConfiguration & { encodedInsertableStreams?: boolean }) { Peer.instances.push(this); }
 }
@@ -90,6 +96,7 @@ function script() {
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  LegacySender.getCapabilities.mockReset();
   Peer.instances = [];
   vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
   vi.stubGlobal("RTCSessionDescription", class { constructor(public init: unknown) {} });
@@ -104,6 +111,74 @@ beforeEach(async () => {
 afterEach(() => { disposeCallTransforms(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("E2EE call capability and setup", () => {
+  it("filters advertised codecs after installing encryption and preserves RTP repair capabilities", async () => {
+    legacy();
+    const vp8 = { mimeType: "video/VP8", clockRate: 90_000 };
+    const vp9 = { mimeType: "VIDEO/vp9", clockRate: 90_000, sdpFmtpLine: "profile-id=0" };
+    const rtx = { mimeType: "video/rtx", clockRate: 90_000 };
+    const red = { mimeType: "VIDEO/RED", clockRate: 90_000 };
+    const ulpfec = { mimeType: "video/ulpfec", clockRate: 90_000 };
+    const flexfec = { mimeType: "video/flexfec", clockRate: 90_000, sdpFmtpLine: "repair-window=10000000" };
+    const legacyFlexfec = { ...flexfec, mimeType: "video/flexfec-03" };
+    LegacySender.getCapabilities.mockReturnValue({ codecs: [
+      { ...vp8, mimeType: "video/H265" }, vp9, { ...vp8, mimeType: "video/H264" },
+      { ...vp8, mimeType: "video/AV1" }, rtx, red, ulpfec, flexfec, legacyFlexfec, vp8,
+    ], headerExtensions: [] });
+    const pc = await createPeerConnection("call", callKey, () => {});
+    const peer = Peer.instances[0];
+    const setCodecPreferences = vi.fn();
+    peer.getTransceivers.mockReturnValue([{ receiver: { track: track("video") }, setCodecPreferences }] as unknown as RTCRtpTransceiver[]);
+    attachLocalTracks(pc, media([]), callKey, true);
+    expect(LegacySender.getCapabilities).toHaveBeenCalledWith("video");
+    expect(setCodecPreferences).toHaveBeenCalledExactlyOnceWith([vp8, vp9, rtx, red, ulpfec, flexfec, legacyFlexfec]);
+    expect((peer.senders[0] as LegacySender).createEncodedStreams).toHaveBeenCalledBefore(setCodecPreferences);
+    expect(peer.localDescription).toBeNull();
+  });
+
+  it("applies preferences to incoming video before answering and tolerates older codec APIs", async () => {
+    legacy();
+    LegacySender.getCapabilities.mockReturnValue({ codecs: [{ mimeType: "video/VP8", clockRate: 90_000 }], headerExtensions: [] });
+    const pc = await createPeerConnection("call", callKey, () => {});
+    const peer = Peer.instances[0];
+    const setCodecPreferences = vi.fn(() => { throw new DOMException("unsupported", "NotSupportedError"); });
+    peer.setRemoteDescription.mockImplementationOnce(async () => {
+      peer.getTransceivers.mockReturnValue([{ receiver: { track: track("video") }, setCodecPreferences }] as unknown as RTCRtpTransceiver[]);
+    });
+    await acceptCallOffer(pc, socket as unknown as WebSocket, "legacy-sdp");
+    expect(setCodecPreferences).toHaveBeenCalledBefore(peer.createAnswer);
+    expect(socket.send).toHaveBeenCalledWith(expect.stringContaining('"sdp":"encrypted-answer"'));
+    expect(peer.close).not.toHaveBeenCalled();
+    LegacySender.getCapabilities.mockReturnValue(null);
+    await acceptCallOffer(pc, socket as unknown as WebSocket, "legacy-restart");
+    expect(setCodecPreferences).toHaveBeenCalledOnce();
+    expect(peer.createAnswer).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([legacy, script])("encrypts a reserved video sender before attaching or sending video (%s)", async (setup) => {
+    setup();
+    const pc = await createPeerConnection("call", callKey, () => {});
+    const peer = Peer.instances[0];
+    const { videoSender } = attachLocalTracks(pc, media([track()]), callKey, true);
+    const reserved = peer.senders[1];
+    expect(videoSender).toBe(reserved);
+    expect(reserved.track).toBeNull();
+    expect(peer.addTransceiver).toHaveBeenCalledExactlyOnceWith("video", { direction: "sendrecv" });
+    expect(peer.setLocalDescription).not.toHaveBeenCalled();
+    expect(peer.close).not.toHaveBeenCalled();
+    if (reserved instanceof LegacySender) expect(reserved.createEncodedStreams).toHaveBeenCalledOnce();
+    else expect(reserved.transform).toBeTruthy();
+  });
+  it("closes the peer if the reserved video sender cannot be encrypted", async () => {
+    legacy();
+    const pc = await createPeerConnection("call", callKey, () => {});
+    const peer = Peer.instances[0];
+    peer.addTransceiver.mockReturnValueOnce({ sender: { track: null } as LegacySender });
+    const microphone = track();
+    expect(() => attachLocalTracks(pc, media([microphone]), callKey, true)).toThrow(E2EECallUnsupportedError);
+    expect(peer.close).toHaveBeenCalledOnce();
+    expect(microphone.stop).toHaveBeenCalledOnce();
+    expect(peer.setLocalDescription).not.toHaveBeenCalled();
+  });
   it("blocks every setup entry point before capture, TURN, SDP or signaling when transforms are unavailable", async () => {
     const pc = new Peer({});
     expect(capabilities.e2eeCalls).toBe(false);

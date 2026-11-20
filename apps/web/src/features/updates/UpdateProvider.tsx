@@ -1,3 +1,4 @@
+import { useGroupCallStore } from "../calls/group-call-store.js";
 import { createContext, useContext, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { useCall } from "../calls/CallContext.js";
@@ -16,7 +17,8 @@ export function UpdateProvider({ children }: { children: ReactNode }) {
   useLocale();
   const call = useCall();
   const pendingCall = useCallStore(s => !!s.pendingCallStart || s.callStatus === "active" || s.callStatus === "ringing");
-  const update = useUpdates(pendingCall || call.stage !== "ended");
+  const groupCall = useGroupCallStore((state) => state.busy || !!state.session || state.invitations.length > 0);
+  const update = useUpdates(pendingCall || groupCall || call.stage !== "ended");
   const user = useAuthStore(s => s.user);
   const logout = useAuthStore(s => s.logout);
   const navigate = useNavigate();

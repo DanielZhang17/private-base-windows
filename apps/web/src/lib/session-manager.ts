@@ -11,6 +11,7 @@ import {
   initSessionAsResponder,
   ratchetEncrypt,
   ratchetDecrypt,
+  ratchetAdvanceOnly,
   serializeSession,
   deserializeSession,
   fromBase64Url,
@@ -24,10 +25,41 @@ import { deleteSession, hasReceivedMessage, getSession, saveSession, type LocalS
 import { api } from "../services/api.js";
 import { consumeOneTimePreKey, findOneTimePreKey, getIdentityKeyPair, getSignedPreKey } from "./key-manager.js";
 import { matchEditSigningIdentity } from "./message-edit.js";
-import { decryptPayload, finishReceive, withReceiveLock, withSessionLock, ReceiveDecryptionError, type ReceiveContext } from "./receive.js";
+import { checkReceiveGap, decryptPayload, finishReceive, withReceiveLock, withSessionLock, ReceiveDecryptionError, ReceivePredecessorError, type ReceiveContext, type ReceiveGap } from "./receive.js";
 
-function sessionKey(userId: string, deviceId: string): string {
-  return `${userId}:${deviceId}`;
+export interface GroupCallPreKeyScope {
+  conversationId: string;
+  callId: string;
+  sessionId: string;
+  epoch: number;
+  inviteUntil?: number;
+}
+
+function sessionKey(userId: string, deviceId: string, callDirection?: "in" | "out"): string {
+  return callDirection ? `group-call:${callDirection}:${userId}:${deviceId}` : `${userId}:${deviceId}`;
+}
+
+async function requireEarlierEnvelopes(session: RatchetSession | undefined, header: RatchetHeader, receive: ReceiveContext) {
+  const next = session?.recvMessageNumber ?? 0;
+  const dhPublicKey = session?.dhRemotePublicKey && toBase64Url(session.dhRemotePublicKey);
+  const sameChain = dhPublicKey === header.dhPublicKey;
+  const gaps: ReceiveGap[] = [];
+  const from = sameChain ? next : 0;
+  if (header.n > from) gaps.push({ chain: header.dhPublicKey, from, until: header.n });
+  if (!sameChain && dhPublicKey && session?.receivingChainKey && header.pn > next) {
+    gaps.push({ chain: dhPublicKey, from: next, until: header.pn });
+  }
+  if (gaps.length) await checkReceiveGap(receive, ...gaps);
+}
+
+async function receiveRatchetEnvelope(
+  session: RatchetSession, header: RatchetHeader, ciphertext: Uint8Array, iv: Uint8Array, receive: ReceiveContext, peerIdentityKey?: string,
+): Promise<Uint8Array | undefined> {
+  if (receive.advanceOnly) {
+    await ratchetAdvanceOnly(session, header, ciphertext, iv);
+    return;
+  }
+  return ratchetDecrypt(session, header, ciphertext, iv, matchEditSigningIdentity(receive.editKey, peerIdentityKey));
 }
 
 /**
@@ -37,8 +69,9 @@ function sessionKey(userId: string, deviceId: string): string {
 export async function getOrCreateSession(
   remoteUserId: string,
   remoteDeviceId: string,
+  callControl?: GroupCallPreKeyScope,
 ): Promise<{ session: RatchetSession; initialHeader?: InitialMessageHeader }> {
-  const key = sessionKey(remoteUserId, remoteDeviceId);
+  const key = sessionKey(remoteUserId, remoteDeviceId, callControl ? "out" : undefined);
   const stored = await getSession(key);
   if (stored) {
     return { session: deserializeSession(JSON.parse(stored.state)), initialHeader: stored.initialHeader };
@@ -46,6 +79,9 @@ export async function getOrCreateSession(
 
   const localKeys = getIdentityKeyPair();
 
+  const query = callControl && new URLSearchParams({ callControl: "1", conversationId: callControl.conversationId,
+    callId: callControl.callId, sessionId: callControl.sessionId, epoch: String(callControl.epoch) });
+  if (query && callControl?.inviteUntil !== undefined) query.set("inviteUntil", String(callControl.inviteUntil));
   const bundle = await api.get<{
     deviceId: string;
     identityKey: string;
@@ -53,7 +89,7 @@ export async function getOrCreateSession(
     signedPreKeyId: number;
     signedPreKeySig: string;
     oneTimePreKey?: { id: number; key: string };
-  }>(`/api/keys/bundle/${remoteUserId}/${remoteDeviceId}`);
+  }>(`/api/keys/bundle/${remoteUserId}/${remoteDeviceId}${query ? `?${query}` : ""}`);
 
   const result = await x3dhInitiate(
     localKeys.privateX25519,
@@ -88,24 +124,28 @@ export async function decryptInitialMessage(
   ciphertext: Uint8Array,
   iv: Uint8Array,
   receive: ReceiveContext,
+  callControl = false,
 ): Promise<Uint8Array | null> {
-  const key = sessionKey(remoteUserId, remoteDeviceId);
+  const key = sessionKey(remoteUserId, remoteDeviceId, callControl ? "in" : undefined);
   return withReceiveLock(receive, key, async () => {
     if (await hasReceivedMessage(receive.messageId, receive.ownerId, receive.deviceId)) return null;
     const existing = await getSession(key);
     if (existing && (!existing.x3dhEphemeralKey || existing.x3dhEphemeralKey === header.ephemeralKey)) {
       // Even legacy states must never be rebuilt after a failed decrypt.
       const session = deserializeSession(JSON.parse(existing.state));
-      const editKey = matchEditSigningIdentity(receive.editKey, existing.peerIdentityKey);
-      const plaintext = await decryptPayload(() => ratchetDecrypt(session, ratchetHeader, ciphertext, iv, editKey));
-      return finishReceive(receive, plaintext, {
+      await requireEarlierEnvelopes(session, ratchetHeader, receive);
+      const plaintext = await decryptPayload(() => receiveRatchetEnvelope(session, ratchetHeader, ciphertext, iv, receive, existing.peerIdentityKey));
+      const committed = await finishReceive(receive, plaintext, {
         session: await sessionRecord(key, session, header.ephemeralKey, null),
       });
+      return committed ? plaintext ?? null : null;
     }
 
     if (existing?.retiredEphemeralKeys?.includes(header.ephemeralKey)) {
       throw new ReceiveDecryptionError(new Error("Retired X3DH ephemeral key"));
     }
+
+    await requireEarlierEnvelopes(undefined, ratchetHeader, receive);
 
     const localKeys = getIdentityKeyPair();
     const signedPreKey = getSignedPreKey();
@@ -131,21 +171,20 @@ export async function decryptInitialMessage(
       );
 
       const session = await initSessionAsResponder(sharedSecret, signedPreKey.keyPair);
-      const editKey = matchEditSigningIdentity(receive.editKey, header.identityKey);
-      const plaintext = await ratchetDecrypt(session, ratchetHeader, ciphertext, iv, editKey);
+      const plaintext = await receiveRatchetEnvelope(session, ratchetHeader, ciphertext, iv, receive, header.identityKey);
       return { session, plaintext };
     });
-    const result = await finishReceive(receive, decrypted.plaintext, {
+    const committed = await finishReceive(receive, decrypted.plaintext, {
       session: await sessionRecord(key, decrypted.session, header.ephemeralKey, null, header.identityKey),
       oneTimePreKeyId: header.oneTimePreKeyId,
     });
-    if (result && header.oneTimePreKeyId !== undefined) {
+    if (committed && header.oneTimePreKeyId !== undefined) {
       // State and output are durable; retain the existing best-effort OTP cleanup.
       await consumeOneTimePreKey(header.oneTimePreKeyId).catch((error) => {
         console.error("Failed to remove a used one-time pre-key", error);
       });
     }
-    return result;
+    return committed ? decrypted.plaintext ?? null : null;
   });
 }
 
@@ -155,10 +194,11 @@ export async function encryptForDevice(
   remoteDeviceId: string,
   plaintext: Uint8Array,
   editKey?: EditKeyToSeal,
+  callControl?: GroupCallPreKeyScope,
 ): Promise<{ result: EncryptResult; isInitial: boolean; initialHeader?: InitialMessageHeader }> {
-  const key = sessionKey(remoteUserId, remoteDeviceId);
+  const key = sessionKey(remoteUserId, remoteDeviceId, callControl ? "out" : undefined);
   return withSessionLock(key, async () => {
-    let { session, initialHeader } = await getOrCreateSession(remoteUserId, remoteDeviceId);
+    let { session, initialHeader } = await getOrCreateSession(remoteUserId, remoteDeviceId, callControl);
     let result: EncryptResult;
 
     try {
@@ -168,7 +208,7 @@ export async function encryptForDevice(
       if (!(err instanceof Error) || err.message !== "Session not ready to send") throw err;
 
       await deleteSession(key);
-      const recreated = await getOrCreateSession(remoteUserId, remoteDeviceId);
+      const recreated = await getOrCreateSession(remoteUserId, remoteDeviceId, callControl);
       session = recreated.session;
       initialHeader = recreated.initialHeader;
       result = await ratchetEncrypt(session, plaintext, editKey);
@@ -187,18 +227,20 @@ export async function decryptFromDevice(
   ciphertext: Uint8Array,
   iv: Uint8Array,
   receive: ReceiveContext,
+  callControl = false,
 ): Promise<Uint8Array | null> {
-  const key = sessionKey(remoteUserId, remoteDeviceId);
+  const key = sessionKey(remoteUserId, remoteDeviceId, callControl ? "in" : undefined);
   return withReceiveLock(receive, key, async () => {
     if (await hasReceivedMessage(receive.messageId, receive.ownerId, receive.deviceId)) return null;
     const stored = await getSession(key);
-    if (!stored) throw new ReceiveDecryptionError(new Error(`No session for ${remoteUserId}:${remoteDeviceId}`));
+    if (!stored) throw new ReceivePredecessorError();
     const session = deserializeSession(JSON.parse(stored.state));
-    const editKey = matchEditSigningIdentity(receive.editKey, stored.peerIdentityKey);
-    const plaintext = await decryptPayload(() => ratchetDecrypt(session, header, ciphertext, iv, editKey));
-    return finishReceive(receive, plaintext, {
+    await requireEarlierEnvelopes(session, header, receive);
+    const plaintext = await decryptPayload(() => receiveRatchetEnvelope(session, header, ciphertext, iv, receive, stored.peerIdentityKey));
+    const committed = await finishReceive(receive, plaintext, {
       session: await sessionRecord(key, session, undefined, null),
     });
+    return committed ? plaintext ?? null : null;
   });
 }
 

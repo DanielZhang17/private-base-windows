@@ -3,6 +3,7 @@ import { HistoryTransferOffer, type SetupReceipt } from "../../features/auth/His
 import { deviceAlertTime } from "../../features/devices/devicePresentation.js";
 import { capabilities } from "../../platform/capabilities.js";
 import { UnlockOffer } from "../../features/auth/UnlockOffer.js";
+import { useHoldUnlockOffer } from "../../features/auth/unlockOfferGate.js";
 import { NewDeviceAlerts } from "../../features/devices/NewDeviceAlert.js";
 import { t, useLocale } from "../../i18n/index.js";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
@@ -26,13 +27,17 @@ export default function Layout() {
   const navigate = useNavigate();
   const transferBanner = useTransferBanner();
   const atRoot = pathname === "/";
+  const showingReceipt = !!completedSetup?.activatedAt && showSetupReceipt;
+  const offeringTransfer = capabilities.historyTransfer && !!completedSetup && showTransfer && !setupState?.transferOffered && atRoot;
+  // Setup receipts, the transfer offer and transfer progress come before the optional unlock offer.
+  useHoldUnlockOffer(showingReceipt || offeringTransfer || !!transferBanner);
   const settingsActive = pathname === "/settings" || pathname === "/devices";
   const navigation = <>
     <NavItem icon="chats" label={t("chats")} active={!settingsActive} count={unread} onClick={() => navigate("/")} />
     <NavItem icon="settings" label={t("settings")} active={settingsActive} onClick={() => navigate("/settings")} />
   </>;
 
-  if (capabilities.historyTransfer && completedSetup && showTransfer && !setupState?.transferOffered && atRoot) {
+  if (offeringTransfer) {
     return <HistoryTransferOffer deviceId={completedSetup.id} onContinue={() => setShowTransfer(false)}
       onTransfer={() => navigate(TRANSFER_SETUP_PATH, { replace: true, state: { passkeySetup: completedSetup, transferOffered: true } })} />;
   }
@@ -44,7 +49,7 @@ export default function Layout() {
         {user && pathname !== "/devices" && <NewDeviceAlerts compact={!atRoot && !settingsActive}
           filter={pathname === "/settings" && new URLSearchParams(search).get("section") === "privacy"
             ? alert => alert.kind !== "approval_disabled" : undefined} />}
-        {completedSetup?.activatedAt && showSetupReceipt && <Notice tone="info">
+        {completedSetup?.activatedAt && showingReceipt && <Notice tone="info">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
             <div className="min-w-0 flex-[1_1_14rem]">
               <p className="text-ink-muted">{t("passkeySetup.otherDevicesWillSee")}</p>

@@ -7,7 +7,7 @@ import type {
   ConversationType,
   InitialMessageHeader,
 } from "@e2ee-chat/shared";
-import { decryptFromDevice, decryptInitialMessage, encryptForDevice } from "./session-manager.js";
+import { decryptFromDevice, decryptInitialMessage, encryptForDevice, type GroupCallPreKeyScope } from "./session-manager.js";
 import { decryptGroupMessage, encryptGroupMessage, prepareRemoteSenderKey } from "./group-session.js";
 import { keysLoaded, KeysLockedError } from "./key-manager.js";
 import { parseDirectHeader, parseGroupHeader } from "./receive-validation.js";
@@ -39,6 +39,8 @@ export async function encryptMessage(
   recipientUserId: string | null,
   recipientDeviceId: string | null,
   editKey?: EditKeyToSeal,
+  joinAdmissionId?: string | null,
+  callControl?: GroupCallPreKeyScope,
 ): Promise<OutgoingEncrypted> {
   if (conversationType !== "direct") {
     throw new Error("encryptMessage supports direct conversations only");
@@ -53,6 +55,7 @@ export async function encryptMessage(
     recipientDeviceId,
     plaintextBytes,
     editKey,
+    callControl,
   );
 
   const header: {
@@ -60,6 +63,7 @@ export async function encryptMessage(
     n: number;
     pn: number;
     recipientDeviceId: string;
+    joinAdmissionId?: string | null;
     initial?: InitialMessageHeader;
     editKey?: SealedEditKey;
   } = {
@@ -67,6 +71,7 @@ export async function encryptMessage(
     n: result.header.n,
     pn: result.header.pn,
     recipientDeviceId,
+    ...(joinAdmissionId !== undefined && { joinAdmissionId }),
   };
 
   if (isInitial && initialHeader) {
@@ -81,6 +86,11 @@ export async function encryptMessage(
   };
 }
 
+/** Group invitations and media grants share a directional per-device channel. */
+export function encryptGroupCallControl(plaintext: string, userId: string, deviceId: string, scope: GroupCallPreKeyScope) {
+  return encryptMessage("direct", plaintext, userId, deviceId, undefined, undefined, scope);
+}
+
 /**
  * Decrypt an incoming direct-message payload.
  */
@@ -88,6 +98,7 @@ export async function decryptMessage(
   conversationType: ConversationType,
   msg: IncomingMessage,
   receive: ReceiveContext,
+  callControl = false,
 ): Promise<string | null> {
   if (conversationType !== "direct") {
     throw new Error("decryptMessage supports direct conversations only");
@@ -126,6 +137,7 @@ export async function decryptMessage(
       ciphertext,
       iv,
       receive,
+      callControl,
     )
     : await decryptFromDevice(
       msg.senderId,
@@ -134,6 +146,7 @@ export async function decryptMessage(
       ciphertext,
       iv,
       receive,
+      callControl,
     );
 
   return plaintext === null ? null : new TextDecoder().decode(plaintext);
@@ -146,9 +159,10 @@ export async function encryptGroupText(
   conversationId: string,
   plaintext: string,
   editKey?: EditKeyToSeal,
+  groupEpoch?: number,
 ): Promise<OutgoingEncrypted> {
   const plaintextBytes = new TextEncoder().encode(plaintext);
-  const result = await encryptGroupMessage(conversationId, plaintextBytes, editKey);
+  const result = await encryptGroupMessage(conversationId, plaintextBytes, editKey, groupEpoch);
   return {
     ciphertext: toBase64Url(result.ciphertext),
     iv: toBase64Url(result.iv),
@@ -176,7 +190,7 @@ export async function decryptGroupText(
         return {
           ...effects,
           senderKey: await prepareRemoteSenderKey(
-            payload.conversationId, msg.senderId, msg.senderDeviceId, JSON.stringify(payload.distribution),
+            payload.conversationId, msg.senderId, msg.senderDeviceId, JSON.stringify(payload.distribution), payload.joinAdmissionId,
           ),
         };
       },

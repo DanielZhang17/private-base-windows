@@ -1,3 +1,5 @@
+import { groupCallEnvelopeId, groupInvitationEnvelopeId } from "@e2ee-chat/shared";
+import { sealGroupCallGrant } from "../features/calls/group-call-keys.js";
 import type {
   ConversationWithMembers,
   DecryptedMessage,
@@ -7,8 +9,9 @@ import type {
   HistoryDeletionResult,
   MessageEditFrame,
   MessageDeletionEvent,
+  PendingDeliveryStatus,
 } from "@e2ee-chat/shared";
-import { CALL_KEY_RECOVERY_TTL_MS, HISTORY_DELETION_BATCH_SIZE, carriesEditKey, MAX_EDIT_ENVELOPE_BYTES, MAX_LATEST_EDIT_IDS, SYNC_PAGE_TOO_LARGE, WSFrameType } from "@e2ee-chat/shared";
+import { CALL_KEY_RECOVERY_TTL_MS, HISTORY_DELETION_BATCH_SIZE, carriesEditKey, MAX_DELIVERY_ACK_IDS, MAX_EDIT_ENVELOPE_BYTES, MAX_LATEST_EDIT_IDS, SYNC_PAGE_TOO_LARGE, WSFrameType } from "@e2ee-chat/shared";
 import { decryptMessageEdit, fromBase64Url, toBase64Url, type SealedEditKey } from "@e2ee-chat/crypto";
 import { messageEditScope } from "./message-edit.js";
 import { api } from "../services/api.js";
@@ -24,19 +27,29 @@ import {
   logicalMessageId,
   beginMessageHide,
   finishMessageHide,
-  isMessageHidden, hasReceivedMessage,
+  isMessageHidden, getHiddenMessageIds, hasReceivedMessage,
   getMessageDeletion,
   rememberMessageDeletion,
   rememberMessageDeletions,
   removeLocalMessageContent,
   hideLocalMessages,
+  type LocalHideTarget,
   getSyncState,
   saveMessage,
   getPendingCall,
   commitReceivedMessage,
   getReceiveReceipt,
+  getDeliveryAcks,
+  queueCommittedDeliveryAck,
   savePendingReceive,
+  retireUnavailableReceives,
   getPendingReceives,
+  getPendingReceiveEntries,
+  getQueuedPredecessorIds,
+  isMessageContent,
+  envelopeOrder,
+  receiveChainKey,
+  hasPendingReceives,
   getSenderKey,
   type ReceiveEffects,
   getOriginalForEdit,
@@ -71,7 +84,7 @@ import {
   touchConversationInCache,
 } from "./conversation-cache.js";
 import { decryptGroupText, decryptMessage, type IncomingMessage } from "./message-processor.js";
-import { classifyReceiveError, ConversationMetadataError, MissingSenderKeyError, withSessionLock, type ReceiveContext, type ReceiveState } from "./receive.js";
+import { classifyReceiveError, ConversationMetadataError, MissingSenderKeyError, ReceiveDecryptionError, ReceivePredecessorError, withSessionLock, type ReceiveGap, type ReceiveContext, type ReceiveState } from "./receive.js";
 import { parseCallOffer, validateFilePayload } from "./receive-validation.js";
 import { consumeOneTimePreKey, getUnlockGeneration, keysLoaded } from "./key-manager.js";
 import { connectLocalMessageChannel, getConversationHideGeneration } from "./local-message-changes.js";
@@ -83,9 +96,19 @@ let syncEpoch = 0;
 const LOCAL_MESSAGES_PAGE_SIZE = 100;
 const SYNC_BATCH_SIZE = 250;
 const MIN_SYNC_INTERVAL_MS = 5_000;
+const DELIVERY_ACK_BATCH_DELAY_MS = 5_000;
 const EDIT_HISTORY_RESUME_INTERVAL_MS = 30_000;
 let lastSyncStartedAt = 0;
-let activeGlobalSync: Promise<void> | null = null;
+interface GlobalSync {
+  callControl?: true;
+  promise: Promise<void>;
+  followUp: boolean;
+}
+let activeGlobalSync: GlobalSync | null = null;
+let activeDeliveryAckFlush: Promise<void> | null = null;
+let deliveryAckTimer: ReturnType<typeof setTimeout> | undefined;
+let deliveryAckNotBefore = 0;
+let socketReceiveSyncTimer: ReturnType<typeof setTimeout> | undefined;
 let activeEditLookup: Promise<number | undefined> | null = null;
 let editLookupTimer: ReturnType<typeof setTimeout> | undefined;
 let editLookupRequested = false;
@@ -98,6 +121,9 @@ interface SyncCursor {
 interface SyncResponse {
   messages: WSMessageFrame[];
   hasMore: boolean;
+  retainedMessages?: WSMessageFrame[];
+  retainedCursor?: string;
+  hasMoreRetained?: boolean;
   mutations?: ((WSMessageFrame | { edit: MessageEditFrame }) & { mutationSeq: number })[];
   hasMoreMutations?: boolean;
   mutationCursor?: number;
@@ -230,10 +256,14 @@ function receivedMessage(frame: WSMessageFrame, content: string, status: "delive
   };
 }
 
-async function prepareReceiveEffects(frame: WSMessageFrame, plaintext: Uint8Array, editKey?: Uint8Array, editKeyResetToken?: string | null, repairScope?: string): Promise<ReceiveEffects> {
+async function prepareReceiveEffects(frame: WSMessageFrame, plaintext: Uint8Array, editKey?: Uint8Array, editKeyResetToken?: string | null, repairScope?: string, groupCallRecipient?: MessageSession): Promise<ReceiveEffects> {
   const content = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
   const effects: ReceiveEffects = { expiresAt: frame.expiresAt };
   if (frame.msgType === "system") {
+    if (groupCallRecipient) {
+      effects.groupCallGrant = await sealGroupCallGrant(content, frame, groupCallRecipient.userId, groupCallRecipient.deviceId);
+      return effects;
+    }
     const payload = parseCallOffer(content, frame.conversationId);
     effects.pendingCall = {
       id: payload.callId, conversationId: frame.conversationId, initiatorId: payload.initiatorId,
@@ -411,6 +441,20 @@ async function queueLocalEditChecks(messages: LocalMessage[], session: MessageSe
 }
 
 interface OriginalEditCheck { frame: WSMessageFrame; deferred?: boolean }
+interface ReceiveDrain {
+  pendingIds: ReadonlySet<string>;
+  blockedBy: Set<string>;
+}
+interface ReceiveAttempt {
+  source: "socket" | "sync" | "pending";
+  fromSync?: true;
+  drain?: ReceiveDrain;
+  liveConfirmed?: true;
+}
+
+function isOrderedEnvelope(frame: WSMessageFrame) {
+  return frame.deliveryAck || frame.advanceOnly || frame.serverTimestamp !== undefined || frame.syncTimestamp !== undefined;
+}
 
 async function reconcileOriginalFrames(originals: OriginalEditCheck[], session: MessageSession) {
   const stale: LocalMessage[] = [];
@@ -426,7 +470,8 @@ async function reconcileOriginalFrames(originals: OriginalEditCheck[], session: 
   if (!stale.length && originals.some(({ frame }) => frame.msgType === "text" && !frame.deletedAt && carriesEditKey(frame.header))) startEditLookups(session);
 }
 
-async function decryptIncomingMessage(frame: WSMessageFrame, session: MessageSession, context: Omit<ReceiveContext, "prepare">): Promise<string | null> {
+async function decryptIncomingMessage(frame: WSMessageFrame, session: MessageSession,
+  context: Omit<ReceiveContext, "prepare" | "advanceOnly">, advanceOnly: boolean): Promise<string | null> {
   const conversation = await getConversation(frame.conversationId);
   if (!isCurrentSession(session)) return null;
   if (!conversation || !["direct", "group"].includes(conversation.type)) throw new TypeError("Invalid conversation metadata");
@@ -436,25 +481,30 @@ async function decryptIncomingMessage(frame: WSMessageFrame, session: MessageSes
   };
   let editKey: Uint8Array | undefined;
   let sealed: SealedEditKey | undefined;
-  if (frame.msgType === "text" && frame.editKeyAccepted !== false) {
+  if (!advanceOnly && frame.msgType === "text" && frame.editKeyAccepted !== false) {
     try { sealed = JSON.parse(frame.header)?.editKey; } catch { /* The normal header parser handles malformed headers. */ }
   }
   const editKeyResetToken = sealed ? await getEditKeyResetToken() : undefined;
+  const callGrant = conversation.type === "group" && frame.msgType === "system" && (groupCallEnvelopeId.test(frame.id) || groupInvitationEnvelopeId.test(frame.id));
+  const metadata = { deliveryAck: frame.deliveryAck, ownerId: session.userId, deviceId: session.deviceId,
+    direct: conversation.type === "direct" };
   const receive: ReceiveContext = {
     ...context,
+    ...(advanceOnly && { advanceOnly: () => ({ ...metadata, expiresAt: frame.expiresAt }) }),
     ...(sealed && { editKey: {
       scope: messageEditScope(frame, frame.senderDeviceId), sealed,
       accept: (bytes: Uint8Array) => { editKey = bytes; },
     } }),
     prepare: async (plaintext) => ({
-      ...await prepareReceiveEffects(frame, plaintext, editKey, editKeyResetToken, editScope(session)),
-      ownerId: session.userId, deviceId: session.deviceId, direct: conversation.type === "direct",
+      ...await prepareReceiveEffects(frame, plaintext, editKey, editKeyResetToken, editScope(session),
+        callGrant ? session : undefined),
+      ...metadata,
     }),
   };
-  if (conversation.type === "group" || frame.msgType === "sender_key_distribution") {
+  if ((conversation.type === "group" && !callGrant) || frame.msgType === "sender_key_distribution") {
     return decryptGroupText(frame.conversationId, incoming, receive);
   }
-  return decryptMessage("direct", incoming, receive);
+  return callGrant ? decryptMessage("direct", incoming, receive, true) : decryptMessage("direct", incoming, receive);
 }
 
 function isAcceptanceEcho(frame: WSMessageFrame): boolean {
@@ -501,7 +551,7 @@ async function mergeExistingMessage(frame: WSMessageFrame, session: MessageSessi
   // A message known only from IndexedDB is still shown; an identical one in the store is left alone.
   const visible = await guardMessageForPublish(merged, ownerId, knownDirectChat(merged.conversationId));
   if (!isCurrentSession(session)) return null;
-  if (!visible) { useChatStore.getState().removeMessages([frame.id]); return { message: merged, changed: false }; }
+  if (!visible) { useChatStore.getState().removeMessages([existing.id]); return { message: merged, changed: false }; }
   if (changed || !inStore || visible.deletedAt !== merged.deletedAt) useChatStore.getState().addMessage(frame.conversationId, visible);
   return { message: visible, changed: changed || visible.deletedAt !== merged.deletedAt };
 }
@@ -528,59 +578,153 @@ async function restoreCommittedFrame(frame: WSMessageFrame, session: MessageSess
   return receipt.hidden ? "hidden" : "restored";
 }
 
-/** An untrusted scheduling hint, never a validation/classification result. */
-function groupOrder(frame: WSMessageFrame): { senderKeyId: number; chainIndex: number } {
-  try {
-    const header = JSON.parse(frame.header);
-    return {
-      senderKeyId: Number.isSafeInteger(header?.senderKeyId) ? header.senderKeyId : -1,
-      chainIndex: Number.isSafeInteger(header?.chainIndex) ? header.chainIndex : -1,
-    };
-  } catch { return { senderKeyId: -1, chainIndex: -1 }; }
+function receivePosition(frame: WSMessageFrame) {
+  const order = envelopeOrder(frame);
+  const group = order.senderKeyId >= 0 && frame.msgType !== "sender_key_distribution"
+    && (knownDirectChat(frame.conversationId) ?? (getCachedConversation(frame.conversationId)?.type === "direct")) !== true;
+  return { group, key: receiveChainKey(frame, group ? order.senderKeyId : order.dhPublicKey),
+    number: group ? order.chainIndex : order.n };
 }
 
-function sortPending(frames: WSMessageFrame[]): WSMessageFrame[] {
-  return frames.sort((left, right) => {
-    const a = groupOrder(left), b = groupOrder(right);
-    return String(left?.conversationId).localeCompare(String(right?.conversationId))
-      || String(left?.senderId).localeCompare(String(right?.senderId)) || String(left?.senderDeviceId).localeCompare(String(right?.senderDeviceId))
-      || a.senderKeyId - b.senderKeyId || a.chainIndex - b.chainIndex;
-  });
+// The drain snapshot was read before taking this peer's lock. Recheck under
+// the lock, only when a gap would otherwise be crossed.
+async function recheckQueuedPredecessors(frame: WSMessageFrame, session: MessageSession, drain: ReceiveDrain, gaps: ReceiveGap[]) {
+  const ids = await getQueuedPredecessorIds(frame, session.userId, session.deviceId, gaps);
+  if (!ids.length) return;
+  // Retry for arrivals the drain did not see, or when a blocker is processed.
+  // A failed status lookup alone must not spin up another sync pass.
+  for (const id of ids) drain.blockedBy.add(id);
+  if (activeGlobalSync && isCurrentSession(session) && ids.some((id) => !drain.pendingIds.has(id))) {
+    activeGlobalSync.followUp = true;
+  }
+  throw new ReceivePredecessorError();
 }
 
-async function pendingReceives(): Promise<WSMessageFrame[]> {
-  const { user, device } = useAuthStore.getState();
-  return sortPending(await getPendingReceives(user?.id, device?.id));
+async function confirmPendingDeliveries(frames: WSMessageFrame[], session: MessageSession) {
+  const statuses = new Map<string, PendingDeliveryStatus | "live" | null>();
+  let rollback = false;
+  for (let offset = 0; offset < frames.length && isCurrentSession(session); offset += MAX_DELIVERY_ACK_IDS) {
+    const batch = frames.slice(offset, offset + MAX_DELIVERY_ACK_IDS);
+    if (!rollback) {
+      try {
+        const ids = batch.map(({ id }) => id);
+        const result = await api.post<{ messages: PendingDeliveryStatus[] }>("/api/messages/delivery-status", { ids });
+        if (!Array.isArray(result?.messages)) break;
+        const received = new Map(result.messages.map((status) => [status.id, status]));
+        for (const id of ids) statuses.set(id, received.get(id) ?? null);
+        continue;
+      } catch (error) {
+        if ((error as { status?: number } | null)?.status !== 404) break;
+        rollback = true;
+      }
+    }
+    // The rollback Worker can attest to an addressed original with an exact
+    // wire ID, send time and deleted_at IS NULL, even behind the sync cursor.
+    if (!isCurrentSession(session)) break;
+    try {
+      const result = await api.post<{ ids: string[] }>("/api/messages/history-ownership?purpose=local", {
+        messages: batch.map((frame) => ({ id: frame.id, conversationId: frame.conversationId, senderId: frame.senderId,
+          timestamp: messagePageCursor(frame).ts, type: frame.msgType, deletedAt: null })),
+      });
+      if (!Array.isArray(result?.ids) || result.ids.some((id) => typeof id !== "string")) break;
+      const live = new Set(result.ids);
+      for (const { id } of batch) statuses.set(id, live.has(id) ? "live" : null);
+    } catch { break; } // A failed lookup leaves the affected ciphertext queued.
+  }
+  return statuses;
 }
 
-async function retryPendingReceives(session: MessageSession): Promise<void> {
+async function retryPendingReceives(session: MessageSession, completeSync = false): Promise<void> {
   // A pending record (or a failed queue read) must never prevent fetching fresh envelopes.
-  let frames: WSMessageFrame[];
-  try { frames = await pendingReceives(); } catch (error) {
+  let entries: Awaited<ReturnType<typeof getPendingReceiveEntries>>;
+  let confirmed: Awaited<ReturnType<typeof confirmPendingDeliveries>> | undefined;
+  let drain: ReceiveDrain | undefined;
+  try {
+    entries = await getPendingReceiveEntries(session.userId, session.deviceId);
+    if (completeSync) {
+      drain = { pendingIds: new Set(entries.map(({ frame }) => frame.id)), blockedBy: new Set() };
+      const pending = entries.filter(({ frame }) => isMessageContent(frame) && !frame.advanceOnly
+        && (frame.expiresAt === null || frame.expiresAt > Date.now()));
+      if (pending.length) {
+        confirmed = await confirmPendingDeliveries(pending.map(({ frame }) => frame), session);
+        if (!isCurrentSession(session)) return;
+        const unavailable = pending.filter(({ frame }) => confirmed?.get(frame.id) === null);
+        await retireUnavailableReceives(unavailable, session.userId, session.deviceId);
+        // Include predecessors queued while confirmation was in flight. Their
+        // next lookup must finish before any later envelope can cross a gap.
+        entries = await getPendingReceiveEntries(session.userId, session.deviceId);
+      }
+    }
+  } catch (error) {
     console.error("Could not read deferred receives", error);
     return;
   }
-  for (const frame of frames) {
-    if (!isCurrentSession(session)) return;
-    try { await ingestMessageFrame(frame, undefined, true); } catch (error) { console.error("Deferred receive will be retried", error); }
+  type Pending = (typeof entries)[number] & { number: number };
+  const direct = new Map<string, Pending[]>();
+  const groups = new Map<string, Pending[]>();
+  const receivedTextIds = new Set<string>();
+  for (const entry of entries.sort((a, b) => getFrameTimestamp(a.frame) - getFrameTimestamp(b.frame))) {
+    const { frame } = entry;
+    if (frame.expiresAt !== null && frame.expiresAt <= Date.now()) continue;
+    const { group, key, number } = receivePosition(frame);
+    const chains = group ? groups : direct;
+    const chain = chains.get(key) ?? [];
+    chain.push({ ...entry, number });
+    chains.set(key, chain);
   }
+  // Direct chains carry the distributions needed by group chains.
+  for (const chain of [...direct.values(), ...groups.values()]) {
+    for (const { frame, fromSync } of chain.sort((a, b) => a.number - b.number)) {
+      if (!isCurrentSession(session)) return;
+      let ready = frame;
+      let liveConfirmed: true | undefined;
+      if (isMessageContent(frame)) {
+        if (!completeSync) break;
+        if (!frame.advanceOnly) {
+          const status = confirmed?.get(frame.id);
+          if (status === "live") liveConfirmed = true;
+          else if (status && status.conversationId === frame.conversationId && status.senderId === frame.senderId
+            && status.senderDeviceId === frame.senderDeviceId && Number.isSafeInteger(status.expiresAt)
+            && (status.deletedAt === null || (Number.isSafeInteger(status.deletedAt) && status.deletedAt > 0
+              && typeof status.deletedByUserId === "string"))) {
+            const deletedAt = frame.deletedAt ?? status.deletedAt;
+            ready = { ...frame, expiresAt: status.expiresAt, ...(deletedAt && { deletedAt,
+              deletedByUserId: frame.deletedByUserId ?? status.deletedByUserId, advanceOnly: true }) };
+            if (!deletedAt) liveConfirmed = true;
+          }
+        }
+      }
+      try {
+        await ingestMessageFrame(ready, undefined, { source: "pending", fromSync, drain, liveConfirmed });
+        if (!await hasReceivedMessage(frame.id, session.userId, session.deviceId)) break;
+        if (frame.msgType === "text") receivedTextIds.add(messageEditScope(frame, frame.senderDeviceId).messageId);
+        if (drain?.blockedBy.has(frame.id) && activeGlobalSync && isCurrentSession(session)) activeGlobalSync.followUp = true;
+      } catch (error) {
+        console.error("Deferred receive will be retried", error);
+        break;
+      }
+    }
+  }
+  if (receivedTextIds.size) await drainLockedEdits(session, receivedTextIds).catch((error) => console.error("Queued edits will retry on the next sync", error));
 }
 
 /** Called only while this peer's receive lock is held. Never re-enter the public ID queue. */
 async function drainPeerReceives(frame: WSMessageFrame, session: MessageSession, lockKey: string, originals: OriginalEditCheck[], before?: SenderKeyHeader): Promise<void> {
-  const frames = (await pendingReceives()).filter((pending) => {
+  const frames = (await getPendingReceives(session.userId, session.deviceId)).filter((pending) => {
     if (pending.id === frame.id || pending.conversationId !== frame.conversationId
       || pending.senderId !== frame.senderId || pending.senderDeviceId !== frame.senderDeviceId) return false;
-    const order = groupOrder(pending);
+    const order = envelopeOrder(pending);
     return !before || order.senderKeyId < 0 || (order.senderKeyId === before.senderKeyId && order.chainIndex < before.chainIndex);
-  });
+  }).sort((a, b) => envelopeOrder(a).chainIndex - envelopeOrder(b).chainIndex);
   const blockedChains = new Set<number>();
   for (const pending of frames) {
     if (!isCurrentSession(session)) return;
-    const chain = groupOrder(pending).senderKeyId;
+    const chain = envelopeOrder(pending).senderKeyId;
     if (blockedChains.has(chain)) continue;
     try {
-      await ingestFrame(pending, session, lockKey, originals, false);
+      // The ordinary queue drain reconciles content. Here only controls and
+      // known deletions can proceed under this peer's lock.
+      await ingestFrame(pending, session, lockKey, originals, { source: "pending" }, false);
       originals.push({ frame: pending, deferred: true });
     } catch (error) {
       // A failed lower index is a barrier for this chain, including a newer live frame.
@@ -591,15 +735,19 @@ async function drainPeerReceives(frame: WSMessageFrame, session: MessageSession,
   }
 }
 
-export async function ingestMessageFrame(frame: WSMessageFrame, syncOriginals?: OriginalEditCheck[], deferred = false): Promise<void> {
+export async function ingestMessageFrame(frame: WSMessageFrame, syncOriginals?: OriginalEditCheck[],
+  attempt: ReceiveAttempt = { source: syncOriginals ? "sync" : "socket" }): Promise<void> {
   const session = captureSession();
-  const originals = [{ frame, deferred }];
+  const originals = [{ frame, deferred: attempt.source === "pending" && !attempt.drain }];
   const previous = inFlightDecryptIds.get(frame.id) ?? Promise.resolve();
   const lockKey = `${frame.senderId}:${frame.senderDeviceId}`;
   const pending = previous.catch(() => undefined).then(() => withSessionLock(lockKey, async () => {
-    await ingestFrame(frame, session, lockKey, originals);
+    await ingestFrame(frame, session, lockKey, originals, attempt);
     if (frame.msgType === "sender_key_distribution" && isCurrentSession(session)) {
-      try { await drainPeerReceives(frame, session, lockKey, originals); } catch (error) {
+      try {
+        const receipt = await getReceiveReceipt(frame.id, session.userId, session.deviceId);
+        if (receipt && !receipt.failure) await drainPeerReceives(frame, session, lockKey, originals);
+      } catch (error) {
         console.error("Could not read deferred receives after distribution", error);
       }
     }
@@ -623,36 +771,73 @@ function terminalEffects(frame: WSMessageFrame): ReceiveEffects {
   };
 }
 
-async function ingestFrame(frame: WSMessageFrame, session: MessageSession, lockKey: string, originals: OriginalEditCheck[], drainOlder = true): Promise<void> {
+async function ingestFrame(frame: WSMessageFrame, session: MessageSession, lockKey: string, originals: OriginalEditCheck[],
+  attempt: ReceiveAttempt, drainOlder = true): Promise<void> {
   if (!isCurrentSession(session) || (frame.expiresAt !== null && frame.expiresAt <= Date.now())) return;
-  if (await isMessageHidden(frame.id, session.userId) && (frame.deletedAt || await hasReceivedMessage(frame.id, session.userId, session.deviceId))) {
-    if (frame.deletedAt) {
-      const direct = knownDirectChat(frame.conversationId) ?? (await getConversation(frame.conversationId)).type === "direct";
-      await applyMessageDeletion({ ...receivedMessage(frame, ""), direct, wireId: frame.id }, frame.deletedAt, frame.deletedByUserId ?? frame.senderId, session);
-    }
-    if (isCurrentSession(session)) useChatStore.getState().removeMessages([frame.id]);
-    return;
-  }
+  // A transport that sets the advance flag must supply a matching tombstone.
+  if (frame.advanceOnly && !frame.deletedAt) return;
   const { user, device } = useAuthStore.getState();
+  const { source, drain } = attempt;
   const isLocalEcho = frame.senderId === user?.id && frame.senderDeviceId === device?.id && frame.msgType !== "system";
   const directChat = knownDirectChat(frame.conversationId)
     ?? (frame.id.includes(":") ? (await getConversation(frame.conversationId)).type === "direct" : undefined);
   const deletion = await getMessageDeletion(frame.id, session.userId, frame, directChat);
-  if (frame.deletedAt || (deletion && deletion.importedAt === undefined)) {
+  const deletedAt = frame.deletedAt ?? (deletion?.importedAt === undefined ? deletion?.deletedAt : undefined);
+  // An older live envelope already pending locally can also advance the chain
+  // after a mutation arrives. The deletion marker always wins over its plaintext.
+  const advanceOnly = !!deletedAt && !isLocalEcho && !!frame.ciphertext && isMessageContent(frame)
+    && (frame.advanceOnly === true || !frame.deletedAt);
+  const acknowledgeCommitted = async () => {
+    if (frame.deliveryAck && session.userId && session.deviceId && isCurrentSession(session)) {
+      const queued = await queueCommittedDeliveryAck(frame, session.userId, session.deviceId);
+      if (queued && attempt.source === "socket") scheduleDeliveryAckFlush(session);
+    }
+  };
+  if (!deletedAt && !isLocalEcho && isMessageContent(frame) && source !== "sync" && !attempt.liveConfirmed) {
+    if (source === "socket" && isCurrentSession(session)) {
+      if (await hasReceivedMessage(frame.id, session.userId, session.deviceId)) {
+        if (await isMessageHidden(frame.id, session.userId, directChat)) {
+          if (isCurrentSession(session)) useChatStore.getState().removeMessages([logicalMessageId(frame.id, directChat === true)]);
+        } else {
+          await restoreCommittedFrame(frame, session, false);
+        }
+        await acknowledgeCommitted();
+      } else {
+        await savePendingReceive(frame, session.userId, session.deviceId);
+      }
+      scheduleSocketReceiveSync(session);
+    }
+    return;
+  }
+  if (deletedAt) {
     const conversation = await getConversation(frame.conversationId);
     const direct = conversation.type === "direct";
     const id = logicalMessageId(frame.id, direct);
     const existing = await getMessageById(id, session.userId ?? null, direct);
     if (!isCurrentSession(session)) return;
-    if (!await rememberMessageDeletion(frame.id, frame.conversationId, frame.deletedAt ?? deletion!.deletedAt, frame.deletedByUserId ?? deletion?.deletedByUserId ?? frame.senderId, frame.senderId,
-      () => isCurrentSession(session), session.userId, direct)) return;
+    const deletedBy = frame.deletedByUserId ?? deletion?.deletedByUserId ?? frame.senderId;
+    if (!await rememberMessageDeletion(frame.id, frame.conversationId, deletedAt, deletedBy, frame.senderId,
+      () => isCurrentSession(session), session.userId, direct, !!frame.deletedAt)) return;
     if (!existing && isLocalEcho) return;
     const display = existing ? normalizeStoredMessage(existing, Date.now(), session.userId ?? null) : { ...receivedMessage(frame, ""), id, direct, wireId: frame.id };
-    if (display) await applyMessageDeletion(display, frame.deletedAt ?? deletion!.deletedAt, frame.deletedByUserId ?? deletion?.deletedByUserId ?? frame.senderId, session);
-    return;
+    if (display) await applyMessageDeletion(display, deletedAt, deletedBy, session);
+    if (!advanceOnly || await hasReceivedMessage(frame.id, session.userId, session.deviceId)) {
+      await acknowledgeCommitted();
+      return;
+    }
+  } else {
+    if (await isMessageHidden(frame.id, session.userId) && await hasReceivedMessage(frame.id, session.userId, session.deviceId)) {
+      if (isCurrentSession(session)) useChatStore.getState().removeMessages([frame.id]);
+      await acknowledgeCommitted();
+      return;
+    }
+    if (await restoreCommittedFrame(frame, session, isLocalEcho)) {
+      await acknowledgeCommitted();
+      return;
+    }
   }
-  if (await restoreCommittedFrame(frame, session, isLocalEcho)) return;
   let staged: ReceiveState = {};
+  const fromSync = source === "sync" || !!attempt.fromSync;
   try {
     if (!isCurrentSession(session)) return;
     if (isLocalEcho) {
@@ -662,29 +847,56 @@ async function ingestFrame(frame: WSMessageFrame, session: MessageSession, lockK
     }
     await decryptIncomingMessage(frame, session, {
       messageId: frame.id, ownerId: session.userId, deviceId: session.deviceId, lockedSession: lockKey,
+      waitForEarlier: !drain,
+      beforeSkip: drain ? (gaps) => recheckQueuedPredecessors(frame, session, drain, gaps) : undefined,
       stage: (state) => { staged = state; },
-      beforeGroupDecrypt: drainOlder ? (header) => drainPeerReceives(frame, session, lockKey, originals, header) : undefined,
-    });
+      beforeGroupDecrypt: drainOlder && !isOrderedEnvelope(frame) ? (header) => drainPeerReceives(frame, session, lockKey, originals, header) : undefined,
+    }, advanceOnly);
   } catch (error) {
+    if (error instanceof ReceivePredecessorError) {
+      if (!isCurrentSession(session)) return;
+      await savePendingReceive(frame, session.userId, session.deviceId, fromSync);
+      if (source === "socket") throw error;
+      return;
+    }
+    // Socket broadcasts and locally queued frames may run ahead of retained
+    // envelopes. Leave them replayable for the ordered server page.
+    if (!drain && !fromSync && frame.deliveryAck && error instanceof ReceiveDecryptionError) throw error;
     const disposition = classifyReceiveError(error);
     if (disposition === "retry") throw error;
     if (disposition === "defer") {
-      await savePendingReceive(frame, user?.id, device?.id);
-        // Also cover another tab committing distribution just before this queue write.
+      if (!isCurrentSession(session)) return;
+      await savePendingReceive(frame, session.userId, session.deviceId, fromSync);
+      // Also cover another tab committing distribution just before this queue write.
       if (error instanceof MissingSenderKeyError && await getSenderKey(error.keyId)) {
         originals.push({ frame, deferred: true });
-        return ingestFrame(frame, session, lockKey, originals, false);
+        return ingestFrame(frame, session, lockKey, originals, attempt, false);
       }
+      // An active-chat socket may be the only hint to fetch the missing distribution.
+      if (source === "socket" && frame.deliveryAck && frame.serverTimestamp !== undefined) throw error;
       return;
     }
     // Unauthenticated stale work must not retire a frame belonging to the prior login.
     // Authenticated receives still commit their advanced state and output together.
     if (!staged.session && !staged.senderKey && !isCurrentSession(session)) return;
-    const committed = await commitReceivedMessage(frame.id, { ...terminalEffects(frame), ownerId: session.userId, deviceId: session.deviceId, direct: knownDirectChat(frame.conversationId) }, staged);
+    const authenticated = !!(staged.session || staged.senderKey);
+    const effects: ReceiveEffects = advanceOnly ? { expiresAt: frame.expiresAt } : terminalEffects(frame);
+    if (!authenticated) effects.failure ??= "terminal_receive_error";
+    const committed = await commitReceivedMessage(frame.id, { ...effects, deliveryAck: authenticated && !effects.failure ? frame.deliveryAck : undefined,
+      ownerId: session.userId, deviceId: session.deviceId, direct: knownDirectChat(frame.conversationId) }, staged);
     if (committed && staged.oneTimePreKeyId !== undefined) {
       await consumeOneTimePreKey(staged.oneTimePreKeyId).catch((cleanupError) => console.error("Failed to remove a used one-time pre-key", cleanupError));
     }
   }
+  // The missing predecessor can arrive only via the socket too. A successful
+  // receive gives the queued successors another chance to replay in order.
+  if (source === "socket" && frame.deliveryAck && (staged.session || staged.senderKey)) scheduleDeliveryAckFlush(session);
+  if (source === "socket" && isOrderedEnvelope(frame) && (staged.session || staged.senderKey)
+    && isCurrentSession(session) && await hasPendingReceives(session.userId, session.deviceId)
+    && isCurrentSession(session)) {
+    void syncMessages({ force: true }).catch(() => undefined);
+  }
+  if (advanceOnly) return;
   // Both success and losing-tab dedupe publish only the durable output. Controls restore receipts.
   if (await restoreCommittedFrame(frame, session, isLocalEcho) !== "restored" || !isCurrentSession(session)) return;
   if (frame.msgType !== "text" && frame.msgType !== "file") return;
@@ -709,11 +921,69 @@ async function ingestFrame(frame: WSMessageFrame, session: MessageSession, lockK
   }
 }
 
-async function executeSync(session: MessageSession, options?: {
+function scheduleSocketReceiveSync(session: MessageSession) {
+  if (socketReceiveSyncTimer !== undefined || !isCurrentSession(session)) return;
+  socketReceiveSyncTimer = setTimeout(() => {
+    socketReceiveSyncTimer = undefined;
+    if (isCurrentSession(session)) void syncMessages({ force: true }).catch(() => undefined);
+  }, Math.max(250, MIN_SYNC_INTERVAL_MS - (Date.now() - lastSyncStartedAt)));
+}
+
+function scheduleDeliveryAckFlush(session: MessageSession) {
+  if (deliveryAckTimer !== undefined || !isCurrentSession(session)) return;
+  deliveryAckTimer = setTimeout(() => {
+    deliveryAckTimer = undefined;
+    void flushDeliveryAcks(session).catch(() => undefined);
+  }, Math.max(DELIVERY_ACK_BATCH_DELAY_MS, deliveryAckNotBefore - Date.now()));
+}
+
+async function flushDeliveryAcks(session: MessageSession) {
+  const { userId, deviceId } = session;
+  if (!userId || !deviceId || !isCurrentSession(session)) return;
+  if (activeDeliveryAckFlush) {
+    scheduleDeliveryAckFlush(session);
+    return activeDeliveryAckFlush;
+  }
+  if (Date.now() < deliveryAckNotBefore) {
+    scheduleDeliveryAckFlush(session);
+    return;
+  }
+  clearTimeout(deliveryAckTimer);
+  deliveryAckTimer = undefined;
+  const run = (async () => {
+    const acks = await getDeliveryAcks(userId, deviceId, MAX_DELIVERY_ACK_IDS);
+    if (!acks.length || !isCurrentSession(session)) return;
+    deliveryAckNotBefore = Date.now() + DELIVERY_ACK_BATCH_DELAY_MS;
+    try {
+      await api.post("/api/messages/ack-delivery", { ids: acks.map(({ messageId }) => messageId) });
+    } catch (error) {
+      const rejection = error as { status?: number; body?: { retryAfterSeconds?: number } } | null;
+      if (rejection?.status === 429 && isCurrentSession(session)) {
+        const seconds = rejection.body?.retryAfterSeconds;
+        deliveryAckNotBefore = Date.now() + (typeof seconds === "number" && Number.isSafeInteger(seconds) && seconds > 0 ? seconds : 60) * 1_000;
+        scheduleDeliveryAckFlush(session);
+      }
+      return;
+    }
+    if (!isCurrentSession(session)) return;
+    const tx = (await getAppDB()).transaction("accountState", "readwrite");
+    await Promise.all([tx.done, ...acks.map(({ id }) => tx.store.delete(id))]);
+    if (acks.length === MAX_DELIVERY_ACK_IDS) scheduleDeliveryAckFlush(session);
+  })();
+  activeDeliveryAckFlush = run;
+  try { await run; } finally {
+    if (activeDeliveryAckFlush === run) activeDeliveryAckFlush = null;
+  }
+}
+
+interface SyncOptions {
   conversationId?: string;
   since?: number;
   force?: boolean;
-}): Promise<void> {
+  callControl?: true;
+}
+
+async function executeSync(session: MessageSession, options?: SyncOptions): Promise<void> {
   if (!isCurrentSession(session)) return;
   if (!options?.force && !options?.conversationId) {
     const now = Date.now();
@@ -725,12 +995,19 @@ async function executeSync(session: MessageSession, options?: {
     lastSyncStartedAt = Date.now();
   }
 
+  if (!options?.conversationId && options?.since === undefined) {
+    clearTimeout(socketReceiveSyncTimer);
+    socketReceiveSyncTimer = undefined;
+  }
   await retryPendingReceives(session);
   await drainLockedEdits(session).catch((error) => console.error("Queued edits will retry on the next sync", error));
   startEditLookups(session);
   if (!isCurrentSession(session)) return;
   const syncStateId = getSyncStateId();
   let pageCursor = await resolveSyncCursor(syncStateId, options?.since);
+  let retainedThrough = pageCursor;
+  let retainedAfter: string | undefined = retainedThrough.ts > 0 ? "" : undefined;
+  let retainedNeedsRestart = false;
   const scope = !options?.conversationId && session.userId && session.deviceId ? `${session.userId}:${session.deviceId}` : null;
   const editStateId = scope && `message-mutations-edits:${scope}`;
   const deletionStateId = scope && `message-mutations:${scope}`;
@@ -738,6 +1015,7 @@ async function executeSync(session: MessageSession, options?: {
   let deletionCursor = deletionStateId ? (await getSyncState(deletionStateId))?.value ?? 0 : 0;
   let limit = SYNC_BATCH_SIZE;
   let ordinaryFailure: { error: unknown } | undefined;
+  let callControl = options?.callControl;
 
   while (isCurrentSession(session)) {
     const params = new URLSearchParams();
@@ -748,7 +1026,13 @@ async function executeSync(session: MessageSession, options?: {
     params.set("mutationSince", String(deletionCursor));
     params.set("editSince", String(editCursor));
     params.set("edits", "1");
+    params.set("advanceOnlyDeletes", "1");
+    if (retainedAfter !== undefined && !ordinaryFailure) {
+      params.set("retainedBefore", String(retainedThrough.ts));
+      params.set("retainedAfter", retainedAfter);
+    }
     if (ordinaryFailure) params.set("mutationsOnly", "1");
+    if (callControl) params.set("callControl", "1");
 
     let response: SyncResponse;
     try {
@@ -756,13 +1040,29 @@ async function executeSync(session: MessageSession, options?: {
     } catch (error) {
       const rejection = error as { status?: number; code?: string } | null;
       if (!isCurrentSession(session)) return;
+      if (callControl && rejection?.status === 403 && rejection.code === "CALL_CONTROL_UNAVAILABLE") {
+        // The room may drain during sync. Keep the same cursor for chat sync.
+        callControl = undefined;
+        continue;
+      }
       if (rejection?.status !== 413 || rejection.code !== SYNC_PAGE_TOO_LARGE || ordinaryFailure) throw error;
       if (limit === 1) ordinaryFailure = { error };
       else limit = Math.max(1, Math.floor(limit / 2));
       continue;
     }
     if (!isCurrentSession(session)) return;
+    if (response.hasMoreRetained && (retainedAfter === undefined || !response.retainedCursor || response.retainedCursor <= retainedAfter)) {
+      throw new Error("Retained envelope cursor did not advance");
+    }
     const mutations = response.mutations ?? [];
+    const previousMutationCursor = response.editStream ? editCursor : deletionCursor;
+    // A new grant can sort into a range that retained paging already passed.
+    if (response.hasMoreRetained !== undefined && retainedThrough.ts > 0
+      && mutations.some((mutation) => !("edit" in mutation) && mutation.mutationSeq > previousMutationCursor
+        && messagePageCursor(mutation).ts <= retainedThrough.ts && (retainedAfter === undefined || mutation.id <= retainedAfter))) {
+      retainedNeedsRestart = true;
+    }
+    retainedAfter = response.hasMoreRetained ? response.retainedCursor : undefined;
     for (const mutation of mutations) {
       if (!isCurrentSession(session)) return;
       if (!("edit" in mutation)) await ingestMessageFrame(mutation);
@@ -775,7 +1075,7 @@ async function executeSync(session: MessageSession, options?: {
     // An older Worker ignores editSince. Its deletion sequence is independent of
     // the edit-aware stream. Checkpoint either stream before ordinary frames.
     const mutationStateId = response.editStream ? editStateId : deletionStateId;
-    const mutationCursor = Math.max(response.editStream ? editCursor : deletionCursor, mutations.at(-1)?.mutationSeq ?? 0, response.mutationCursor ?? 0);
+    const mutationCursor = Math.max(previousMutationCursor, mutations.at(-1)?.mutationSeq ?? 0, response.mutationCursor ?? 0);
     if (response.editStream) editCursor = mutationCursor;
     else deletionCursor = mutationCursor;
     if (mutationStateId && (mutations.length || response.mutationCursor !== undefined)) {
@@ -786,12 +1086,20 @@ async function executeSync(session: MessageSession, options?: {
     let lastFrame: WSMessageFrame | undefined;
     let lastOrdinaryFrame: WSMessageFrame | undefined;
     if (!ordinaryFailure) {
+      for (const frame of response.retainedMessages ?? []) {
+        if (!isCurrentSession(session)) return;
+        if (!frame.advanceOnly || !frame.deletedAt) throw new Error("Invalid retained envelope");
+        try { await ingestMessageFrame(frame, originals); }
+        catch (error) { ordinaryFailure = { error }; break; }
+      }
+    }
+    if (!ordinaryFailure) {
       for (const frame of response.messages) {
         if (!isCurrentSession(session)) return;
         try { await ingestMessageFrame(frame, originals); }
         catch (error) { ordinaryFailure = { error }; break; }
         lastFrame = frame;
-        if (frame.deletedAt == null) lastOrdinaryFrame = frame;
+        if (frame.deletedAt == null || frame.advanceOnly) lastOrdinaryFrame = frame;
       }
     }
     try { await reconcileOriginalFrames(originals, session); }
@@ -815,10 +1123,26 @@ async function executeSync(session: MessageSession, options?: {
       } catch (error) { ordinaryFailure ??= { error }; }
     }
 
+    if (!ordinaryFailure && !response.hasMore && !response.hasMoreMutations && !response.hasMoreRetained
+      && !options?.conversationId && options?.since === undefined) {
+      // A send may have committed and been deleted behind the forward cursor
+      // as it moved. Catch up to its final boundary before allowing any skips.
+      if (response.hasMoreRetained === false && (retainedNeedsRestart || pageCursor.ts !== retainedThrough.ts || pageCursor.id !== retainedThrough.id)) {
+        retainedThrough = pageCursor;
+        retainedAfter = "";
+        retainedNeedsRestart = false;
+        continue;
+      }
+      await retryPendingReceives(session, true);
+    }
     // Drain later mutation pages without moving past the failing ordinary frame.
     if (ordinaryFailure) {
-      if (!response.hasMoreMutations || !mutations.length) throw ordinaryFailure.error;
-    } else if ((!response.hasMore && !response.hasMoreMutations) || (!response.messages.length && !mutations.length)) {
+      if (!response.hasMoreMutations || !mutations.length) {
+        await flushDeliveryAcks(session).catch(() => undefined);
+        throw ordinaryFailure.error;
+      }
+    } else if (!response.hasMoreRetained && ((!response.hasMore && !response.hasMoreMutations) || (!response.messages.length && !mutations.length))) {
+      await flushDeliveryAcks(session).catch(() => undefined);
       if (!options?.conversationId) await reconcileImportedHistoryDeletions(session);
       return;
     }
@@ -933,33 +1257,42 @@ export async function verifyHistoryDisclosure(chats: ReadonlySet<string>, curren
   assertActive();
 }
 
-export async function syncMessages(options?: {
-  conversationId?: string;
-  since?: number;
-  force?: boolean;
-}): Promise<void> {
+export async function syncMessages(options?: SyncOptions): Promise<void> {
   const session = captureSession();
   if (options?.conversationId) {
-    if (activeGlobalSync) {
-      await activeGlobalSync;
-    }
+    await activeGlobalSync?.promise;
     await executeSync(session, options);
     return;
   }
 
-  if (!activeGlobalSync) {
-    const pending = executeSync(session, options).then(() => {
+  if (activeGlobalSync) {
+    if (options?.force) {
+      activeGlobalSync.followUp = true;
+      activeGlobalSync.callControl ||= options.callControl;
+    }
+    return activeGlobalSync.promise;
+  }
+
+  const run: GlobalSync = { followUp: false, callControl: options?.callControl, promise: Promise.resolve() };
+  activeGlobalSync = run;
+  run.promise = (async () => {
+    try {
+      let pass = options;
+      do {
+        run.followUp = false;
+        try { await executeSync(session, pass); }
+        catch (error) { if (!run.followUp || !isCurrentSession(session)) throw error; }
+        pass = { force: true, callControl: run.callControl };
+      } while (run.followUp && isCurrentSession(session));
       const activeConversation = useChatStore.getState().activeConversationId;
       if (activeConversation && isCurrentSession(session) && document.visibilityState === "visible") {
         void queueConversationEditPage(activeConversation, session, "resume").catch(() => undefined);
       }
-    }).finally(() => {
-      if (activeGlobalSync === pending) activeGlobalSync = null;
-    });
-    activeGlobalSync = pending;
-  }
-
-  await activeGlobalSync;
+    } finally {
+      if (activeGlobalSync === run) activeGlobalSync = null;
+    }
+  })();
+  await run.promise;
 }
 
 export async function syncConversationMessages(conversationId: string): Promise<void> {
@@ -971,6 +1304,31 @@ export async function syncConversationMessages(conversationId: string): Promise<
 /** The edit cursor may have skipped this conversation while access was absent. */
 export async function reconcileConversationEdits(conversationId: string, membershipChanged = false): Promise<void> {
   await queueConversationEditPage(conversationId, captureSession(), membershipChanged ? "restart" : "open");
+}
+
+// The global mutation cursor can pass a deletion while this device is out of
+// the group. Check cached IDs when reopening or paging a name-approved chat.
+async function reconcileAdmissionDeletions(conversationId: string, messages: LocalMessage[], session: MessageSession): Promise<void> {
+  const { userId, deviceId } = session;
+  const current = () => isCurrentSession(session);
+  if (!userId || !deviceId || !current() ||
+    !getCachedConversation(conversationId)?.members?.some(member => member.userId === userId && member.joinAdmissionId)) return;
+  const candidates = messages.filter(row => row.deletedAt == null && !row.hasOutgoingEntry
+    && (row.type === "text" || row.type === "file") && messageVisibleToAccount(row, userId));
+  for (let offset = 0; current() && offset < candidates.length; offset += HISTORY_DELETION_BATCH_SIZE) {
+    const batch = candidates.slice(offset, offset + HISTORY_DELETION_BATCH_SIZE);
+    const { deletions } = await api.post<{ deletions: HistoryDeletionResult[] }>("/api/messages/history-deletions", {
+      messages: batch.map(row => ({ id: row.wireId ?? row.transferSourceId ?? row.id, conversationId, senderId: row.senderId })),
+    });
+    for (const event of deletions) {
+      if (!current()) return;
+      const row = batch.find(message => (message.wireId ?? message.transferSourceId ?? message.id) === event.id
+        && message.senderId === event.senderId && conversationId === event.conversationId);
+      if (row && await rememberMessageDeletion(row.id, conversationId, event.deletedAt, event.deletedByUserId, event.senderId, current, userId)) {
+        await reconcileLocalMessageChange(row.id, useChatStore.getState(), current);
+      }
+    }
+  }
 }
 
 async function queueConversationEditPage(conversationId: string, session: MessageSession, mode: "open" | "resume" | "restart") {
@@ -985,6 +1343,7 @@ async function queueConversationEditPage(conversationId: string, session: Messag
     before = { timestamp: previous.value, id: previous.cursorId };
   }
   const page = await getCachedConversationMessagesPage(conversationId, { before, limit: mode === "resume" ? MAX_LATEST_EDIT_IDS : LOCAL_MESSAGES_PAGE_SIZE });
+  void reconcileAdmissionDeletions(conversationId, page.messages, session).catch(() => undefined);
   const next = page.hasOlder ? page.oldestCursor : undefined;
   let checkpoint = mode !== "open" || !previous?.cursorId ? { id, previous, next } : undefined;
   while (!await queueLocalEditChecks(page.messages, session, checkpoint) && mode === "restart" && isCurrentSession(session) && keysLoaded()) {
@@ -1049,6 +1408,7 @@ async function publishCachedPage(conversationId: string, session: MessageSession
     const oldest = foundOlder ? preserveOldest : page.oldestCursor ?? before;
     const hasOlder = foundOlder || page.hasOlder;
     historyWindows.set(conversationId, { oldest, hasOlder });
+    void reconcileAdmissionDeletions(conversationId, page.messages, session).catch(() => undefined);
     if (before) void queueLocalEditChecks(page.messages, session).catch(() => undefined);
     return { loadedCount: messages.length, hasOlder };
   }
@@ -1152,6 +1512,12 @@ export function resetMessageSyncState(): void {
   syncEpoch++;
   lastSyncStartedAt = 0;
   activeGlobalSync = null;
+  activeDeliveryAckFlush = null;
+  clearTimeout(deliveryAckTimer);
+  deliveryAckTimer = undefined;
+  deliveryAckNotBefore = 0;
+  clearTimeout(socketReceiveSyncTimer);
+  socketReceiveSyncTimer = undefined;
   activeEditLookup = null;
   clearTimeout(editLookupTimer);
   editLookupTimer = undefined;
@@ -1185,8 +1551,12 @@ export function handleBatchMessageDeletion(conversationId: string, deletions: Me
   return handleMessageDeletion({ conversationId, conversationType, replayedDeletions: { senderId, deletions } });
 }
 
+export function applyClearHistoryPage(conversationId: string, events: { event: MessageDeletionEvent; senderId: string }[], direct: boolean) {
+  return applyDeletionEvents(conversationId, events, direct, captureSession(), true);
+}
+
 async function applyDeletionEvents(conversationId: string, events: { event: MessageDeletionEvent; senderId: string }[],
-  direct = knownDirectChat(conversationId), session = captureSession()): Promise<void> {
+  direct = knownDirectChat(conversationId), session = captureSession(), cachedOnly = false): Promise<void> {
   const ownerId = session.userId;
   if (!ownerId || !events.length) return;
   const current = () => isCurrentSession(session);
@@ -1236,6 +1606,7 @@ async function applyDeletionEvents(conversationId: string, events: { event: Mess
     for (const { id, row, changed } of accepted) {
       if (!current()) return;
       const copy = cached.get(id);
+      if (cachedOnly && !copy) continue;
       const stale = copy && messageVisibleToAccount(copy, ownerId) && copy.senderId === (row?.senderId ?? targets.get(id)?.deletion.senderId)
         && (copy.deletedAt == null || copy.content !== "" || (row && (copy.deletedAt !== row.deletedAt || copy.deletedByUserId !== row.deletedByUserId)));
       if (!changed && !stale) continue;
@@ -1256,7 +1627,7 @@ async function applyDeletionEvents(conversationId: string, events: { event: Mess
   // while resolving metadata, then redact any quarantined direct-family copies.
   if (direct === undefined && current() && events.some(({ event }) => event.ids.some((id) => id.includes(":")))) {
     const conversation = await getConversation(conversationId).catch(() => undefined);
-    if (current() && conversation?.type === "direct") await applyDeletionEvents(conversationId, events, true, session);
+    if (current() && conversation?.type === "direct") await applyDeletionEvents(conversationId, events, true, session, cachedOnly);
   }
 }
 
@@ -1270,15 +1641,15 @@ export async function deleteMessageForLocalUserOnly(conversationId: string, mess
   if (current() && isCurrentSession(session)) useChatStore.getState().removeMessages([messageId]);
 }
 
-export async function deleteMessagesForLocalUserOnly(conversationId: string | undefined, ids: string[], current: () => boolean,
+export async function deleteMessagesForLocalUserOnly(conversationId: string | undefined, ids: LocalHideTarget, current: () => boolean,
   expectedQueued?: ReadonlySet<string>) {
   const session = captureSession();
   const active = () => current() && isCurrentSession(session);
-  await Promise.all(ids.map((id) => inFlightDecryptIds.get(id)?.catch(() => undefined)));
-  if (!session.userId || !session.deviceId || !active()) return { discarded: false, alreadySending: [] };
+  if (Array.isArray(ids)) await Promise.all(ids.map((id) => inFlightDecryptIds.get(id)?.catch(() => undefined)));
+  if (!session.userId || !session.deviceId || !active()) return { hidden: [], discarded: false, alreadySending: [] };
   const { hidden, discarded, alreadySending } = await hideLocalMessages(conversationId, ids, session.userId, session.deviceId, active, expectedQueued);
   if (hidden.length && active()) useChatStore.getState().removeMessages(hidden);
-  return { discarded, alreadySending };
+  return { hidden, discarded, alreadySending };
 }
 
 /** The timer lives outside the bubble lifecycle: removing the bubble must not cancel commit. */
@@ -1347,6 +1718,12 @@ export function startLocalHiddenMessageSync(onOutboxChange?: (id?: string) => Pr
       if (!current()) return;
       if (kind === "outbox") return onOutboxChange?.(id);
       if (kind === "outbox-batch") return onOutboxChange?.();
+      if (kind === "clear-history" && conversationId) {
+        const loaded = useChatStore.getState().messages.get(conversationId) ?? [];
+        return getHiddenMessageIds(loaded.map(({ id }) => id), session.userId!).then((ids) => {
+          if (ids.length && current()) useChatStore.getState().removeMessages(ids);
+        });
+      }
       return kind === "edit" && conversationId
         ? publishCachedEdit(id, conversationId, current)
         : reconcileLocalMessageChange(id, useChatStore.getState(), current);

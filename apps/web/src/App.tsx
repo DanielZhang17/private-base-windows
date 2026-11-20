@@ -20,6 +20,7 @@ import SettingsLayout from "./components/layout/SettingsLayout.js";
 import { HistoryTransferOwner, HistoryTransferScreen, TRANSFER_PATH, TRANSFER_SETUP_PATH } from "./features/transfer/HistoryTransferScreens.js";
 import { capabilities } from "./platform/capabilities.js";
 import { SettingsFrame } from "./features/settings/SettingsFrame.js";
+import { CaptureProtectionGate } from "./features/settings/CaptureProtectionGate.js";
 import { t } from "./i18n/index.js";
 import UnlockedAppEffects from "./components/app/UnlockedAppEffects.js";
 import UiPreferencesEffects from "./components/app/UiPreferencesEffects.js";
@@ -53,7 +54,8 @@ function ProtectedRoute({ phase, children }: { phase: AuthPhase; children: React
   if (phase === "locked") {
     return <Navigate to="/unlock" replace state={{ from: location }} />;
   }
-  return <>{children}</>;
+  // Android: no chat is shown until screenshot protection is confirmed on.
+  return <CaptureProtectionGate>{children}</CaptureProtectionGate>;
 }
 
 function PublicOnlyRoute({ phase, children, preserveAfterAuth = false }: {
