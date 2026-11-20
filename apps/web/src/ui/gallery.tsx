@@ -35,7 +35,7 @@ function ShellDemo() {
         bottomBar={<BottomBar><NavItem icon="chats" label={t("chats")} active count={3} /><NavItem icon="settings" label={t("settings")} /></BottomBar>}
         list={
           <>
-            <TopBar title={t("chats")} actions={<IconButton icon="edit" label={t("newConversation")} />} />
+            <TopBar title={t("chats")} actions={<IconButton icon="plus" label={t("newConversation")} />} />
             <ul role="list" className="flex flex-col gap-0.5 overflow-y-auto p-2">
               {people.map((name, index) => (
                 <li key={name}>

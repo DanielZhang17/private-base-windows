@@ -47,7 +47,7 @@ export default function ChatListPage() {
   return <div className="flex min-h-0 flex-1 flex-col">
     <TopBar title={t("chats")} actions={<>
       <IconButton icon="search" label={t("searchConversations")} onClick={() => { setSearchOpen(true); requestAnimationFrame(() => searchRef.current?.focus()); }} />
-      <IconButton icon="edit" label={t("newChat")} onClick={() => flow.setShowNewChat(true)} />
+      <IconButton icon="plus" label={t("newChat")} onClick={() => flow.setShowNewChat(true)} />
     </>} />
     <UpdateBanner />
     <div className={`${searchOpen ? "block" : "hidden lg:block"} px-3 pt-3 pb-1`}>
